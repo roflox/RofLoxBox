@@ -1,0 +1,14 @@
+[package]
+name = "deckhand-formats"
+version = "0.1.0"
+description = "Readers for Pioneer DJ USB export formats"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = "2.0.21"
+
+[dev-dependencies]
+binrw = "0.14"
+rekordcrate = "0.3.0"
