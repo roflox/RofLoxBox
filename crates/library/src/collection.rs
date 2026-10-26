@@ -1,0 +1,585 @@
+//! The collection model and its storage.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::rekordbox_xml::{XmlLibrary, XmlNode};
+use crate::scan::ScannedFile;
+
+/// The name of the folder a rekordbox import puts its playlists in.
+pub const REKORDBOX_FOLDER: &str = "rekordbox";
+
+/// What a rekordbox import did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ImportSummary {
+    pub added: usize,
+    pub updated: usize,
+    pub playlists: usize,
+    /// Tracks whose file was not found on this computer.
+    pub missing: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    pub id: u32,
+    pub path: PathBuf,
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub genre: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub comment: String,
+    pub year: Option<u16>,
+    pub track_number: Option<u32>,
+    /// Seconds.
+    pub duration: f64,
+    pub bpm: Option<f64>,
+    /// As written in the tags (`Am`, `8A`, …).
+    pub key: Option<String>,
+    pub sample_rate: Option<u32>,
+    /// kbit/s.
+    pub bitrate: Option<u32>,
+    #[serde(default)]
+    pub has_artwork: bool,
+    /// 0–5 stars.
+    #[serde(default)]
+    pub rating: u8,
+    /// rekordbox colour label 1–8.
+    pub color: Option<u8>,
+    #[serde(default)]
+    pub play_count: u32,
+    /// Unix seconds.
+    pub added: u64,
+    pub last_played: Option<u64>,
+    /// File size and modification time when the tags were last read.
+    pub file_size: u64,
+    pub modified: u64,
+    /// Hot cues, memory cues and loops.
+    #[serde(default)]
+    pub cues: Vec<Cue>,
+    /// Beat grid: where the tempo starts or changes.
+    #[serde(default)]
+    pub tempo: Vec<TempoMarker>,
+}
+
+/// A beat-grid anchor: from `start` on, beats follow at `bpm`, and the beat
+/// at `start` is `beat` (1–4) of its bar.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TempoMarker {
+    /// Seconds.
+    pub start: f64,
+    pub bpm: f64,
+    pub beat: u8,
+}
+
+impl Track {
+    /// Every beat of the grid until `duration`: (seconds, position in bar 1–4).
+    pub fn beats(&self, duration: f64) -> Vec<(f64, u16)> {
+        let mut beats = Vec::new();
+        for (i, marker) in self.tempo.iter().enumerate() {
+            if marker.bpm <= 0.0 {
+                continue;
+            }
+            let end = self.tempo.get(i + 1).map_or(duration, |next| next.start);
+            let step = 60.0 / marker.bpm;
+            let mut n = 0u32;
+            loop {
+                let time = marker.start + f64::from(n) * step;
+                if time >= end - 1e-6 {
+                    break;
+                }
+                let position = (u32::from(marker.beat.clamp(1, 4)) - 1 + n) % 4 + 1;
+                beats.push((time, position as u16));
+                n += 1;
+            }
+        }
+        beats
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum CueKind {
+    /// Hot cue A = 0 … H = 7.
+    Hot(u8),
+    Memory,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cue {
+    pub kind: CueKind,
+    /// Seconds.
+    pub start: f64,
+    /// Loop end in seconds, for loops.
+    pub end: Option<f64>,
+    /// RGB.
+    pub color: Option<[u8; 3]>,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NodeKind {
+    Folder,
+    Playlist,
+}
+
+/// A playlist or a folder of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    pub id: u32,
+    pub name: String,
+    pub kind: NodeKind,
+    /// `None` at the top level.
+    pub parent: Option<u32>,
+    /// Playlist entries in order (a track may appear only once).
+    #[serde(default)]
+    pub tracks: Vec<u32>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Collection {
+    pub tracks: Vec<Track>,
+    /// Playlists and folders; siblings keep the order of this list.
+    pub nodes: Vec<Node>,
+    /// Folders that were added; rescanned to pick up new files.
+    pub folders: Vec<PathBuf>,
+    next_track: u32,
+    next_node: u32,
+    #[serde(skip)]
+    path: PathBuf,
+    #[serde(skip)]
+    dirty: bool,
+}
+
+pub(crate) fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+impl Collection {
+    /// Opens the collection stored at `path`, or an empty one if there is
+    /// no file yet.
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut collection: Collection = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("reading {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Collection::default(),
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        };
+        collection.path = path.to_path_buf();
+        collection.next_track = collection
+            .next_track
+            .max(collection.tracks.iter().map(|t| t.id + 1).max().unwrap_or(1));
+        collection.next_node =
+            collection.next_node.max(collection.nodes.iter().map(|n| n.id + 1).max().unwrap_or(1));
+        Ok(collection)
+    }
+
+    /// Writes the collection if it changed since it was opened or saved.
+    pub fn save(&mut self) -> Result<()> {
+        if !self.dirty || self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let temporary = self.path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(self)?)?;
+        std::fs::rename(&temporary, &self.path)
+            .with_context(|| format!("saving {}", self.path.display()))?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn track(&self, id: u32) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.id == id)
+    }
+
+    /// Changes a track; marks the collection for saving.
+    pub fn update_track(&mut self, id: u32, change: impl FnOnce(&mut Track)) {
+        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == id) {
+            change(track);
+            self.dirty = true;
+        }
+    }
+
+    /// (size, modified) of every known file, so a scan can skip unchanged ones.
+    pub fn known_files(&self) -> HashMap<PathBuf, (u64, u64)> {
+        self.tracks.iter().map(|t| (t.path.clone(), (t.file_size, t.modified))).collect()
+    }
+
+    /// Adds a folder to rescan later.
+    pub fn add_folder(&mut self, folder: &Path) {
+        if !self.folders.iter().any(|f| f == folder) {
+            self.folders.push(folder.to_path_buf());
+            self.dirty = true;
+        }
+    }
+
+    /// Merges scanned files: new files become tracks, known ones get their
+    /// tags refreshed (keeping rating, cues and play counts). Returns
+    /// (added, updated).
+    pub fn merge(&mut self, files: Vec<ScannedFile>) -> (usize, usize) {
+        let by_path: HashMap<PathBuf, usize> =
+            self.tracks.iter().enumerate().map(|(i, t)| (t.path.clone(), i)).collect();
+        let (mut added, mut updated) = (0, 0);
+        for file in files {
+            match by_path.get(&file.path) {
+                Some(&i) => {
+                    file.apply_to(&mut self.tracks[i]);
+                    updated += 1;
+                }
+                None => {
+                    let id = self.next_track;
+                    self.next_track += 1;
+                    self.tracks.push(file.into_track(id));
+                    added += 1;
+                }
+            }
+        }
+        if added + updated > 0 {
+            self.dirty = true;
+        }
+        (added, updated)
+    }
+
+    /// Tracks whose file is gone.
+    pub fn missing(&self) -> Vec<u32> {
+        self.tracks.iter().filter(|t| !t.path.is_file()).map(|t| t.id).collect()
+    }
+
+    /// Removes tracks from the collection and from every playlist.
+    pub fn remove_tracks(&mut self, ids: &[u32]) {
+        self.tracks.retain(|t| !ids.contains(&t.id));
+        for node in &mut self.nodes {
+            node.tracks.retain(|t| !ids.contains(t));
+        }
+        self.dirty = true;
+    }
+
+    /// Imports a rekordbox XML export. Tracks are matched by file path:
+    /// known ones get rekordbox's tags, grid, cues, rating and colour; new
+    /// ones are added. rekordbox's playlists replace the ones of the last
+    /// import, in a top-level folder called `rekordbox`.
+    pub fn import_rekordbox(&mut self, library: XmlLibrary) -> ImportSummary {
+        let mut summary = ImportSummary::default();
+        let mut by_path: HashMap<PathBuf, u32> =
+            self.tracks.iter().map(|t| (t.path.clone(), t.id)).collect();
+        let mut by_key: HashMap<String, u32> = HashMap::new();
+        let mut by_location: HashMap<String, u32> = HashMap::new();
+        for xml in library.tracks {
+            if !xml.file.path.is_file() {
+                summary.missing += 1;
+            }
+            let id = match by_path.get(&xml.file.path) {
+                Some(&id) => {
+                    summary.updated += 1;
+                    id
+                }
+                None => {
+                    let id = self.next_track;
+                    self.next_track += 1;
+                    self.tracks.push(xml.file.clone().into_track(id));
+                    by_path.insert(xml.file.path.clone(), id);
+                    summary.added += 1;
+                    id
+                }
+            };
+            if let Some(track) = self.tracks.iter_mut().find(|t| t.id == id) {
+                let (size, modified) = (track.file_size, track.modified);
+                xml.file.apply_to(track);
+                // Keep the stamp of the file as last read, so rescans still
+                // notice changes; rekordbox does not export one.
+                if modified != 0 {
+                    (track.file_size, track.modified) = (size, modified);
+                }
+                track.rating = xml.rating;
+                track.color = xml.color.or(track.color);
+                track.play_count = track.play_count.max(xml.play_count);
+                if let Some(added) = xml.added {
+                    track.added = added;
+                }
+                if !xml.tempo.is_empty() {
+                    track.tempo = xml.tempo;
+                }
+                if !xml.cues.is_empty() {
+                    track.cues = xml.cues;
+                }
+            }
+            by_key.insert(xml.id, id);
+            by_location.insert(xml.location, id);
+        }
+
+        // Replace the previous import's playlists.
+        let old: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.parent.is_none() && n.kind == NodeKind::Folder && n.name == REKORDBOX_FOLDER
+            })
+            .map(|n| n.id)
+            .collect();
+        for id in old {
+            self.delete(id);
+        }
+        let root = self.create(REKORDBOX_FOLDER, NodeKind::Folder, None);
+        fn add(
+            c: &mut Collection,
+            nodes: &[XmlNode],
+            parent: u32,
+            by_key: &HashMap<String, u32>,
+            by_location: &HashMap<String, u32>,
+            count: &mut usize,
+        ) {
+            for node in nodes {
+                match node {
+                    XmlNode::Folder { name, children } => {
+                        let folder = c.create(name, NodeKind::Folder, Some(parent));
+                        add(c, children, folder, by_key, by_location, count);
+                    }
+                    XmlNode::Playlist { name, keys, by_location: located } => {
+                        let list = c.create(name, NodeKind::Playlist, Some(parent));
+                        let map = if *located { by_location } else { by_key };
+                        let ids: Vec<u32> =
+                            keys.iter().filter_map(|k| map.get(k).copied()).collect();
+                        c.add_to_playlist(list, &ids);
+                        *count += 1;
+                    }
+                }
+            }
+        }
+        add(self, &library.playlists, root, &by_key, &by_location, &mut summary.playlists);
+        self.dirty = true;
+        summary
+    }
+
+    // Playlists
+
+    pub fn node(&self, id: u32) -> Option<&Node> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    fn node_mut(&mut self, id: u32) -> Option<&mut Node> {
+        self.nodes.iter_mut().find(|n| n.id == id)
+    }
+
+    /// Creates a playlist or folder at the end of `parent` (which must be a
+    /// folder, or `None` for the top level).
+    pub fn create(&mut self, name: &str, kind: NodeKind, parent: Option<u32>) -> u32 {
+        let parent = parent.filter(|p| self.node(*p).is_some_and(|n| n.kind == NodeKind::Folder));
+        let id = self.next_node;
+        self.next_node += 1;
+        self.nodes.push(Node { id, name: name.to_owned(), kind, parent, tracks: Vec::new() });
+        self.dirty = true;
+        id
+    }
+
+    pub fn rename(&mut self, id: u32, name: &str) {
+        if let Some(node) = self.node_mut(id) {
+            node.name = name.to_owned();
+            self.dirty = true;
+        }
+    }
+
+    /// Deletes a playlist, or a folder with everything in it.
+    pub fn delete(&mut self, id: u32) {
+        let mut doomed = vec![id];
+        let mut i = 0;
+        while i < doomed.len() {
+            let parent = doomed[i];
+            doomed.extend(self.nodes.iter().filter(|n| n.parent == Some(parent)).map(|n| n.id));
+            i += 1;
+        }
+        self.nodes.retain(|n| !doomed.contains(&n.id));
+        self.dirty = true;
+    }
+
+    /// Appends tracks to a playlist, skipping ones already in it.
+    pub fn add_to_playlist(&mut self, id: u32, tracks: &[u32]) -> usize {
+        let Some(node) = self.node_mut(id).filter(|n| n.kind == NodeKind::Playlist) else {
+            return 0;
+        };
+        let before = node.tracks.len();
+        for &track in tracks {
+            if !node.tracks.contains(&track) {
+                node.tracks.push(track);
+            }
+        }
+        let added = node.tracks.len() - before;
+        self.dirty |= added > 0;
+        added
+    }
+
+    pub fn remove_from_playlist(&mut self, id: u32, tracks: &[u32]) {
+        if let Some(node) = self.node_mut(id) {
+            node.tracks.retain(|t| !tracks.contains(t));
+            self.dirty = true;
+        }
+    }
+
+    /// Moves a playlist entry to another position.
+    pub fn move_in_playlist(&mut self, id: u32, from: usize, to: usize) {
+        if let Some(node) = self.node_mut(id)
+            && from < node.tracks.len()
+        {
+            let track = node.tracks.remove(from);
+            node.tracks.insert(to.min(node.tracks.len()), track);
+            self.dirty = true;
+        }
+    }
+
+    /// Moves a node into another folder (or the top level), not into itself
+    /// or its own children.
+    pub fn move_node(&mut self, id: u32, parent: Option<u32>) {
+        let mut ancestor = parent;
+        while let Some(a) = ancestor {
+            if a == id {
+                return;
+            }
+            ancestor = self.node(a).and_then(|n| n.parent);
+        }
+        if parent.is_some_and(|p| self.node(p).is_none_or(|n| n.kind != NodeKind::Folder)) {
+            return;
+        }
+        if let Some(node) = self.node_mut(id) {
+            node.parent = parent;
+            self.dirty = true;
+        }
+    }
+
+    /// The tree in display order: (depth, node).
+    pub fn tree(&self) -> Vec<(usize, &Node)> {
+        fn walk<'a>(
+            c: &'a Collection,
+            parent: Option<u32>,
+            depth: usize,
+            out: &mut Vec<(usize, &'a Node)>,
+        ) {
+            for node in c.nodes.iter().filter(|n| n.parent == parent) {
+                out.push((depth, node));
+                if node.kind == NodeKind::Folder {
+                    walk(c, Some(node.id), depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, None, 0, &mut out);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scanned(path: &str, title: &str) -> ScannedFile {
+        ScannedFile { path: PathBuf::from(path), title: title.to_owned(), ..ScannedFile::default() }
+    }
+
+    #[test]
+    fn merging_keeps_user_data_and_ids() {
+        let mut c = Collection::default();
+        assert_eq!(c.merge(vec![scanned("/a.mp3", "A"), scanned("/b.mp3", "B")]), (2, 0));
+        let a = c.tracks[0].id;
+        c.update_track(a, |t| t.rating = 4);
+        assert_eq!(c.merge(vec![scanned("/a.mp3", "A (remaster)")]), (0, 1));
+        let track = c.track(a).unwrap();
+        assert_eq!((track.title.as_str(), track.rating), ("A (remaster)", 4));
+        assert_ne!(c.tracks[1].id, a);
+    }
+
+    #[test]
+    fn playlists_nest_and_delete_with_their_contents() {
+        let mut c = Collection::default();
+        c.merge(vec![scanned("/a.mp3", "A"), scanned("/b.mp3", "B")]);
+        let (a, b) = (c.tracks[0].id, c.tracks[1].id);
+        let folder = c.create("Sets", NodeKind::Folder, None);
+        let list = c.create("Friday", NodeKind::Playlist, Some(folder));
+        let top = c.create("Warmup", NodeKind::Playlist, None);
+        assert_eq!(c.add_to_playlist(list, &[a, b, a]), 2);
+        c.move_in_playlist(list, 1, 0);
+        assert_eq!(c.node(list).unwrap().tracks, [b, a]);
+        let names: Vec<_> = c.tree().iter().map(|(d, n)| (*d, n.name.as_str())).collect();
+        assert_eq!(names, [(0, "Sets"), (1, "Friday"), (0, "Warmup")]);
+        // A folder cannot go inside itself.
+        c.move_node(folder, Some(folder));
+        assert_eq!(c.node(folder).unwrap().parent, None);
+        c.remove_tracks(&[a]);
+        assert_eq!(c.node(list).unwrap().tracks, [b]);
+        c.delete(folder);
+        assert!(c.node(list).is_none() && c.node(top).is_some());
+    }
+
+    #[test]
+    fn saves_and_reopens() {
+        let dir = std::env::temp_dir().join(format!("deckhand-collection-{}", std::process::id()));
+        let path = dir.join("collection.json");
+        let mut c = Collection::open(&path).unwrap();
+        c.merge(vec![scanned("/a.mp3", "A")]);
+        let list = c.create("Set", NodeKind::Playlist, None);
+        c.add_to_playlist(list, &[c.tracks[0].id]);
+        c.save().unwrap();
+        let mut reopened = Collection::open(&path).unwrap();
+        assert_eq!(reopened.tracks, c.tracks);
+        assert_eq!(reopened.nodes, c.nodes);
+        // New ids continue after the stored ones.
+        reopened.merge(vec![scanned("/b.mp3", "B")]);
+        assert!(reopened.tracks[1].id > reopened.tracks[0].id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn grid_expands_to_beats_with_bar_positions() {
+        let mut c = Collection::default();
+        c.merge(vec![scanned("/a.mp3", "A")]);
+        let id = c.tracks[0].id;
+        c.update_track(id, |t| {
+            t.tempo = vec![
+                TempoMarker { start: 0.5, bpm: 120.0, beat: 3 },
+                TempoMarker { start: 2.0, bpm: 60.0, beat: 2 },
+            ]
+        });
+        let beats = c.track(id).unwrap().beats(4.0);
+        assert_eq!(beats, [(0.5, 3), (1.0, 4), (1.5, 1), (2.0, 2), (3.0, 3)]);
+    }
+
+    #[test]
+    fn rekordbox_import_merges_tracks_and_replaces_its_playlists() {
+        let xml = br#"<DJ_PLAYLISTS><COLLECTION>
+            <TRACK TrackID="7" Name="A" Location="file://localhost/a.mp3" Rating="255">
+              <TEMPO Inizio="0.1" Bpm="128" Metro="4/4" Battito="1"/>
+              <POSITION_MARK Type="0" Start="1.5" Num="0"/>
+            </TRACK>
+            <TRACK TrackID="8" Name="New" Location="file://localhost/new.mp3"/>
+          </COLLECTION><PLAYLISTS><NODE Type="0" Name="ROOT">
+            <NODE Name="Set" Type="1" KeyType="0"><TRACK Key="8"/><TRACK Key="7"/></NODE>
+          </NODE></PLAYLISTS></DJ_PLAYLISTS>"#;
+        let mut c = Collection::default();
+        c.merge(vec![scanned("/a.mp3", "A (old tags)")]);
+        let a = c.tracks[0].id;
+        let summary = c.import_rekordbox(XmlLibrary::parse(xml).unwrap());
+        assert_eq!((summary.added, summary.updated, summary.playlists), (1, 1, 1));
+        let track = c.track(a).unwrap();
+        assert_eq!((track.title.as_str(), track.rating, track.cues.len()), ("A", 5, 1));
+        assert_eq!(track.tempo[0].bpm, 128.0);
+        let set = c.tree().into_iter().find(|(_, n)| n.name == "Set").unwrap().1.clone();
+        assert_eq!(set.tracks.len(), 2);
+        assert_eq!(set.tracks[1], a);
+        // Importing again replaces the playlists instead of adding copies.
+        c.import_rekordbox(XmlLibrary::parse(xml).unwrap());
+        assert_eq!(c.tree().iter().filter(|(_, n)| n.name == "Set").count(), 1);
+        assert_eq!(c.tracks.len(), 2);
+    }
+}

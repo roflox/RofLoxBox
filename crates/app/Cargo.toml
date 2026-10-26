@@ -1,0 +1,19 @@
+[package]
+name = "deckhand-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+deckhand-audio = { version = "0.1.0", path = "../audio" }
+deckhand-control = { version = "0.1.0", path = "../control" }
+deckhand-formats = { version = "0.1.0", path = "../formats" }
+deckhand-library = { version = "0.1.0", path = "../library" }
+eframe = "0.33.3"
+egui_extras = "0.33"
+png = "0.18.1"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
