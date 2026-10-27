@@ -27,6 +27,8 @@ pub struct XmlTrack {
     pub added: Option<u64>,
     pub tempo: Vec<TempoMarker>,
     pub cues: Vec<Cue>,
+    /// rekordbox's analysis file (`.DAT`), when known (USB imports).
+    pub analysis: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +212,7 @@ fn parse_track<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> XmlTrack {
         added: get("DateAdded").and_then(unix_date),
         tempo: Vec::new(),
         cues: Vec::new(),
+        analysis: None,
     }
 }
 

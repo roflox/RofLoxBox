@@ -1,5 +1,6 @@
 //! The library of a USB/SD export: playlists and tracks from `export.pdb`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,6 +20,15 @@ pub struct UsbLibrary {
     pub root: PathBuf,
     pub library: Library,
     pub playlists: Vec<PlaylistRow>,
+    /// The selected playlist (index into `playlists`); `None`: all tracks.
+    pub playlist: Option<usize>,
+    /// Folders closed in the sidebar (indexes into `playlists`).
+    pub collapsed: HashSet<usize>,
+    /// Its section in the sidebar is open.
+    pub open: bool,
+    /// A drive of its own (a USB stick or SD card) that can be ejected,
+    /// rather than a folder on another disk.
+    pub removable: bool,
 }
 
 impl UsbLibrary {
@@ -28,7 +38,15 @@ impl UsbLibrary {
         let library = Library::open(&pdb).with_context(|| format!("reading {}", pdb.display()))?;
         let mut playlists = Vec::new();
         flatten(&library.playlists, 0, &mut playlists);
-        Ok(Self { root: root.to_path_buf(), library, playlists })
+        Ok(Self {
+            root: root.to_path_buf(),
+            library,
+            playlists,
+            playlist: None,
+            collapsed: HashSet::new(),
+            open: true,
+            removable: is_drive(root),
+        })
     }
 
     /// The name shown for the medium.
@@ -103,6 +121,51 @@ pub fn find_exports() -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+/// Whether a path is the root of a mounted drive (`/Volumes/NAME`, `E:\`).
+fn is_drive(path: &Path) -> bool {
+    if cfg!(windows) {
+        path.parent().is_none()
+    } else {
+        path.parent() == Some(Path::new("/Volumes"))
+    }
+}
+
+/// Safely removes a drive, like the Finder's or Explorer's Eject.
+pub fn eject(root: &Path) -> anyhow::Result<()> {
+    use std::process::Command;
+    let output = if cfg!(target_os = "macos") {
+        Command::new("diskutil").arg("eject").arg(root).output()
+    } else if cfg!(windows) {
+        // Explorer's Eject verb on the drive ("This PC" is namespace 17).
+        let drive = root.to_string_lossy().trim_end_matches('\\').to_owned();
+        let script = format!(
+            "(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{drive}').InvokeVerb('Eject')"
+        );
+        Command::new("powershell").args(["-NoProfile", "-Command", &script]).output()
+    } else {
+        Command::new("umount").arg(root).output()
+    }
+    .context("starting the eject command")?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        anyhow::bail!(
+            "{}",
+            if message.is_empty() { "the drive is in use".to_owned() } else { message }
+        );
+    }
+    if cfg!(windows) {
+        // The verb reports nothing; give Windows a moment, then check.
+        for _ in 0..20 {
+            if !root.exists() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        anyhow::bail!("Windows did not eject the drive; is a file on it still open?");
+    }
+    Ok(())
 }
 
 /// `m:ss` for a duration in seconds.

@@ -73,6 +73,10 @@ pub struct Track {
     /// The audio file is never changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edited: Vec<EditedField>,
+    /// rekordbox's analysis of the track (`.DAT`, with `.EXT` and `.2EX`
+    /// beside it), kept from a USB import: waveforms, grid and cues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<PathBuf>,
 }
 
 /// A track field that can be edited in deckhand.
@@ -333,6 +337,19 @@ impl Collection {
     /// ones are added. rekordbox's playlists replace the ones of the last
     /// import, in a top-level folder called `rekordbox`.
     pub fn import_rekordbox(&mut self, library: XmlLibrary) -> ImportSummary {
+        self.import_into(library, REKORDBOX_FOLDER, true)
+    }
+
+    /// Imports tracks and playlists like [`Collection::import_rekordbox`],
+    /// with the playlists in the top-level folder `folder`. With `replace`,
+    /// that folder is rebuilt; without, its playlists of the same names are
+    /// replaced and the others kept.
+    pub fn import_into(
+        &mut self,
+        library: XmlLibrary,
+        folder: &str,
+        replace: bool,
+    ) -> ImportSummary {
         let mut summary = ImportSummary::default();
         let mut by_path: HashMap<PathBuf, u32> =
             self.tracks.iter().map(|t| (t.path.clone(), t.id)).collect();
@@ -376,24 +393,51 @@ impl Collection {
                 if !xml.cues.is_empty() {
                     track.cues = xml.cues;
                 }
+                if xml.analysis.is_some() {
+                    track.analysis = xml.analysis;
+                }
             }
             by_key.insert(xml.id, id);
             by_location.insert(xml.location, id);
         }
 
-        // Replace the previous import's playlists.
-        let old: Vec<u32> = self
+        let existing: Vec<u32> = self
             .nodes
             .iter()
-            .filter(|n| {
-                n.parent.is_none() && n.kind == NodeKind::Folder && n.name == REKORDBOX_FOLDER
-            })
+            .filter(|n| n.parent.is_none() && n.kind == NodeKind::Folder && n.name == folder)
             .map(|n| n.id)
             .collect();
-        for id in old {
-            self.delete(id);
-        }
-        let root = self.create(REKORDBOX_FOLDER, NodeKind::Folder, None);
+        let root = match existing.first() {
+            Some(&root) if !replace => {
+                // Playlists imported again replace their earlier copies.
+                let names: Vec<&str> = library
+                    .playlists
+                    .iter()
+                    .map(|n| match n {
+                        XmlNode::Folder { name, .. } | XmlNode::Playlist { name, .. } => {
+                            name.as_str()
+                        }
+                    })
+                    .collect();
+                let old: Vec<u32> = self
+                    .nodes
+                    .iter()
+                    .filter(|n| n.parent == Some(root) && names.contains(&n.name.as_str()))
+                    .map(|n| n.id)
+                    .collect();
+                for id in old {
+                    self.delete(id);
+                }
+                root
+            }
+            _ => {
+                // Replace the previous import's playlists.
+                for id in existing {
+                    self.delete(id);
+                }
+                self.create(folder, NodeKind::Folder, None)
+            }
+        };
         fn add(
             c: &mut Collection,
             nodes: &[XmlNode],

@@ -69,6 +69,31 @@ impl DeckElement {
         Self::Nudge,
     ];
 
+    /// Groups for the View menu: (name, elements).
+    pub const GROUPS: [(&'static str, &'static [DeckElement]); 7] = [
+        ("Track info", &[Self::Header, Self::Title, Self::Info, Self::Overview]),
+        (
+            "Transport",
+            &[
+                Self::Cue,
+                Self::Play,
+                Self::Sync,
+                Self::Master,
+                Self::Quantize,
+                Self::Vinyl,
+                Self::Slip,
+            ],
+        ),
+        ("Loops", &[Self::LoopInOut, Self::LoopResize, Self::BeatLoops, Self::BeatJump]),
+        ("Cues", &[Self::Gate, Self::MemoryCall, Self::MemorySet]),
+        ("Pads", &[Self::PadModes, Self::PadShift, Self::Pads]),
+        (
+            "Tempo",
+            &[Self::TempoRange, Self::MasterTempo, Self::TempoFader, Self::TempoReset, Self::Nudge],
+        ),
+        ("Key", &[Self::KeyShift, Self::KeySyncTap]),
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Header => "Deck name",
@@ -127,8 +152,121 @@ pub struct DeckLayout {
     pub hidden: Vec<DeckElement>,
 }
 
+/// The "Default" preset: the controller does the transport, loops, memory
+/// cues and key, so the screen keeps what it shows best.
 impl Default for DeckLayout {
     fn default() -> Self {
+        use DeckElement as E;
+        Self {
+            hidden: vec![
+                E::LoopInOut,
+                E::LoopResize,
+                E::BeatLoops,
+                E::BeatJump,
+                E::Cue,
+                E::Play,
+                E::MemoryCall,
+                E::MemorySet,
+                E::PadShift,
+                E::KeyShift,
+                E::KeySyncTap,
+                E::TempoFader,
+            ],
+            ..Self::everything()
+        }
+    }
+}
+
+/// A view saved under a name (View → View presets): the deck elements and,
+/// for presets saved since view presets exist, the rest of the view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutPreset {
+    pub name: String,
+    pub layout: DeckLayout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewSettings>,
+}
+
+/// Everything in the View menu besides the deck elements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewSettings {
+    pub vertical_waveforms: bool,
+    pub show_waveforms: bool,
+    pub show_mixer: bool,
+    pub show_library: bool,
+    pub show_fx: bool,
+    pub screen_layout: crate::screen_layout::ScreenLayout,
+    pub hidden_mixer_parts: Vec<crate::parts::MixerPart>,
+    pub hidden_fx_parts: Vec<crate::parts::FxPart>,
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self {
+            vertical_waveforms: false,
+            show_waveforms: true,
+            show_mixer: true,
+            show_library: true,
+            show_fx: true,
+            screen_layout: Default::default(),
+            hidden_mixer_parts: Vec::new(),
+            hidden_fx_parts: Vec::new(),
+        }
+    }
+}
+
+impl ViewSettings {
+    /// The same view (hidden parts in any order).
+    pub fn matches(&self, other: &Self) -> bool {
+        fn same<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+            a.len() == b.len() && a.iter().all(|x| b.contains(x))
+        }
+        let plain = |v: &Self| {
+            (
+                v.vertical_waveforms,
+                v.show_waveforms,
+                v.show_mixer,
+                v.show_library,
+                v.show_fx,
+                v.screen_layout.clone(),
+            )
+        };
+        plain(self) == plain(other)
+            && same(&self.hidden_mixer_parts, &other.hidden_mixer_parts)
+            && same(&self.hidden_fx_parts, &other.hidden_fx_parts)
+    }
+}
+
+impl LayoutPreset {
+    /// Presets that come with the app.
+    pub fn built_in() -> Vec<LayoutPreset> {
+        let preset = |name: &str, layout, view| LayoutPreset {
+            name: name.to_owned(),
+            layout,
+            view: Some(view),
+        };
+        vec![
+            preset("Default", DeckLayout::default(), ViewSettings::default()),
+            preset("Everything", DeckLayout::everything(), ViewSettings::default()),
+            // The controller is the mixer: waveforms between the decks, no
+            // mixer on screen.
+            preset(
+                "Vertical, mixer on the controller",
+                DeckLayout::default(),
+                ViewSettings {
+                    vertical_waveforms: true,
+                    show_mixer: false,
+                    ..ViewSettings::default()
+                },
+            ),
+        ]
+    }
+}
+
+impl DeckLayout {
+    /// Every element shown.
+    pub fn everything() -> Self {
         use DeckElement as E;
         Self {
             main: vec![
@@ -158,14 +296,9 @@ impl Default for DeckLayout {
 }
 
 impl DeckLayout {
-    /// The four-deck default: the loop buttons are left to the controller
-    /// so that two decks fit above each other.
+    /// The four-deck default (the same as for two decks).
     pub fn four_decks() -> Self {
-        use DeckElement as E;
-        Self {
-            hidden: vec![E::LoopInOut, E::LoopResize, E::BeatLoops, E::BeatJump],
-            ..Self::default()
-        }
+        Self::default()
     }
 
     pub fn is_shown(&self, element: DeckElement) -> bool {
@@ -244,6 +377,14 @@ impl DeckLayout {
 mod tests {
     use super::*;
     use DeckElement as E;
+
+    #[test]
+    fn groups_hold_every_element_once() {
+        let grouped: Vec<DeckElement> =
+            DeckElement::GROUPS.iter().flat_map(|(_, e)| e.iter().copied()).collect();
+        assert_eq!(grouped.len(), DeckElement::ALL.len());
+        assert!(DeckElement::ALL.iter().all(|e| grouped.contains(e)));
+    }
 
     #[test]
     fn default_has_every_element_once() {
