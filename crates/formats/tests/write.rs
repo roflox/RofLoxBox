@@ -297,3 +297,131 @@ fn edge_case_rows_round_trip() {
     assert!(genres.iter().zip(10..).all(|(g, id)| g.id == id && g.name == format!("Genre {id}")));
     assert!(db.table_pages(db.table(TableType::Genres).unwrap()).unwrap().len() > 3);
 }
+
+/// Playlist edits on a real export (`DECKHAND_TEST_PDB`, edited as a copy;
+/// skipped without it) keep every other row and read back as expected.
+#[test]
+fn playlist_edits_on_a_real_export() {
+    use deckhand_formats::pdb::{Library, PlaylistTables, TableType, edit_playlists};
+    let Some(original) = std::env::var_os("DECKHAND_TEST_PDB") else { return };
+    let dir = std::env::temp_dir().join(format!("deckhand-pdb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdb = dir.join("export.pdb");
+    std::fs::copy(&original, &pdb).unwrap();
+    let before = Database::open(&pdb).unwrap();
+    let tables_before = PlaylistTables::read(&before).unwrap();
+    let tracks: Vec<u32> = Library::from_database(&before)
+        .unwrap()
+        .tracks
+        .iter()
+        .take(3)
+        .map(|t| t.track.id)
+        .collect();
+    let (renamed, deleted) = {
+        let mut ids = tables_before.nodes.iter().filter(|n| !n.is_folder).map(|n| n.id);
+        (ids.next().unwrap(), ids.next().unwrap())
+    };
+
+    let new = edit_playlists(&pdb, |t| {
+        let new = t.create("RofLoxBox test", false, None);
+        t.add_tracks(new, &tracks);
+        t.rename(renamed, "Renamed by RofLoxBox");
+        t.delete(deleted);
+        new
+    })
+    .unwrap();
+    assert!(deckhand_formats::pdb::backup_path(&pdb).is_file(), "backup made");
+
+    let after = Database::open(&pdb).unwrap();
+    // Every table but the playlist ones keeps its rows: the same values for
+    // the tables deckhand understands (rekordbox leaves stale bytes after
+    // some rows, which are not copied), the same bytes for the others.
+    fn same<T: deckhand_formats::pdb::FromRow + PartialEq + std::fmt::Debug>(
+        a: &Database,
+        b: &Database,
+    ) {
+        let (x, y): (Vec<T>, Vec<T>) = (a.read_all().unwrap(), b.read_all().unwrap());
+        assert_eq!(x.len(), y.len(), "{:?}", T::TABLE);
+        for (x, y) in x.iter().zip(&y) {
+            assert_eq!(x, y);
+        }
+    }
+    use deckhand_formats::pdb::{
+        Album, Artist, Artwork, Color, ColumnEntry, Genre, HistoryEntry, HistoryPlaylist, Key,
+        Label, Track,
+    };
+    same::<Track>(&before, &after);
+    same::<Artist>(&before, &after);
+    same::<Album>(&before, &after);
+    same::<Genre>(&before, &after);
+    same::<Label>(&before, &after);
+    same::<Key>(&before, &after);
+    same::<Color>(&before, &after);
+    same::<Artwork>(&before, &after);
+    same::<ColumnEntry>(&before, &after);
+    same::<HistoryPlaylist>(&before, &after);
+    same::<HistoryEntry>(&before, &after);
+    for table in before.tables() {
+        if matches!(table.table_type, TableType::History | TableType::Unknown(_)) {
+            let other = after.table(table.table_type).unwrap();
+            assert_eq!(before.raw_rows(table).unwrap(), after.raw_rows(other).unwrap());
+        }
+    }
+    let t = PlaylistTables::read(&after).unwrap();
+    assert_eq!(t.tracks(new), tracks);
+    assert_eq!(t.nodes.iter().find(|n| n.id == renamed).unwrap().name, "Renamed by RofLoxBox");
+    assert!(t.nodes.iter().all(|n| n.id != deleted));
+    assert_eq!(t.nodes.len(), tables_before.nodes.len());
+    let library = Library::from_database(&after).unwrap();
+    assert!(library.playlists.iter().any(|p| p.name == "RofLoxBox test"));
+
+    // rekordcrate reads it too.
+    {
+        use binrw::BinRead;
+        use rekordcrate::pdb::{Header, PageType};
+        let mut cursor = std::io::Cursor::new(std::fs::read(&pdb).unwrap());
+        let header = Header::read(&mut cursor).unwrap();
+        for theirs in &header.tables {
+            if matches!(theirs.page_type, PageType::Unknown(_)) {
+                continue;
+            }
+            header
+                .read_pages(
+                    &mut cursor,
+                    binrw::Endian::NATIVE,
+                    (&theirs.first_page, &theirs.last_page),
+                )
+                .unwrap();
+        }
+    }
+    // Tracks no playlist uses go; everything else stays consistent.
+    {
+        use deckhand_formats::pdb::{Track, remove_tracks};
+        // Leave one playlist, so that tracks become unused.
+        edit_playlists(&pdb, |t| {
+            let ids: Vec<u32> = t.nodes.iter().map(|n| n.id).collect();
+            for id in ids.into_iter().skip(1) {
+                t.delete(id);
+            }
+        })
+        .unwrap();
+        let db = Database::open(&pdb).unwrap();
+        let tables = PlaylistTables::read(&db).unwrap();
+        let tracks: Vec<Track> = db.read_all().unwrap();
+        let unused: Vec<u32> = tracks
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| tables.entries.iter().all(|e| e.track_id != *id))
+            .collect();
+        let removed = remove_tracks(&pdb, &unused).unwrap();
+        assert_eq!(removed.len(), unused.len());
+        let db = Database::open(&pdb).unwrap();
+        let left: Vec<Track> = db.read_all().unwrap();
+        assert_eq!(left.len(), tracks.len() - unused.len());
+        let tables = PlaylistTables::read(&db).unwrap();
+        assert!(tables.entries.iter().all(|e| left.iter().any(|t| t.id == e.track_id)));
+        println!("removed {} of {} tracks", unused.len(), tracks.len());
+        assert!(!unused.is_empty());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

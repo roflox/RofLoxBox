@@ -53,6 +53,12 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             lock(ui, &mut p.needle_lock);
             ui.label(RichText::new("Locked: clicking the overview of a playing deck does not jump.").small().weak());
         });
+        section(ui, "Key display format", |ui| {
+            use crate::deck::KeyNotation;
+            ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
+            ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
+            ui.label(RichText::new("On the decks and in the track lists, whatever the tags say.").small().weak());
+        });
         section(ui, "Memory Cue Call Lock", |ui| {
             lock(ui, &mut p.memory_call_lock);
             ui.label(RichText::new("Locked: memory cues are not called on a playing deck.").small().weak());
@@ -114,6 +120,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.load_lock = defaults.load_lock;
             p.needle_lock = defaults.needle_lock;
             p.memory_call_lock = defaults.memory_call_lock;
+            p.key_notation = defaults.key_notation;
             p.call_resizes_loop = defaults.call_resizes_loop;
             p.gate_while_playing = defaults.gate_while_playing;
             p.start_at_first_cue = defaults.start_at_first_cue;

@@ -9,6 +9,8 @@ use deckhand_formats::pdb::{Library, LibraryTrack, PlaylistKind, PlaylistNode};
 /// A playlist entry in the sidebar, flattened with its nesting depth.
 #[derive(Debug, Clone)]
 pub struct PlaylistRow {
+    /// The playlist's or folder's id in `export.pdb`.
+    pub id: u32,
     pub name: String,
     pub depth: usize,
     /// `None` for folders.
@@ -83,6 +85,17 @@ impl UsbLibrary {
         }
     }
 
+    /// The export's database.
+    pub fn pdb_path(&self) -> PathBuf {
+        self.root.join("PIONEER/rekordbox/export.pdb")
+    }
+
+    /// The stick also holds rekordbox's newer OneLibrary (Device Library
+    /// Plus), which deckhand cannot update.
+    pub fn has_one_library(&self) -> bool {
+        self.root.join("PIONEER/rekordbox/exportLibrary.db").is_file()
+    }
+
     /// Absolute path of a file referenced from the export (`/Contents/…`).
     pub fn resolve(&self, export_path: &str) -> PathBuf {
         self.root.join(export_path.trim_start_matches('/'))
@@ -93,11 +106,17 @@ fn flatten(nodes: &[PlaylistNode], depth: usize, out: &mut Vec<PlaylistRow>) {
     for node in nodes {
         match &node.kind {
             PlaylistKind::Folder(children) => {
-                out.push(PlaylistRow { name: node.name.clone(), depth, track_ids: None });
+                out.push(PlaylistRow {
+                    id: node.id,
+                    name: node.name.clone(),
+                    depth,
+                    track_ids: None,
+                });
                 flatten(children, depth + 1, out);
             }
             PlaylistKind::Playlist(ids) => {
                 out.push(PlaylistRow {
+                    id: node.id,
                     name: node.name.clone(),
                     depth,
                     track_ids: Some(ids.clone()),

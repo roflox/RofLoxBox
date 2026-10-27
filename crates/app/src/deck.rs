@@ -1140,6 +1140,38 @@ pub fn key_name((pitch, minor): (i32, bool)) -> String {
     format!("{}{}", NOTES[pitch.rem_euclid(12) as usize], if minor { "m" } else { "" })
 }
 
+/// How keys are written, like rekordbox's "Key display format".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyNotation {
+    /// `Fm`, `Ab`
+    Classic,
+    /// The Camelot wheel: `4A`, `4B`.
+    #[default]
+    Alphanumeric,
+}
+
+/// Camelot number 1–12 of a key: 8A = A minor, 8B = C major, each step a fifth.
+pub fn camelot_number((pitch, minor): (i32, bool)) -> i32 {
+    let base = if minor { 9 } else { 0 };
+    ((pitch - base) * 7 + 7).rem_euclid(12) + 1
+}
+
+pub fn format_key(key: (i32, bool), notation: KeyNotation) -> String {
+    match notation {
+        KeyNotation::Classic => key_name(key),
+        KeyNotation::Alphanumeric => {
+            format!("{}{}", camelot_number(key), if key.1 { 'A' } else { 'B' })
+        }
+    }
+}
+
+/// A key as written in tags or an export, rewritten in `notation`; text
+/// that is not a key stays as it is.
+pub fn display_key(text: &str, notation: KeyNotation) -> String {
+    parse_key(text).map_or_else(|| text.to_owned(), |key| format_key(key, notation))
+}
+
 /// Semitones (−6 … +5) that bring `own` to `target`, or to its relative
 /// major/minor when the modes differ.
 pub fn key_sync_shift(own: (i32, bool), target: (i32, bool)) -> i32 {
@@ -1184,6 +1216,7 @@ pub fn eq_db(knob: f32, isolator: bool) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeckPrefs {
     pub memory_call_lock: bool,
+    pub key_notation: KeyNotation,
     pub call_resizes_loop: bool,
     /// Gated hot cues also stop on release when the deck was playing.
     pub gate_while_playing: bool,
@@ -1203,6 +1236,7 @@ impl Default for DeckPrefs {
     fn default() -> Self {
         Self {
             memory_call_lock: true,
+            key_notation: KeyNotation::default(),
             call_resizes_loop: false,
             gate_while_playing: false,
             start_at_first_cue: true,
@@ -1495,6 +1529,22 @@ mod tests {
         assert_eq!(parse_key("1B"), Some((11, false)));
         assert_eq!(parse_key("12A"), Some((1, true)));
         assert_eq!(key_name((10, true)), "Bbm");
+        let both = |text: &str| {
+            (display_key(text, KeyNotation::Classic), display_key(text, KeyNotation::Alphanumeric))
+        };
+        assert_eq!(both("4A"), ("Fm".into(), "4A".into()));
+        assert_eq!(both("Fm"), ("Fm".into(), "4A".into()));
+        assert_eq!(both("C"), ("C".into(), "8B".into()));
+        assert_eq!(both("Am"), ("Am".into(), "8A".into()));
+        assert_eq!(both("12A"), ("C#m".into(), "12A".into()));
+        assert_eq!(both("1B"), ("B".into(), "1B".into()));
+        assert_eq!(both("?"), ("?".into(), "?".into()));
+        for number in 1..=12 {
+            for letter in ["A", "B"] {
+                let camelot = format!("{number}{letter}");
+                assert_eq!(display_key(&camelot, KeyNotation::Alphanumeric), camelot);
+            }
+        }
         // Am → Bm: up two; Am → C (its relative major): no change.
         assert_eq!(key_sync_shift((9, true), (11, true)), 2);
         assert_eq!(key_sync_shift((9, true), (0, false)), 0);

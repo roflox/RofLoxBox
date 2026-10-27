@@ -8,12 +8,14 @@
 mod defaults;
 mod encode;
 mod library;
+mod playlists;
 mod rows;
 mod string;
 mod write;
 
 pub use encode::{EncodedRow, ToRow};
 pub use library::{HistoryList, Library, LibraryTrack, PlaylistKind, PlaylistNode};
+pub use playlists::{PlaylistTables, backup_path, edit_playlists, remove_tracks, write_safely};
 pub use rows::{
     Album, Artist, Artwork, Color, ColumnEntry, FromRow, Genre, HistoryEntry, HistoryPlaylist, Key,
     Label, PlaylistEntry, PlaylistTreeNode, Tag, TagTrack, Track, TrackExtras,

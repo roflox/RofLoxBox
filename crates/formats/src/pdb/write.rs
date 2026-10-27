@@ -91,6 +91,17 @@ impl DatabaseWriter {
         Ok(writer)
     }
 
+    /// Replaces every row of `T`'s table.
+    pub fn replace_rows<T: ToRow>(&mut self, rows: &[T]) {
+        let raw = T::TABLE.to_raw(self.schema) as usize;
+        if let Some(table) = self.tables.get_mut(raw) {
+            table.clear();
+        }
+        for row in rows {
+            self.push(row);
+        }
+    }
+
     pub fn push<T: ToRow>(&mut self, row: &T) {
         self.push_encoded(T::TABLE, row.to_row());
     }
