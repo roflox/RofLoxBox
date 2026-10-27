@@ -68,6 +68,7 @@ impl ScannedFile {
             cues: Vec::new(),
             tempo: Vec::new(),
             edited: Vec::new(),
+            analysis: None,
         };
         self.apply_to(&mut track);
         track
@@ -113,7 +114,8 @@ impl ScannedFile {
     }
 }
 
-fn file_stamp(path: &Path) -> (u64, u64) {
+/// A file's size and modification time (Unix seconds), as scans record them.
+pub fn file_stamp(path: &Path) -> (u64, u64) {
     std::fs::metadata(path).map_or((0, 0), |m| {
         let modified = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
         (m.len(), modified.map_or(0, |d| d.as_secs()))

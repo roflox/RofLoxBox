@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 
 use deckhand_library::{NodeKind, Scan};
-use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Stroke, Ui, vec2};
+use eframe::egui::{self, RichText, Stroke, Ui};
 
-use super::{ACTIVE, DeckhandApp, Focus, WARN};
+use super::{DeckhandApp, Focus, WARN};
 use crate::browser::{Row, TableOptions, sort_rows, track_table};
 
 /// Browser state for the collection.
@@ -177,88 +177,74 @@ impl DeckhandApp {
         });
     }
 
-    pub(super) fn collection_ui(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let focus_stroke =
-            |focused: bool| if focused { Stroke::new(1.0_f32, ACTIVE) } else { Stroke::NONE };
-        let mut load: Option<(u32, usize)> = None;
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                vec2(240.0, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    egui::Frame::new()
-                        .stroke(focus_stroke(self.focus == Focus::Playlists))
-                        .show(ui, |ui| self.collection_sidebar(ui));
-                },
-            );
-            ui.separator();
-            ui.vertical(|ui| {
-                load = self.collection_tracks(ui, focus_stroke(self.focus == Focus::Tracks));
-            });
-        });
-        if let Some((id, deck)) = load {
-            self.selected = Some(id);
-            self.load_from_collection(id, deck, ctx);
-        }
-    }
-
-    fn collection_sidebar(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            if ui.small_button("+ Folder of music…").clicked()
-                && let Some(folder) =
-                    rfd::FileDialog::new().set_title("Add a folder of music").pick_folder()
+    /// Adding music, importing and new playlists (the COLLECTION menu).
+    pub(super) fn collection_tools(&mut self, ui: &mut Ui) {
+        if ui.button("Add a folder of music…").clicked() {
+            ui.close();
+            if let Some(folder) =
+                rfd::FileDialog::new().set_title("Add a folder of music").pick_folder()
             {
                 self.add_music(vec![folder]);
             }
-            if ui.small_button("+ Files…").clicked()
-                && let Some(files) = rfd::FileDialog::new()
-                    .set_title("Add music files")
-                    .add_filter("Audio", &deckhand_library::AUDIO_EXTENSIONS)
-                    .pick_files()
+        }
+        if ui.button("Add files…").clicked() {
+            ui.close();
+            if let Some(files) = rfd::FileDialog::new()
+                .set_title("Add music files")
+                .add_filter("Audio", &deckhand_library::AUDIO_EXTENSIONS)
+                .pick_files()
             {
                 self.add_music(files);
             }
-            if ui
-                .small_button("⟳")
-                .on_hover_text("Rescan the added folders for new and changed files")
-                .clicked()
-            {
-                self.rescan();
-            }
-            if ui
-                .small_button("Import rekordbox XML…")
-                .on_hover_text(
-                    "In rekordbox: File → Export Collection in xml format. Brings tracks, \
-                     playlists, beat grids, hot cues, memory cues, ratings and colours.",
-                )
-                .clicked()
-                && let Some(file) = rfd::FileDialog::new()
-                    .set_title("Choose a rekordbox XML export")
-                    .add_filter("rekordbox XML", &["xml"])
-                    .pick_file()
+        }
+        if ui
+            .button("Rescan added folders")
+            .on_hover_text("Look for new and changed files in the added folders")
+            .clicked()
+        {
+            ui.close();
+            self.rescan();
+        }
+        if ui
+            .button("Import rekordbox XML…")
+            .on_hover_text(
+                "In rekordbox: File → Export Collection in xml format. Brings tracks,                  playlists, beat grids, hot cues, memory cues, ratings and colours.",
+            )
+            .clicked()
+        {
+            ui.close();
+            if let Some(file) = rfd::FileDialog::new()
+                .set_title("Choose a rekordbox XML export")
+                .add_filter("rekordbox XML", &["xml"])
+                .pick_file()
             {
                 self.import_xml(file);
             }
-        });
+        }
+        ui.separator();
+        let parent = self.selected_folder();
+        if ui.button("New playlist").clicked() {
+            ui.close();
+            let id = self.collection.create("New playlist", NodeKind::Playlist, parent);
+            self.collection_view.renaming = Some((id, "New playlist".into()));
+            self.tree.collection_open = true;
+        }
+        if ui.button("New folder").clicked() {
+            ui.close();
+            let id = self.collection.create("New folder", NodeKind::Folder, parent);
+            self.collection_view.renaming = Some((id, "New folder".into()));
+            self.tree.collection_open = true;
+        }
+    }
+
+    /// Progress of reading music or an XML file, and errors.
+    pub(super) fn collection_status(&mut self, ui: &mut Ui) {
         if self.collection_view.xml.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(RichText::new("Reading rekordbox XML…").small());
             });
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            let parent = self.selected_folder();
-            if ui.small_button("+ Playlist").clicked() {
-                let id = self.collection.create("New playlist", NodeKind::Playlist, parent);
-                self.collection_view.renaming = Some((id, "New playlist".into()));
-            }
-            if ui.small_button("+ Folder").clicked() {
-                let id = self.collection.create("New folder", NodeKind::Folder, parent);
-                self.collection_view.renaming = Some((id, "New folder".into()));
-            }
-        });
         if let Some(scan) = &self.collection_view.scan {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -273,36 +259,28 @@ impl DeckhandApp {
         if let Some(err) = &self.collection_view.error {
             ui.colored_label(WARN, err);
         }
-        ui.separator();
-        ScrollArea::vertical().id_salt("collection tree").auto_shrink([false, false]).show(
-            ui,
-            |ui| {
-                ui.set_width(230.0);
-                let all = format!("Collection ({})", self.collection.tracks.len());
-                if ui.selectable_label(self.collection_view.node.is_none(), all).clicked() {
-                    self.collection_view.node = None;
-                    self.focus = Focus::Playlists;
-                }
-                let rows: Vec<(usize, u32, String, NodeKind, usize)> = self
-                    .collection
-                    .tree()
-                    .into_iter()
-                    .map(|(depth, n)| (depth, n.id, n.name.clone(), n.kind.clone(), n.tracks.len()))
-                    .collect();
-                // Rows inside a collapsed folder are skipped.
-                let mut hidden_below: Option<usize> = None;
-                for (depth, id, name, kind, count) in rows {
-                    if hidden_below.is_some_and(|d| depth > d) {
-                        continue;
-                    }
-                    hidden_below = None;
-                    if kind == NodeKind::Folder && self.config.collapsed_folders.contains(&id) {
-                        hidden_below = Some(depth);
-                    }
-                    self.tree_row(ui, depth, id, &name, kind, count);
-                }
-            },
-        );
+    }
+
+    /// The collection's playlists and folders in the sidebar tree.
+    pub(super) fn collection_tree_rows(&mut self, ui: &mut Ui) {
+        let rows: Vec<(usize, u32, String, NodeKind, usize)> = self
+            .collection
+            .tree()
+            .into_iter()
+            .map(|(depth, n)| (depth, n.id, n.name.clone(), n.kind.clone(), n.tracks.len()))
+            .collect();
+        // Rows inside a collapsed folder are skipped.
+        let mut hidden_below: Option<usize> = None;
+        for (depth, id, name, kind, count) in rows {
+            if hidden_below.is_some_and(|d| depth > d) {
+                continue;
+            }
+            hidden_below = None;
+            if kind == NodeKind::Folder && self.config.collapsed_folders.contains(&id) {
+                hidden_below = Some(depth);
+            }
+            self.tree_row(ui, depth + 1, id, &name, kind, count);
+        }
     }
 
     /// Writes hot cues, memory cues/loops and a tapped beat grid of loaded
@@ -532,7 +510,8 @@ impl DeckhandApp {
                 NodeKind::Playlist => format!("♫ {name} ({count})"),
                 NodeKind::Folder => name.to_owned(),
             };
-            let selected = self.collection_view.node == Some(id);
+            let selected =
+                self.source == super::Source::Collection && self.collection_view.node == Some(id);
             let response = ui.add(egui::Button::selectable(selected, label).truncate());
             if selected && self.reveal_playlist {
                 response.scroll_to_me(Some(egui::Align::Center));
@@ -548,7 +527,7 @@ impl DeckhandApp {
                 self.config.save();
             }
             if response.clicked() {
-                self.collection_view.node = Some(id);
+                self.select_entry(super::library_tree::TreeEntry::Collection(Some(id)));
                 self.focus = Focus::Playlists;
             }
             // Tracks dropped on a playlist are added to it.
@@ -641,7 +620,11 @@ impl DeckhandApp {
     }
 
     /// The track list; returns a (track, deck) to load.
-    fn collection_tracks(&mut self, ui: &mut Ui, stroke: Stroke) -> Option<(u32, usize)> {
+    pub(super) fn collection_tracks(
+        &mut self,
+        ui: &mut Ui,
+        stroke: Stroke,
+    ) -> Option<(u32, usize)> {
         let mut load = None;
         let deck_count = self.deck_count();
         ui.horizontal(|ui| {

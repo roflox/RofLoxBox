@@ -58,6 +58,17 @@ pub struct Config {
     pub layout_two: crate::layout::DeckLayout,
     #[serde(default = "crate::layout::DeckLayout::four_decks")]
     pub layout_four: crate::layout::DeckLayout,
+    /// Where the decks, vertical waveforms and mixer go.
+    #[serde(default)]
+    pub screen_layout: crate::screen_layout::ScreenLayout,
+    /// Mixer and FX strip parts not shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_mixer_parts: Vec<crate::parts::MixerPart>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_fx_parts: Vec<crate::parts::FxPart>,
+    /// Deck layouts saved under a name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layout_presets: Vec<crate::layout::LayoutPreset>,
     /// Output sample rate; `None` uses the device's current rate.
     #[serde(default)]
     pub sample_rate: Option<u32>,
@@ -354,6 +365,10 @@ impl Default for Config {
             session: Session::default(),
             layout_two: crate::layout::DeckLayout::default(),
             layout_four: crate::layout::DeckLayout::four_decks(),
+            layout_presets: Vec::new(),
+            hidden_mixer_parts: Vec::new(),
+            hidden_fx_parts: Vec::new(),
+            screen_layout: Default::default(),
             sample_rate: None,
             buffer_frames: None,
             audio_quality: AudioQuality::default(),
@@ -397,7 +412,34 @@ impl Config {
         }
         config.layout_two.repair();
         config.layout_four.repair();
+        config.screen_layout.repair();
         config
+    }
+
+    /// The View menu's settings besides the deck elements.
+    pub fn view(&self) -> crate::layout::ViewSettings {
+        crate::layout::ViewSettings {
+            vertical_waveforms: self.vertical_waveforms,
+            show_waveforms: self.show_waveforms,
+            show_mixer: self.show_mixer,
+            show_library: self.show_library,
+            show_fx: self.show_fx,
+            screen_layout: self.screen_layout.clone(),
+            hidden_mixer_parts: self.hidden_mixer_parts.clone(),
+            hidden_fx_parts: self.hidden_fx_parts.clone(),
+        }
+    }
+
+    pub fn set_view(&mut self, view: crate::layout::ViewSettings) {
+        self.vertical_waveforms = view.vertical_waveforms;
+        self.show_waveforms = view.show_waveforms;
+        self.show_mixer = view.show_mixer;
+        self.show_library = view.show_library;
+        self.show_fx = view.show_fx;
+        self.screen_layout = view.screen_layout;
+        self.screen_layout.repair();
+        self.hidden_mixer_parts = view.hidden_mixer_parts;
+        self.hidden_fx_parts = view.hidden_fx_parts;
     }
 
     pub fn deck_layout(&self, four: bool) -> &crate::layout::DeckLayout {
@@ -418,5 +460,40 @@ impl Config {
         if let Ok(text) = toml::to_string_pretty(self) {
             let _ = std::fs::write(dir.join("config.toml"), text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{DeckLayout, LayoutPreset};
+
+    #[test]
+    fn layout_presets_are_saved_and_read_back() {
+        use crate::layout::ViewSettings;
+        let mut config = Config::default();
+        let view = ViewSettings {
+            vertical_waveforms: true,
+            show_mixer: false,
+            hidden_fx_parts: vec![crate::parts::FxPart::Sampler],
+            ..ViewSettings::default()
+        };
+        config.layout_presets.push(LayoutPreset {
+            name: "Club".into(),
+            layout: DeckLayout::everything(),
+            view: Some(view.clone()),
+        });
+        let text = toml::to_string_pretty(&config).unwrap();
+        let read: Config = toml::from_str(&text).unwrap();
+        assert_eq!(read.layout_presets, config.layout_presets);
+        assert_eq!(read.layout_two, DeckLayout::default());
+        // Applying the view and reading it back gives the same view.
+        let mut applied = Config::default();
+        applied.set_view(view.clone());
+        assert!(applied.view().matches(&view));
+        // Presets saved before view presets existed have no view.
+        let old = "[[layout_presets]]\nname = \"Old\"\n[layout_presets.layout]\nmain = []\nside = []\nhidden = []\n";
+        let read: Config = toml::from_str(old).unwrap();
+        assert_eq!(read.layout_presets[0].view, None);
     }
 }

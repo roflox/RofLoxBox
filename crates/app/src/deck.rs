@@ -86,6 +86,8 @@ pub struct LoadedTrack {
     pub id: u32,
     /// From deckhand's collection rather than a USB export.
     pub from_collection: bool,
+    /// The export it came from (USB tracks).
+    pub usb_root: Option<PathBuf>,
     /// Auto Cue: where the first sound starts, when it was looked for.
     pub first_sound: Option<f64>,
     /// A memory loop rekordbox marked active: it loops when playback gets there.
@@ -339,11 +341,26 @@ impl Deck {
         self.jog_touched && self.vinyl
     }
 
+    /// Takes the track off the deck. Settings like tempo range or SYNC stay.
+    pub fn eject(&mut self, engine: &mut Engine) {
+        engine.send(Command::Unload { deck: self.index });
+        self.track = None;
+        self.audio = None;
+        self.loading = None;
+        self.error = None;
+        self.edited = false;
+        self.double_of = None;
+        self.cue_point = 0.0;
+        (self.loop_in, self.loop_region, self.loop_active) = (None, None, false);
+        (self.gate_held, self.slip_pad) = (None, None);
+    }
+
     /// Starts decoding a track and reading its analysis in the background.
     pub fn start_load(&mut self, track: &LibraryTrack, library: &UsbLibrary, ctx: &egui::Context) {
         let request = LoadRequest {
             id: track.track.id,
             from_collection: false,
+            usb_root: Some(library.root.clone()),
             title: track.track.title.clone(),
             artist: track.artist.clone().unwrap_or_default(),
             key: track.key.clone(),
@@ -362,12 +379,13 @@ impl Deck {
         let request = LoadRequest {
             id: track.id,
             from_collection: true,
+            usb_root: None,
             title: track.title.clone(),
             artist: track.artist.clone(),
             key: track.key.clone(),
             bpm: track.bpm.unwrap_or(0.0),
             audio_path: track.path.clone(),
-            analysis_path: None,
+            analysis_path: track.analysis.clone(),
             known: Some(Known::from_track(track)),
             auto_cue_db: self.prefs.auto_cue_db,
         };
@@ -1245,6 +1263,7 @@ struct LoadRequest {
     known: Option<Known>,
     auto_cue_db: Option<f32>,
     from_collection: bool,
+    usb_root: Option<PathBuf>,
     title: String,
     artist: String,
     key: Option<String>,
@@ -1336,13 +1355,19 @@ impl LoadRequest {
             })
             .filter(|(start, end)| end > start);
         if let Some(known) = self.known {
-            if beats.is_empty() {
+            // Collection tracks: the collection's grid and cues (edited in
+            // deckhand) win over rekordbox's analysis, which then only gives
+            // the waveform. Otherwise the analysis wins.
+            let known_cues = known.hot_cues.iter().any(Option::is_some)
+                || !known.memory_cues.is_empty()
+                || !known.memory_loops.is_empty();
+            let no_cues = hot_cues.iter().all(Option::is_none)
+                && memory_cues.is_empty()
+                && memory_loops.is_empty();
+            if beats.is_empty() || (self.from_collection && !known.beats.is_empty()) {
                 beats = known.beats;
             }
-            if hot_cues.iter().all(Option::is_none)
-                && memory_cues.is_empty()
-                && memory_loops.is_empty()
-            {
+            if no_cues || (self.from_collection && known_cues) {
                 (hot_cues, memory_cues, memory_loops) =
                     (known.hot_cues, known.memory_cues, known.memory_loops);
             }
@@ -1351,6 +1376,7 @@ impl LoadRequest {
         let track = LoadedTrack {
             id: self.id,
             from_collection: self.from_collection,
+            usb_root: self.usb_root,
             first_sound: self.auto_cue_db.and_then(|db| first_sound(&audio, db)),
             active_loop,
             title: self.title,
@@ -1376,6 +1402,7 @@ mod tests {
         LoadedTrack {
             id: 1,
             from_collection: false,
+            usb_root: None,
             first_sound: None,
             active_loop: None,
             title: String::new(),

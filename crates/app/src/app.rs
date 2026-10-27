@@ -3,6 +3,7 @@
 mod collection_view;
 mod deck_view;
 mod hotplug;
+mod library_tree;
 mod recording;
 mod session;
 mod status_bar;
@@ -28,18 +29,18 @@ use crate::config::{AudioQuality, Config};
 use crate::controller::Controller;
 use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, key_sync_shift};
 use crate::effects::{Effects, pad_fx_label};
-use crate::library::{UsbLibrary, find_exports};
+use crate::library::find_exports;
 use crate::prefs_view::{PrefsTab, deck_prefs, mixer_prefs};
 use collection_view::CollectionView;
 use deckhand_library::Collection;
 
 /// Which library the browser shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
     /// deckhand's own collection.
     Collection,
-    /// The opened rekordbox USB export.
-    Usb,
+    /// An opened rekordbox export, by its root.
+    Usb(PathBuf),
 }
 use crate::waveform::{HotCueMark, Markers, WaveformStyle, draw_detail, overview_time};
 use crate::widgets::{crossfader, fader, knob, meter};
@@ -54,10 +55,29 @@ const CUE_COLOR: Color32 = Color32::from_rgb(255, 170, 0);
 const PLAY_COLOR: Color32 = Color32::from_rgb(40, 190, 90);
 const ACTIVE: Color32 = Color32::from_rgb(60, 120, 220);
 const WARN: Color32 = Color32::from_rgb(255, 120, 90);
+/// Mixer sizes: a channel strip's narrowest width, the gap between strips,
+/// and the master/phones column with its gap.
+const MIXER_STRIP: f32 = 50.0;
+const MIXER_SPACING: f32 = 4.0;
+const MIXER_MASTER: f32 = 70.0;
+/// The parts in the master/phones column.
+const MIXER_MASTER_PARTS: [crate::parts::MixerPart; 4] = [
+    crate::parts::MixerPart::MasterLevel,
+    crate::parts::MixerPart::MasterMeter,
+    crate::parts::MixerPart::PhonesMix,
+    crate::parts::MixerPart::PhonesLevel,
+];
 /// How often synced decks are checked for phase drift.
 const DRIFT_CHECK: Duration = Duration::from_millis(500);
 /// Phase error (in beats) that sync corrects.
 const DRIFT_LIMIT: f64 = 0.02;
+
+/// A screen block dropped on an edge of another.
+type ScreenMove = (
+    crate::screen_layout::ScreenBlock,
+    crate::screen_layout::ScreenBlock,
+    crate::screen_layout::Edge,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -78,13 +98,13 @@ pub struct DeckhandApp {
     master_volume: f32,
     headphone_mix: f32,
     headphone_volume: f32,
-    library: Option<UsbLibrary>,
+    /// Opened rekordbox exports (USB sticks and folders), in tree order.
+    libraries: Vec<crate::library::UsbLibrary>,
     library_error: Option<String>,
-    exports: Vec<PathBuf>,
+    tree: library_tree::LibraryTree,
     source: Source,
     collection: Collection,
     collection_view: CollectionView,
-    playlist: Option<usize>,
     search: String,
     selected: Option<u32>,
     focus: Focus,
@@ -96,12 +116,12 @@ pub struct DeckhandApp {
     status_bar: status_bar::StatusBar,
     /// Deck elements can be dragged around.
     editing_layout: bool,
+    /// Name typed for saving the deck layout as a preset.
+    preset_name: String,
     moved_window: bool,
     hotplug: hotplug::Hotplug,
     /// Each deck's jog bend at the last frame, to notice it ending.
     was_bending: [bool; DECKS],
-    /// USB export folders closed in the sidebar (by row).
-    usb_collapsed: std::collections::HashSet<usize>,
     /// F12: window and screen details for troubleshooting.
     show_diagnostics: bool,
     /// The master being recorded.
@@ -130,6 +150,9 @@ pub struct DeckhandApp {
     seconds_visible: f64,
     status: Option<String>,
     screenshot: Option<Screenshot>,
+    /// Test aid (`DECKHAND_AUTOPLAY`): start every loaded deck once its
+    /// track is in.
+    autoplay: bool,
 }
 
 /// Developer aid: `DECKHAND_SCREENSHOT=out.png` loads tracks, saves an image
@@ -154,6 +177,14 @@ impl DeckhandApp {
         if std::env::var_os("DECKHAND_VERTICAL").is_some() {
             config.vertical_waveforms = true;
         }
+        // Test aid: a ready-made screen arrangement by number.
+        if let Some(layout) = std::env::var("DECKHAND_SCREEN")
+            .ok()
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| crate::screen_layout::ScreenLayout::built_in().into_iter().nth(n))
+        {
+            config.screen_layout = layout.1;
+        }
         if std::env::var_os("DECKHAND_HIDE_MIXER").is_some() {
             config.show_mixer = false;
         }
@@ -176,13 +207,12 @@ impl DeckhandApp {
             master_volume: 0.8,
             headphone_mix: 0.0,
             headphone_volume: 0.8,
-            library: None,
+            libraries: Vec::new(),
             library_error: None,
-            exports: find_exports(),
-            source: Source::Usb,
+            tree: Default::default(),
+            source: Source::Collection,
             collection: Collection::default(),
             collection_view: CollectionView::default(),
-            playlist: None,
             search: String::new(),
             selected: None,
             focus: Focus::Tracks,
@@ -206,7 +236,6 @@ impl DeckhandApp {
             active_decks: [0, 1],
             recording: None,
             moved_window: false,
-            usb_collapsed: Default::default(),
             hotplug: Default::default(),
             was_bending: [false; DECKS],
             show_diagnostics: std::env::var_os("DECKHAND_DIAGNOSTICS").is_some(),
@@ -230,6 +259,8 @@ impl DeckhandApp {
                     not_before: Instant::now() + Duration::from_secs(delay),
                 }
             }),
+            autoplay: std::env::var_os("DECKHAND_AUTOPLAY").is_some(),
+            preset_name: String::new(),
             config,
         };
         app.restore_session();
@@ -250,18 +281,20 @@ impl DeckhandApp {
             Err(err) => app.collection_view.error = Some(format!("{err:#}")),
         }
         let prefer_collection = app.config.use_collection;
-        let root = app
-            .config
-            .library_root
-            .clone()
-            .filter(|r| r.join("PIONEER").is_dir())
-            .or_else(|| app.exports.first().cloned());
-        if let Some(root) = root {
-            app.open_library(root);
+        // Every plugged-in export, and the last one used (it may be a folder).
+        let last = app.config.library_root.clone().filter(|r| r.join("PIONEER").is_dir());
+        for root in find_exports().into_iter().chain(last.clone()) {
+            app.open_usb(root, false);
         }
         // Start in the collection when it has music, or when there is no export.
-        if !app.collection.tracks.is_empty() && prefer_collection || app.library.is_none() {
-            app.set_source(Source::Collection);
+        let usb = last
+            .filter(|r| app.libraries.iter().any(|l| &l.root == r))
+            .or_else(|| app.libraries.first().map(|l| l.root.clone()));
+        match usb {
+            Some(root) if !(prefer_collection && !app.collection.tracks.is_empty()) => {
+                app.set_source(Source::Usb(root));
+            }
+            _ => app.set_source(Source::Collection),
         }
         let only = std::env::var("DECKHAND_PORT_FILTER").ok();
         let ports: Vec<String> = input_ports()
@@ -294,7 +327,7 @@ impl DeckhandApp {
         if record_to.is_some() {
             app.toggle_recording();
         }
-        if app.screenshot.is_some() {
+        if app.screenshot.is_some() || app.autoplay {
             let ids = app.visible_track_ids();
             let decks = if app.config.four_decks { DECKS } else { 2 };
             for (deck, id) in ids.into_iter().cycle().take(decks).enumerate() {
@@ -364,26 +397,16 @@ impl DeckhandApp {
         }
     }
 
-    fn open_library(&mut self, root: PathBuf) {
-        match UsbLibrary::open(&root) {
-            Ok(library) => {
-                self.library = Some(library);
-                self.library_error = None;
-                self.playlist = None;
-                self.selected = None;
-                self.config.library_root = Some(root);
-                self.set_source(Source::Usb);
-            }
-            Err(err) => self.library_error = Some(format!("{err:#}")),
-        }
-    }
-
     fn set_source(&mut self, source: Source) {
-        if self.source != source {
-            self.selected = None;
+        if self.source == source {
+            return;
+        }
+        self.selected = None;
+        self.config.use_collection = source == Source::Collection;
+        if let Source::Usb(root) = &source {
+            self.config.library_root = Some(root.clone());
         }
         self.source = source;
-        self.config.use_collection = source == Source::Collection;
         self.config.save();
     }
 
@@ -399,9 +422,24 @@ impl DeckhandApp {
         }
         let Some(id) = self.selected else { return };
         self.mark_double(deck, id, false);
-        let Some(library) = &self.library else { return };
+        // Borrowing fields one by one, so a deck can be changed meanwhile.
+        let Source::Usb(root) = &self.source else { return };
+        let Some(library) = self.libraries.iter().find(|l| &l.root == root) else { return };
         let Some(track) = library.library.track(id) else { return };
         self.decks[deck].start_load(track, library, ctx);
+    }
+
+    /// Takes a deck's track off, after saving its cue and grid edits.
+    fn eject_deck(&mut self, index: usize) {
+        if self.load_blocked(index) {
+            return;
+        }
+        self.save_track_edits();
+        let Some(engine) = self.engine.as_mut() else { return };
+        self.decks[index].eject(engine);
+        if self.master == Some(index) {
+            self.master = None;
+        }
     }
 
     /// Eject/Load Lock: a playing deck keeps its track.
@@ -502,6 +540,68 @@ impl DeckhandApp {
         engine.send(Command::SetLimiter(p.limiter));
     }
 
+    /// Applying, saving and deleting deck layout presets.
+    fn layout_presets_menu(&mut self, ui: &mut Ui, four: bool) {
+        use crate::layout::LayoutPreset;
+        let current = self.config.deck_layout(four).clone();
+        let view = self.config.view();
+        let is_current = |preset: &LayoutPreset| {
+            preset.layout == current && preset.view.as_ref().is_none_or(|v| v.matches(&view))
+        };
+        let mut chosen = None;
+        for preset in LayoutPreset::built_in() {
+            if ui.selectable_label(is_current(&preset), &preset.name).clicked() {
+                chosen = Some(preset);
+            }
+        }
+        let mut delete = None;
+        if !self.config.layout_presets.is_empty() {
+            ui.separator();
+        }
+        for (i, preset) in self.config.layout_presets.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(is_current(preset), &preset.name).clicked() {
+                    chosen = Some(preset.clone());
+                }
+                if ui.small_button("×").on_hover_text("Delete this preset").clicked() {
+                    delete = Some(i);
+                }
+            });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.preset_name)
+                    .hint_text("Preset name")
+                    .desired_width(140.0),
+            );
+            let name = self.preset_name.trim().to_owned();
+            if ui.add_enabled(!name.is_empty(), egui::Button::new("Save current")).clicked() {
+                // Saving under an existing name replaces that preset.
+                self.config.layout_presets.retain(|p| p.name != name);
+                self.config.layout_presets.push(LayoutPreset {
+                    name,
+                    layout: current.clone(),
+                    view: Some(view.clone()),
+                });
+                self.preset_name.clear();
+                self.config.save();
+            }
+        });
+        if let Some(i) = delete {
+            self.config.layout_presets.remove(i);
+            self.config.save();
+        }
+        if let Some(preset) = chosen {
+            *self.config.deck_layout_mut(four) = preset.layout;
+            if let Some(view) = preset.view {
+                self.config.set_view(view);
+            }
+            self.config.save();
+            ui.close();
+        }
+    }
+
     /// Track ids in the order the list shows them.
     fn visible_track_ids(&self) -> Vec<u32> {
         self.visible_rows().into_iter().map(|(id, _)| id).collect()
@@ -512,7 +612,7 @@ impl DeckhandApp {
     fn visible_rows(&self) -> Vec<(u32, usize)> {
         let rows = match self.source {
             Source::Collection => self.collection_rows(),
-            Source::Usb => self.usb_rows(),
+            Source::Usb(_) => self.usb_rows(),
         };
         rows.into_iter().map(|r| (r.id, r.position)).collect()
     }
@@ -830,8 +930,8 @@ impl DeckhandApp {
                 let Some(track) = self.collection.track(id) else { return };
                 (track.path.clone(), track.title.clone())
             }
-            Source::Usb => {
-                let Some(library) = &self.library else { return };
+            Source::Usb(_) => {
+                let Some(library) = self.usb() else { return };
                 let Some(track) = library.library.track(id) else { return };
                 (library.resolve(&track.track.file_path), track.track.title.clone())
             }
@@ -993,33 +1093,13 @@ impl DeckhandApp {
                         (Some(rows[next].0), Some(rows[next].1));
                 }
             }
-            Focus::Playlists if self.source == Source::Collection => {
-                let entries = self.collection_browse_entries();
-                let current = entries.iter().position(|&e| e == self.collection_view.node);
-                if let Some(next) = step(current, entries.len()) {
-                    self.collection_view.node = entries[next];
-                }
-            }
             Focus::Playlists => {
-                let Some(library) = &self.library else { return };
-                // Position 0 is "All tracks"; folders, and playlists inside
-                // closed folders, are skipped.
-                let mut entries: Vec<Option<usize>> = vec![None];
-                let mut hidden_below: Option<usize> = None;
-                for (i, row) in library.playlists.iter().enumerate() {
-                    if hidden_below.is_some_and(|d| row.depth > d) {
-                        continue;
-                    }
-                    hidden_below = None;
-                    match &row.track_ids {
-                        None if self.usb_collapsed.contains(&i) => hidden_below = Some(row.depth),
-                        None => {}
-                        Some(_) => entries.push(Some(i)),
-                    }
-                }
-                let current = entries.iter().position(|&e| e == self.playlist);
+                // The whole tree: the collection, then every export.
+                let mut entries = self.tree_entries();
+                let current_entry = self.current_entry();
+                let current = entries.iter().position(|e| *e == current_entry);
                 if let Some(next) = step(current, entries.len()) {
-                    self.playlist = entries[next];
+                    self.select_entry(entries.swap_remove(next));
                 }
             }
         }
@@ -1127,11 +1207,24 @@ impl eframe::App for DeckhandApp {
             }
         }
         self.sync_jog_resolution();
+        let count = self.deck_count();
+        if self.autoplay
+            && let Some(engine) = self.engine.as_mut()
+        {
+            let decks = &mut self.decks[..count];
+            if decks.iter().all(|d| d.track.is_some() && d.loading_title().is_none()) {
+                for deck in decks {
+                    deck.toggle_play(engine);
+                }
+                self.autoplay = false;
+            }
+        }
         for event in self.controller.poll() {
             self.apply_event(event, ctx);
         }
         self.save_track_edits();
         self.poll_collection(ctx);
+        self.poll_usb(ctx);
         self.check_controllers(ctx);
         self.save_session(false);
         self.finish_doubles();
@@ -1240,44 +1333,6 @@ impl DeckhandApp {
             ui.horizontal(|ui| {
                 ui.heading(crate::APP_NAME);
                 ui.separator();
-                let current = match self.source {
-                    Source::Collection => "Collection".to_owned(),
-                    Source::Usb => self
-                        .library
-                        .as_ref()
-                        .map_or_else(|| "No library".to_owned(), UsbLibrary::name),
-                };
-                let mut open = None;
-                let mut collection = false;
-                egui::ComboBox::from_id_salt("library").selected_text(current).show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.source == Source::Collection, "Collection")
-                        .clicked()
-                    {
-                        collection = true;
-                    }
-                    ui.separator();
-                    for export in &self.exports {
-                        if ui.selectable_label(false, export.display().to_string()).clicked() {
-                            open = Some(export.clone());
-                        }
-                    }
-                    if ui.button("Choose folder…").clicked() {
-                        open = rfd::FileDialog::new()
-                            .set_title("Choose the root of a rekordbox USB export")
-                            .pick_folder();
-                    }
-                });
-                if ui.button("⟳").on_hover_text("Look for USB exports again").clicked() {
-                    self.exports = find_exports();
-                }
-                if let Some(root) = open {
-                    self.open_library(root);
-                }
-                if collection {
-                    self.set_source(Source::Collection);
-                }
-                ui.separator();
 
                 let device = self
                     .engine
@@ -1310,69 +1365,115 @@ impl DeckhandApp {
                     self.config.save();
                 }
                 ui.separator();
-                ui.menu_button("View", |ui| {
-                    let before = (
-                        self.config.vertical_waveforms,
-                        self.config.show_waveforms,
-                        self.config.show_mixer,
-                        self.config.show_library,
-                        self.config.show_fx,
-                    );
-                    ui.label(RichText::new("Waveforms").small().weak());
-                    ui.radio_value(&mut self.config.vertical_waveforms, false, "Horizontal (top)");
-                    ui.radio_value(
-                        &mut self.config.vertical_waveforms,
-                        true,
-                        "Vertical (between decks)",
-                    );
-                    ui.separator();
-                    ui.checkbox(&mut self.config.show_waveforms, "Waveforms");
-                    ui.checkbox(&mut self.config.show_mixer, "Mixer");
-                    ui.checkbox(&mut self.config.show_library, "Library");
-                    ui.checkbox(&mut self.config.show_fx, "FX and sampler");
-                    ui.separator();
-                    let four = self.config.four_decks;
-                    let which = if four { "4-deck" } else { "2-deck" };
-                    ui.menu_button(format!("Deck elements ({which} layout)"), |ui| {
-                        let layout = self.config.deck_layout_mut(four);
-                        let mut changed = false;
-                        for element in crate::layout::DeckElement::ALL {
-                            let mut shown = layout.is_shown(element);
-                            if ui.checkbox(&mut shown, element.label()).changed() {
-                                layout.set_shown(element, shown);
-                                changed = true;
+                egui::containers::menu::MenuButton::new("View")
+                    .config(
+                        egui::containers::menu::MenuConfig::new()
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| {
+                        let before = (
+                            self.config.vertical_waveforms,
+                            self.config.show_waveforms,
+                            self.config.show_mixer,
+                            self.config.show_library,
+                            self.config.show_fx,
+                        );
+                        ui.label(RichText::new("Waveforms").small().weak());
+                        ui.radio_value(
+                            &mut self.config.vertical_waveforms,
+                            false,
+                            "Horizontal (top)",
+                        );
+                        ui.radio_value(
+                            &mut self.config.vertical_waveforms,
+                            true,
+                            "Vertical (between decks)",
+                        );
+                        ui.separator();
+                        ui.checkbox(&mut self.config.show_waveforms, "Waveforms");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.config.show_mixer, "Mixer");
+                            sticky_menu(ui, "parts", |ui| {
+                                use crate::parts::{MixerPart, grouped_checkboxes};
+                                let hidden = &mut self.config.hidden_mixer_parts;
+                                if grouped_checkboxes(
+                                    ui,
+                                    &MixerPart::GROUPS,
+                                    MixerPart::label,
+                                    hidden,
+                                ) {
+                                    self.config.save();
+                                }
+                            });
+                        });
+                        ui.checkbox(&mut self.config.show_library, "Library");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.config.show_fx, "FX and sampler");
+                            sticky_menu(ui, "parts", |ui| {
+                                use crate::parts::{FxPart, grouped_checkboxes};
+                                let hidden = &mut self.config.hidden_fx_parts;
+                                if grouped_checkboxes(ui, &FxPart::GROUPS, FxPart::label, hidden) {
+                                    self.config.save();
+                                }
+                            });
+                        });
+                        ui.separator();
+                        let four = self.config.four_decks;
+                        let which = if four { "4-deck" } else { "2-deck" };
+                        sticky_menu(ui, format!("Deck elements ({which} layout)"), |ui| {
+                            use crate::layout::DeckElement;
+                            let hidden = &mut self.config.deck_layout_mut(four).hidden;
+                            let changed = ScrollArea::vertical()
+                                .show(ui, |ui| {
+                                    crate::parts::grouped_checkboxes(
+                                        ui,
+                                        &DeckElement::GROUPS,
+                                        DeckElement::label,
+                                        hidden,
+                                    )
+                                })
+                                .inner;
+                            if changed {
+                                self.config.save();
                             }
+                        });
+                        if ui
+                            .checkbox(&mut self.editing_layout, "Edit deck layout (drag elements)")
+                            .changed()
+                        {
+                            ui.close();
                         }
-                        if changed {
+                        sticky_menu(ui, format!("View presets ({which})"), |ui| {
+                            self.layout_presets_menu(ui, four);
+                        });
+                        ui.menu_button("Screen arrangement", |ui| {
+                            for (name, layout) in crate::screen_layout::ScreenLayout::built_in() {
+                                let current = self.config.screen_layout == layout;
+                                if ui.selectable_label(current, name).clicked() {
+                                    self.config.screen_layout = layout;
+                                    self.config.save();
+                                    ui.close();
+                                }
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Or move them yourself: Edit layout, then drag their bars.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+                        let after = (
+                            self.config.vertical_waveforms,
+                            self.config.show_waveforms,
+                            self.config.show_mixer,
+                            self.config.show_library,
+                            self.config.show_fx,
+                        );
+                        if before != after {
                             self.config.save();
                         }
                     });
-                    if ui
-                        .checkbox(&mut self.editing_layout, "Edit deck layout (drag elements)")
-                        .changed()
-                    {
-                        ui.close();
-                    }
-                    if ui.button("Reset deck layout").clicked() {
-                        *self.config.deck_layout_mut(four) = if four {
-                            crate::layout::DeckLayout::four_decks()
-                        } else {
-                            crate::layout::DeckLayout::default()
-                        };
-                        self.config.save();
-                        ui.close();
-                    }
-                    let after = (
-                        self.config.vertical_waveforms,
-                        self.config.show_waveforms,
-                        self.config.show_mixer,
-                        self.config.show_library,
-                        self.config.show_fx,
-                    );
-                    if before != after {
-                        self.config.save();
-                    }
-                });
                 ui.separator();
                 let label = self
                     .controller
@@ -1478,55 +1579,236 @@ impl DeckhandApp {
 
     /// Decks, vertical waveforms and mixer side by side, leaving out hidden parts.
     fn central(&mut self, ui: &mut Ui) {
+        use crate::screen_layout::ScreenBlock as B;
         if self.editing_layout {
             ui.horizontal(|ui| {
                 ui.colored_label(
                     CUE_COLOR,
-                    "Editing the deck layout: drag an element onto another (left or right half), onto + at the end of a row or the side column, onto New row, or onto Hide.",
+                    "Editing the layout: drag a deck element onto another (left or right half), onto + at the end of a row or the side column, onto New row, or onto Hide. Drag the decks, waveforms or mixer by their bar onto an edge of another block.",
                 );
                 if ui.button("Done").clicked() {
                     self.editing_layout = false;
                 }
             });
         }
-        let four = self.config.four_decks;
         let vertical = self.config.vertical_waveforms && self.config.show_waveforms;
         let show_mixer = self.config.show_mixer;
-        let (left, right): (Vec<usize>, Vec<usize>) =
-            if four { (vec![0, 2], vec![1, 3]) } else { (vec![0], vec![1]) };
-        // Vertical waveforms follow the mixer's channel order, half on each side.
-        let channels = self.mixer_channels();
-        let (left_waves, right_waves) = channels.split_at(channels.len() / 2);
-        let (left_waves, right_waves) = (left_waves.to_vec(), right_waves.to_vec());
+        let shown = |b: B| match b {
+            B::LeftWaves | B::RightWaves => vertical,
+            B::Mixer => show_mixer,
+            B::LeftDecks | B::RightDecks => true,
+        };
+        let columns: Vec<Vec<B>> = self
+            .config
+            .screen_layout
+            .columns
+            .iter()
+            .map(|column| column.iter().copied().filter(|&b| shown(b)).collect::<Vec<B>>())
+            .filter(|column| !column.is_empty())
+            .collect();
         const GAP: f32 = 8.0;
-        let wave_width = if vertical { 56.0 * left.len() as f32 } else { 0.0 };
-        let mixer_width = if show_mixer { if four { 310.0 } else { 210.0 } } else { 0.0 };
+        let side_decks = if self.config.four_decks { 2.0 } else { 1.0 };
+        let wave_width = 56.0 * side_decks;
+        let mixer_width = self.mixer_width();
+        // Columns without decks are as wide as their contents; deck columns
+        // share what is left.
+        let fixed = |column: &[B]| -> Option<f32> {
+            if column.iter().any(|b| matches!(b, B::LeftDecks | B::RightDecks)) {
+                return None;
+            }
+            let waves = column.iter().filter(|b| b.is_waves()).count() as f32;
+            let waves_width = waves * wave_width + (waves - 1.0).max(0.0) * 4.0;
+            let mixer = if column.contains(&B::Mixer) { mixer_width } else { 0.0 };
+            Some(waves_width.max(mixer))
+        };
+        let fixed_total: f32 = columns.iter().filter_map(|c| fixed(c)).sum();
+        let flexible = columns.iter().filter(|c| fixed(c).is_none()).count().max(1) as f32;
+        // A margin so the last column is never clipped.
+        let gaps = GAP * columns.len() as f32 + 16.0;
+        let deck_width = ((ui.available_width() - fixed_total - gaps) / flexible).max(240.0);
         let height = ui.available_height();
-        // Gaps between the five columns, plus a margin so the last column is never clipped.
-        let deck_width =
-            ((ui.available_width() - 2.0 * wave_width - mixer_width - 6.0 * GAP - 16.0) / 2.0)
-                .max(240.0);
+        let editing = self.editing_layout;
+        let mut moved = None;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
-            self.deck_column(ui, &left, deck_width, height);
-            if vertical {
-                self.wave_column(ui, &left_waves, wave_width, height);
-            }
-            if show_mixer {
+            for column in &columns {
+                let width = fixed(column).unwrap_or(deck_width);
                 ui.allocate_ui_with_layout(
-                    vec2(mixer_width, height),
-                    Layout::top_down(Align::Center),
+                    vec2(width, height),
+                    Layout::top_down(Align::Min),
                     |ui| {
-                        ui.set_width(mixer_width);
-                        self.mixer_ui(ui);
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing.y = GAP;
+                        self.screen_column(ui, column, width, height, editing, &mut moved);
                     },
                 );
             }
-            if vertical {
-                self.wave_column(ui, &right_waves, wave_width, height);
-            }
-            self.deck_column(ui, &right, deck_width, height);
         });
+        if let Some((block, target, edge)) = moved {
+            self.config.screen_layout.move_block(block, target, edge);
+            self.config.save();
+        }
+    }
+
+    /// One column of the main screen: its blocks stacked, waveform blocks
+    /// next to each other sharing a row, the mixer at its own height.
+    fn screen_column(
+        &mut self,
+        ui: &mut Ui,
+        column: &[crate::screen_layout::ScreenBlock],
+        width: f32,
+        height: f32,
+        editing: bool,
+        moved: &mut Option<ScreenMove>,
+    ) {
+        use crate::screen_layout::ScreenBlock as B;
+        const GAP: f32 = 8.0;
+        let mut groups: Vec<Vec<B>> = Vec::new();
+        for &block in column {
+            match groups.last_mut() {
+                Some(group) if block.is_waves() && group[0].is_waves() => group.push(block),
+                _ => groups.push(vec![block]),
+            }
+        }
+        let shared = groups.len() > 1;
+        let gaps = GAP * (groups.len() as f32 - 1.0);
+        // Sharing a column, the mixer takes what it needs and the rest share
+        // what is left (at least a little for the waveforms).
+        let mixer_height =
+            if shared { (height - gaps - 150.0).clamp(200.0, 470.0) } else { height };
+        let has_mixer = column.contains(&B::Mixer);
+        let others = groups.iter().filter(|g| g[0] != B::Mixer).count().max(1) as f32;
+        let rest = height - gaps - if has_mixer && shared { mixer_height } else { 0.0 };
+        let each = rest / others;
+        for group in groups {
+            let h = if group[0] == B::Mixer { mixer_height } else { each };
+            if group.len() == 1 {
+                self.screen_block(ui, group[0], vec2(width, h), editing, moved);
+                continue;
+            }
+            let block_width = (width - 4.0 * (group.len() as f32 - 1.0)) / group.len() as f32;
+            ui.allocate_ui_with_layout(vec2(width, h), Layout::left_to_right(Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for &block in &group {
+                    self.screen_block(ui, block, vec2(block_width, h), editing, moved);
+                }
+            });
+        }
+    }
+
+    /// Draws a block; while editing, with a bar to drag it by, and taking
+    /// other blocks dropped on its edges.
+    fn screen_block(
+        &mut self,
+        ui: &mut Ui,
+        block: crate::screen_layout::ScreenBlock,
+        size: egui::Vec2,
+        editing: bool,
+        moved: &mut Option<ScreenMove>,
+    ) {
+        use crate::screen_layout::{Edge, ScreenBlock as B};
+        let channels = self.mixer_channels();
+        let (left_waves, right_waves) = channels.split_at(channels.len() / 2);
+        let (left_waves, right_waves) = (left_waves.to_vec(), right_waves.to_vec());
+        let (left, right): (Vec<usize>, Vec<usize>) =
+            if self.config.four_decks { (vec![0, 2], vec![1, 3]) } else { (vec![0], vec![1]) };
+        let rect = ui
+            .allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+                ui.set_width(size.x);
+                let mut height = size.y;
+                if editing {
+                    const BAR: f32 = 22.0;
+                    let id = egui::Id::new(("screen block", block));
+                    ui.dnd_drag_source(id, block, |ui| {
+                        egui::Frame::new()
+                            .fill(Color32::from_gray(45))
+                            .corner_radius(3)
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.set_width(size.x - 12.0);
+                                let text = RichText::new(format!("{} (drag)", block.label()));
+                                ui.add(egui::Label::new(text.small()).truncate());
+                            });
+                    })
+                    .response
+                    .on_hover_text("Drag onto an edge of another block");
+                    height -= BAR + ui.spacing().item_spacing.y;
+                }
+                match block {
+                    B::LeftDecks => self.deck_column(ui, &left, size.x, height),
+                    B::RightDecks => self.deck_column(ui, &right, size.x, height),
+                    B::LeftWaves => self.wave_column(ui, &left_waves, size.x, height),
+                    B::RightWaves => self.wave_column(ui, &right_waves, size.x, height),
+                    B::Mixer => {
+                        // A wider column (under the waveforms) stretches the mixer.
+                        let width = size.x;
+                        ui.allocate_ui_with_layout(
+                            vec2(size.x, height),
+                            Layout::top_down(Align::Center),
+                            |ui| {
+                                ui.allocate_ui_with_layout(
+                                    vec2(width, height),
+                                    Layout::top_down(Align::Center),
+                                    |ui| {
+                                        ui.set_width(width);
+                                        self.mixer_ui(ui);
+                                    },
+                                );
+                            },
+                        );
+                    }
+                }
+            })
+            .response
+            .rect;
+        if !editing || !egui::DragAndDrop::has_payload_of_type::<B>(ui.ctx()) {
+            return;
+        }
+        let Some(pos) = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) else {
+            return;
+        };
+        if !rect.contains(pos) {
+            return;
+        }
+        // The nearest edge says where the dragged block goes.
+        let distances = [
+            (pos.x - rect.left(), Edge::Left),
+            (rect.right() - pos.x, Edge::Right),
+            (pos.y - rect.top(), Edge::Above),
+            (rect.bottom() - pos.y, Edge::Below),
+        ];
+        let edge = distances.iter().min_by(|a, b| a.0.total_cmp(&b.0)).map_or(Edge::Right, |d| d.1);
+        let stroke = Stroke::new(4.0_f32, ACTIVE);
+        let painter = ui.painter();
+        match edge {
+            Edge::Left => painter.vline(rect.left(), rect.y_range(), stroke),
+            Edge::Right => painter.vline(rect.right(), rect.y_range(), stroke),
+            Edge::Above => painter.hline(rect.x_range(), rect.top(), stroke),
+            Edge::Below => painter.hline(rect.x_range(), rect.bottom(), stroke),
+        };
+        if ui.input(|i| i.pointer.any_released())
+            && let Some(dragged) = egui::DragAndDrop::take_payload::<B>(ui.ctx())
+        {
+            *moved = Some((*dragged, block, edge));
+        }
+    }
+
+    /// What the mixer needs across for the parts shown.
+    fn mixer_width(&self) -> f32 {
+        use crate::parts::MixerPart as P;
+        let hidden = &self.config.hidden_mixer_parts;
+        let show = |part: P| !hidden.contains(&part);
+        let channels = if self.config.four_decks { 4.0 } else { 2.0 };
+        let strips = channels * MIXER_STRIP + (channels - 1.0) * MIXER_SPACING;
+        let master = if MIXER_MASTER_PARTS.iter().any(|&p| show(p)) {
+            MIXER_MASTER + MIXER_SPACING
+        } else {
+            0.0
+        };
+        let crossfader = if show(P::Crossfader) { 150.0 } else { 0.0 };
+        let order = if self.config.four_decks && show(P::ChannelOrder) { 180.0 } else { 0.0 };
+        // The panel's margins on both sides, and a little air.
+        (strips + master).max(crossfader).max(order) + 16.0
     }
 
     fn deck_column(&mut self, ui: &mut Ui, decks: &[usize], width: f32, height: f32) {
@@ -1576,10 +1858,15 @@ impl DeckhandApp {
     }
 
     fn mixer_ui(&mut self, ui: &mut Ui) {
-        // Five knobs are stacked per channel; they shrink when the window is
-        // short so the fader and crossfader still fit.
+        use crate::parts::MixerPart as P;
+        let hidden = self.config.hidden_mixer_parts.clone();
+        let show = |part: P| !hidden.contains(&part);
+        // Up to five knobs are stacked per channel; they shrink when the
+        // window is short so the fader and crossfader still fit.
+        let knobs = [P::Trim, P::High, P::Mid, P::Low, P::Filter].into_iter().filter(|&p| show(p));
+        let knobs = knobs.count() as f32;
         let room = ui.available_height() - 125.0 - 90.0;
-        let channel_knob = (room / 5.0 - 16.0).clamp(16.0, 24.0);
+        let channel_knob = (room / knobs.max(1.0) - 16.0).clamp(16.0, 24.0);
         const KNOB: f32 = 24.0;
         const ORDERS: [[usize; 4]; 2] = [[1, 2, 3, 4], [3, 1, 2, 4]];
         let channels = self.mixer_channels();
@@ -1589,14 +1876,14 @@ impl DeckhandApp {
         let Some(engine) = self.engine.as_mut() else { return };
         // Faders take whatever height the knobs, buttons and crossfader leave.
         let fader_height =
-            (ui.available_height() - 5.0 * (channel_knob + 16.0) - 125.0).clamp(60.0, 180.0);
+            (ui.available_height() - knobs * (channel_knob + 16.0) - 125.0).clamp(60.0, 180.0);
         let panel = egui::Frame::new()
             .fill(Color32::from_rgb(22, 22, 25))
             .corner_radius(6)
             .inner_margin(6.0);
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             panel.show(ui, |ui| {
-                if four {
+                if four && show(P::ChannelOrder) {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Channel order").small().weak());
                         for order in ORDERS {
@@ -1614,11 +1901,22 @@ impl DeckhandApp {
                     });
                 }
                 ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
+                    ui.spacing_mut().item_spacing = vec2(MIXER_SPACING, 2.0);
+                    // Channel strips share the room the master section leaves,
+                    // so hidden parts leave no gap.
+                    let master = if MIXER_MASTER_PARTS.iter().any(|&p| show(p)) {
+                        MIXER_MASTER + MIXER_SPACING
+                    } else {
+                        0.0
+                    };
+                    let count = channels.len() as f32;
+                    let strip = ((ui.available_width() - master - (count - 1.0) * MIXER_SPACING)
+                        / count)
+                        .max(MIXER_STRIP);
                     for &index in &channels {
                         let deck = &mut self.decks[index];
                         ui.vertical(|ui| {
-                            ui.set_width(KNOB + 26.0);
+                            ui.set_width(strip);
                             ui.vertical_centered(|ui| {
                                 ui.label(
                                     RichText::new(format!("{}", index + 1))
@@ -1628,32 +1926,48 @@ impl DeckhandApp {
                                 let mut changed = false;
                                 let [low, mid, high] = &mut deck.eq;
                                 // One column per channel, top to bottom, like a DJ mixer.
-                                changed |= knob(
-                                    ui,
-                                    &mut deck.trim,
-                                    0.0..=1.0,
-                                    0.5,
-                                    "TRIM",
-                                    true,
-                                    channel_knob,
-                                )
-                                .changed();
-                                changed |= knob(ui, high, 0.0..=1.0, 0.5, "HI", true, channel_knob)
+                                if show(P::Trim) {
+                                    changed |= knob(
+                                        ui,
+                                        &mut deck.trim,
+                                        0.0..=1.0,
+                                        0.5,
+                                        "TRIM",
+                                        true,
+                                        channel_knob,
+                                    )
                                     .changed();
-                                changed |= knob(ui, mid, 0.0..=1.0, 0.5, "MID", true, channel_knob)
+                                }
+                                for (part, value, label) in [
+                                    (P::High, high, "HI"),
+                                    (P::Mid, mid, "MID"),
+                                    (P::Low, low, "LOW"),
+                                ] {
+                                    if show(part) {
+                                        changed |= knob(
+                                            ui,
+                                            value,
+                                            0.0..=1.0,
+                                            0.5,
+                                            label,
+                                            true,
+                                            channel_knob,
+                                        )
+                                        .changed();
+                                    }
+                                }
+                                if show(P::Filter) {
+                                    changed |= knob(
+                                        ui,
+                                        &mut deck.filter,
+                                        -1.0..=1.0,
+                                        0.0,
+                                        "FILTER",
+                                        true,
+                                        channel_knob,
+                                    )
                                     .changed();
-                                changed |= knob(ui, low, 0.0..=1.0, 0.5, "LOW", true, channel_knob)
-                                    .changed();
-                                changed |= knob(
-                                    ui,
-                                    &mut deck.filter,
-                                    -1.0..=1.0,
-                                    0.0,
-                                    "FILTER",
-                                    true,
-                                    channel_knob,
-                                )
-                                .changed();
+                                }
                                 let cue_fill = if deck.headphone_cue {
                                     CUE_COLOR
                                 } else {
@@ -1662,92 +1976,117 @@ impl DeckhandApp {
                                 let cue = egui::Button::new(RichText::new("CUE").small().strong())
                                     .fill(cue_fill)
                                     .min_size(vec2(44.0, 18.0));
-                                if ui.add(cue).on_hover_text("Headphone cue").clicked() {
+                                if show(P::ChannelCue)
+                                    && ui.add(cue).on_hover_text("Headphone cue").clicked()
+                                {
                                     deck.headphone_cue = !deck.headphone_cue;
                                     changed = true;
                                 }
-                                ui.horizontal(|ui| {
-                                    ui.add_space(10.0);
-                                    ui.spacing_mut().item_spacing.x = 3.0;
-                                    changed |= fader(ui, &mut deck.volume, fader_height).changed();
-                                    meter(ui, engine.deck_peak(index), vec2(6.0, fader_height));
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.add_space(4.0);
-                                    ui.spacing_mut().item_spacing.x = 1.0;
-                                    for (side, label) in [
-                                        (CrossfaderSide::A, "A"),
-                                        (CrossfaderSide::Thru, "T"),
-                                        (CrossfaderSide::B, "B"),
-                                    ] {
-                                        let text = RichText::new(label).small();
-                                        if ui
-                                            .selectable_label(deck.side == side, text)
-                                            .on_hover_text("Crossfader assign")
-                                            .clicked()
-                                        {
-                                            deck.side = side;
-                                            changed = true;
+                                if show(P::Fader) || show(P::ChannelMeter) {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(10.0);
+                                        ui.spacing_mut().item_spacing.x = 3.0;
+                                        if show(P::Fader) {
+                                            changed |=
+                                                fader(ui, &mut deck.volume, fader_height).changed();
                                         }
-                                    }
-                                });
+                                        if show(P::ChannelMeter) {
+                                            let peak = engine.deck_peak(index);
+                                            meter(ui, peak, vec2(6.0, fader_height));
+                                        }
+                                    });
+                                }
+                                if show(P::CrossfaderAssign) {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(4.0);
+                                        ui.spacing_mut().item_spacing.x = 1.0;
+                                        for (side, label) in [
+                                            (CrossfaderSide::A, "A"),
+                                            (CrossfaderSide::Thru, "T"),
+                                            (CrossfaderSide::B, "B"),
+                                        ] {
+                                            let text = RichText::new(label).small();
+                                            if ui
+                                                .selectable_label(deck.side == side, text)
+                                                .on_hover_text("Crossfader assign")
+                                                .clicked()
+                                            {
+                                                deck.side = side;
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                }
                                 if changed {
                                     deck.apply_mixer(engine);
                                 }
                             });
                         });
                     }
+                    if !MIXER_MASTER_PARTS.iter().any(|&p| show(p)) {
+                        return;
+                    }
                     // A separator here would stretch to the full height and push the crossfader out.
                     ui.add_space(6.0);
                     ui.vertical(|ui| {
-                        ui.set_width(64.0);
+                        ui.set_width(MIXER_MASTER - 6.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("MASTER").small().strong());
-                            if knob(
-                                ui,
-                                &mut self.master_volume,
-                                0.0..=1.0,
-                                0.8,
-                                "LEVEL",
-                                false,
-                                KNOB + 4.0,
-                            )
-                            .changed()
-                            {
-                                engine.send(Command::SetMasterVolume(self.master_volume));
+                            if show(P::MasterLevel) || show(P::MasterMeter) {
+                                ui.label(RichText::new("MASTER").small().strong());
                             }
-                            ui.horizontal(|ui| {
-                                ui.add_space(20.0);
-                                ui.spacing_mut().item_spacing.x = 3.0;
-                                let peak = engine.master_peak();
-                                meter(ui, peak, vec2(7.0, fader_height));
-                                meter(ui, peak, vec2(7.0, fader_height));
-                            });
-                            ui.label(RichText::new("PHONES").small().strong());
-                            if engine.info().has_headphone_output() {
-                                if knob(
+                            if show(P::MasterLevel)
+                                && knob(
                                     ui,
-                                    &mut self.headphone_mix,
-                                    0.0..=1.0,
-                                    0.0,
-                                    "CUE/MST",
-                                    false,
-                                    KNOB,
-                                )
-                                .changed()
-                                {
-                                    engine.send(Command::SetHeadphoneMix(self.headphone_mix));
-                                }
-                                if knob(
-                                    ui,
-                                    &mut self.headphone_volume,
+                                    &mut self.master_volume,
                                     0.0..=1.0,
                                     0.8,
                                     "LEVEL",
                                     false,
-                                    KNOB,
+                                    KNOB + 4.0,
                                 )
                                 .changed()
+                            {
+                                engine.send(Command::SetMasterVolume(self.master_volume));
+                            }
+                            if show(P::MasterMeter) {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(20.0);
+                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                    let peak = engine.master_peak();
+                                    meter(ui, peak, vec2(7.0, fader_height));
+                                    meter(ui, peak, vec2(7.0, fader_height));
+                                });
+                            }
+                            if !show(P::PhonesMix) && !show(P::PhonesLevel) {
+                                return;
+                            }
+                            ui.label(RichText::new("PHONES").small().strong());
+                            if engine.info().has_headphone_output() {
+                                if show(P::PhonesMix)
+                                    && knob(
+                                        ui,
+                                        &mut self.headphone_mix,
+                                        0.0..=1.0,
+                                        0.0,
+                                        "CUE/MST",
+                                        false,
+                                        KNOB,
+                                    )
+                                    .changed()
+                                {
+                                    engine.send(Command::SetHeadphoneMix(self.headphone_mix));
+                                }
+                                if show(P::PhonesLevel)
+                                    && knob(
+                                        ui,
+                                        &mut self.headphone_volume,
+                                        0.0..=1.0,
+                                        0.8,
+                                        "LEVEL",
+                                        false,
+                                        KNOB,
+                                    )
+                                    .changed()
                                 {
                                     engine.send(Command::SetHeadphoneVolume(self.headphone_volume));
                                 }
@@ -1757,6 +2096,9 @@ impl DeckhandApp {
                         });
                     });
                 });
+                if !show(P::Crossfader) {
+                    return;
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("A").small());
                     let width = (ui.available_width() - 30.0).clamp(120.0, 220.0);
@@ -1782,154 +2124,203 @@ impl DeckhandApp {
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
+        use crate::parts::FxPart;
+        let hidden = &self.config.hidden_fx_parts;
+        let show = |part: FxPart| !hidden.contains(&part);
         let fx = &mut self.effects;
         let decks = if self.config.four_decks { DECKS } else { 2 };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().slider_width = 64.0;
-            ui.label(RichText::new("BEAT FX").small().strong());
-            egui::ComboBox::from_id_salt("beat fx")
-                .selected_text(fx.kind.label())
-                .width(92.0)
-                .show_ui(ui, |ui| {
-                    for kind in BeatFxKind::ALL {
-                        ui.selectable_value(&mut fx.kind, kind, kind.label());
-                    }
-                });
-            if ui.small_button("◀").on_hover_text("Shorter beat").clicked() {
-                fx.change_beat(-1);
-            }
-            ui.label(RichText::new(format!("{:>4}", fx.beat_label())).monospace());
-            if ui.small_button("▶").on_hover_text("Longer beat").clicked() {
-                fx.change_beat(1);
-            }
-            let tap = match fx.tapped_bpm {
-                Some(bpm) => format!("TAP {bpm:.0}"),
-                None => "TAP".to_owned(),
-            };
-            let response = toggle(ui, fx.tapped_bpm.is_some(), &tap).on_hover_text(
-                "Tap the effect's tempo; right-click to follow the master deck again",
-            );
-            if response.clicked() {
-                fx.tap();
-            }
-            if response.secondary_clicked() {
-                fx.tapped_bpm = None;
-            }
-            ui.add(
-                Slider::new(&mut fx.depth, 0.0..=1.0)
-                    .show_value(false)
-                    .text(RichText::new("DEPTH").small()),
-            );
-            let target_label = |t: FxTarget| match t {
-                FxTarget::Channel(d) => format!("CH{}", d + 1),
-                FxTarget::Master => "MASTER".to_owned(),
-                FxTarget::Sampler => "SAMPLER".to_owned(),
-            };
-            egui::ComboBox::from_id_salt("fx target")
-                .selected_text(target_label(fx.target))
-                .width(70.0)
-                .show_ui(ui, |ui| {
-                    for target in (0..decks)
-                        .map(FxTarget::Channel)
-                        .chain([FxTarget::Master, FxTarget::Sampler])
-                    {
-                        ui.selectable_value(&mut fx.target, target, target_label(target));
-                    }
-                });
-            if toggle(ui, fx.on, "ON").clicked() {
-                fx.toggle_on();
-            }
-            if toggle(ui, fx.release, "RELEASE")
-                .on_hover_text("Release FX: cut the source and let the echo play out")
-                .clicked()
-            {
-                fx.toggle_release();
-            }
-            ui.label("?").on_hover_text(
-                (0..16)
-                    .map(|s| format!("Pad FX {}: {}", s + 1, pad_fx_label(s)))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-            ui.separator();
-
-            ui.label(RichText::new("COLOR FX").small().strong());
-            let mut color = fx.color;
-            egui::ComboBox::from_id_salt("color fx")
-                .selected_text(color.label())
-                .width(72.0)
-                .show_ui(ui, |ui| {
-                    for kind in ColorFxKind::ALL {
-                        ui.selectable_value(&mut color, kind, kind.label());
-                    }
-                });
-            if color != fx.color {
-                fx.set_color(color, engine);
-            }
-            if toggle(ui, fx.color_on, "ON")
-                .on_hover_text("Color FX on the channel knobs")
-                .clicked()
-            {
-                fx.toggle_color(engine);
-            }
-            if toggle(ui, fx.master_cue, "MASTER CUE")
-                .on_hover_text("Hear the master mix in the headphones")
-                .clicked()
-            {
-                fx.toggle_master_cue(engine);
-            }
-            ui.separator();
-
-            ui.label(RichText::new("SAMPLER").small().strong());
-            ui.spacing_mut().item_spacing.x = 3.0;
-            if ui.small_button("◀").on_hover_text("Previous bank").clicked() {
-                fx.change_bank(-1);
-            }
-            ui.label(RichText::new(format!("BANK {}", fx.bank + 1)).small().monospace());
-            if ui.small_button("▶").on_hover_text("Next bank").clicked() {
-                fx.change_bank(1);
-            }
-            let first = fx.bank * crate::effects::BANK_SLOTS;
-            for slot in first..first + crate::effects::BANK_SLOTS {
-                let name = fx.samples[slot].as_ref().map(|s| s.name.clone());
-                let label = (slot - first + 1).to_string();
-                let playing = engine.sampler_playing(slot);
-                let response =
-                    crate::widgets::lit_button_sized(ui, &label, playing, ACTIVE, 11.0, 6.0)
-                        .on_hover_text(
-                            name.as_deref()
-                                .unwrap_or("Empty: put audio files in the samples folder"),
-                        );
+            let mut separate = false;
+            if show(FxPart::BeatFx) {
+                ui.label(RichText::new("BEAT FX").small().strong());
+                egui::ComboBox::from_id_salt("beat fx")
+                    .selected_text(fx.kind.label())
+                    .width(92.0)
+                    .show_ui(ui, |ui| {
+                        for kind in BeatFxKind::ALL {
+                            ui.selectable_value(&mut fx.kind, kind, kind.label());
+                        }
+                    });
+                if ui.small_button("◀").on_hover_text("Shorter beat").clicked() {
+                    fx.change_beat(-1);
+                }
+                ui.label(RichText::new(format!("{:>4}", fx.beat_label())).monospace());
+                if ui.small_button("▶").on_hover_text("Longer beat").clicked() {
+                    fx.change_beat(1);
+                }
+                let tap = match fx.tapped_bpm {
+                    Some(bpm) => format!("TAP {bpm:.0}"),
+                    None => "TAP".to_owned(),
+                };
+                let response = toggle(ui, fx.tapped_bpm.is_some(), &tap).on_hover_text(
+                    "Tap the effect's tempo; right-click to follow the master deck again",
+                );
                 if response.clicked() {
-                    engine.send(Command::SamplerPlay { slot });
+                    fx.tap();
                 }
                 if response.secondary_clicked() {
-                    engine.send(Command::SamplerStop { slot });
+                    fx.tapped_bpm = None;
                 }
+                ui.add(
+                    Slider::new(&mut fx.depth, 0.0..=1.0)
+                        .show_value(false)
+                        .text(RichText::new("DEPTH").small()),
+                );
+                let target_label = |t: FxTarget| match t {
+                    FxTarget::Channel(d) => format!("CH{}", d + 1),
+                    FxTarget::Master => "MASTER".to_owned(),
+                    FxTarget::Sampler => "SAMPLER".to_owned(),
+                };
+                egui::ComboBox::from_id_salt("fx target")
+                    .selected_text(target_label(fx.target))
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for target in (0..decks)
+                            .map(FxTarget::Channel)
+                            .chain([FxTarget::Master, FxTarget::Sampler])
+                        {
+                            ui.selectable_value(&mut fx.target, target, target_label(target));
+                        }
+                    });
+                if toggle(ui, fx.on, "ON").clicked() {
+                    fx.toggle_on();
+                }
+                if toggle(ui, fx.release, "RELEASE")
+                    .on_hover_text("Release FX: cut the source and let the echo play out")
+                    .clicked()
+                {
+                    fx.toggle_release();
+                }
+                ui.label("?").on_hover_text(
+                    (0..16)
+                        .map(|s| format!("Pad FX {}: {}", s + 1, pad_fx_label(s)))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                separate = true;
             }
-            if ui
-                .small_button("…")
-                .on_hover_text("Open the samples folder; files load at start-up")
-                .clicked()
-            {
-                let dir = crate::config::samples_dir();
-                let _ = std::fs::create_dir_all(&dir);
-                let opener = if cfg!(windows) { "explorer" } else { "open" };
-                let _ = std::process::Command::new(opener).arg(&dir).spawn();
+            if show(FxPart::ColorFx) {
+                if separate {
+                    ui.separator();
+                }
+                ui.label(RichText::new("COLOR FX").small().strong());
+                let mut color = fx.color;
+                egui::ComboBox::from_id_salt("color fx")
+                    .selected_text(color.label())
+                    .width(72.0)
+                    .show_ui(ui, |ui| {
+                        for kind in ColorFxKind::ALL {
+                            ui.selectable_value(&mut color, kind, kind.label());
+                        }
+                    });
+                if color != fx.color {
+                    fx.set_color(color, engine);
+                }
+                if toggle(ui, fx.color_on, "ON")
+                    .on_hover_text("Color FX on the channel knobs")
+                    .clicked()
+                {
+                    fx.toggle_color(engine);
+                }
+                separate = true;
+            }
+            if show(FxPart::MasterCue) {
+                if separate && !show(FxPart::ColorFx) {
+                    ui.separator();
+                }
+                if toggle(ui, fx.master_cue, "MASTER CUE")
+                    .on_hover_text("Hear the master mix in the headphones")
+                    .clicked()
+                {
+                    fx.toggle_master_cue(engine);
+                }
+                separate = true;
+            }
+            if show(FxPart::Sampler) {
+                if separate {
+                    ui.separator();
+                }
+                ui.label(RichText::new("SAMPLER").small().strong());
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if ui.small_button("◀").on_hover_text("Previous bank").clicked() {
+                    fx.change_bank(-1);
+                }
+                ui.label(RichText::new(format!("BANK {}", fx.bank + 1)).small().monospace());
+                if ui.small_button("▶").on_hover_text("Next bank").clicked() {
+                    fx.change_bank(1);
+                }
+                let first = fx.bank * crate::effects::BANK_SLOTS;
+                for slot in first..first + crate::effects::BANK_SLOTS {
+                    let name = fx.samples[slot].as_ref().map(|s| s.name.clone());
+                    let label = (slot - first + 1).to_string();
+                    let playing = engine.sampler_playing(slot);
+                    let response =
+                        crate::widgets::lit_button_sized(ui, &label, playing, ACTIVE, 11.0, 6.0)
+                            .on_hover_text(
+                                name.as_deref()
+                                    .unwrap_or("Empty: put audio files in the samples folder"),
+                            );
+                    if response.clicked() {
+                        engine.send(Command::SamplerPlay { slot });
+                    }
+                    if response.secondary_clicked() {
+                        engine.send(Command::SamplerStop { slot });
+                    }
+                }
+                if ui
+                    .small_button("…")
+                    .on_hover_text("Open the samples folder; files load at start-up")
+                    .clicked()
+                {
+                    let dir = crate::config::samples_dir();
+                    let _ = std::fs::create_dir_all(&dir);
+                    let opener = if cfg!(windows) { "explorer" } else { "open" };
+                    let _ = std::process::Command::new(opener).arg(&dir).spawn();
+                }
             }
         });
     }
 
     fn library_ui(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        if self.source == Source::Collection {
-            return self.collection_ui(ui, ctx);
+        let focus_stroke =
+            |focused: bool| if focused { Stroke::new(1.0_f32, ACTIVE) } else { Stroke::NONE };
+        let mut collection_load = None;
+        ui.horizontal_top(|ui| {
+            // The sidebar sits in a horizontal row; give it its own top-down layout.
+            ui.allocate_ui_with_layout(
+                vec2(240.0, ui.available_height()),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    egui::Frame::new()
+                        .stroke(focus_stroke(self.focus == Focus::Playlists))
+                        .show(ui, |ui| self.library_sidebar(ui));
+                },
+            );
+            ui.separator();
+            ui.vertical(|ui| match self.source {
+                Source::Collection => {
+                    let stroke = focus_stroke(self.focus == Focus::Tracks);
+                    collection_load = self.collection_tracks(ui, stroke);
+                }
+                Source::Usb(_) => self.usb_list(ui, ctx),
+            });
+        });
+        if let Some((id, deck)) = collection_load {
+            self.selected = Some(id);
+            self.load_from_collection(id, deck, ctx);
         }
-        let Some(library) = &self.library else {
+    }
+
+    /// The selected export's tracks: search, load buttons and the list.
+    fn usb_list(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let Some(library) = self.usb() else {
             ui.centered_and_justified(|ui| {
-                ui.label("Plug in a rekordbox USB export, or choose its folder in the bar above.");
+                ui.label("Plug in a USB stick with a rekordbox export, or open an export folder.");
             });
             return;
         };
+        let root = library.root.clone();
         let mut load: Option<(u32, usize)> = None;
         let mut double_clicked = None;
         let deck_count = self.deck_count();
@@ -1937,157 +2328,69 @@ impl DeckhandApp {
         let loaded: Vec<Option<u32>> = self
             .decks
             .iter()
-            .map(|d| d.track.as_ref().filter(|t| !t.from_collection).map(|t| t.id))
+            .map(|d| d.track.as_ref().filter(|t| t.usb_root.as_ref() == Some(&root)).map(|t| t.id))
             .collect();
         let free = self.free_deck(&loaded);
         let focus_stroke =
             |focused: bool| if focused { Stroke::new(1.0_f32, ACTIVE) } else { Stroke::NONE };
-        ui.horizontal_top(|ui| {
-            // The sidebar sits in a horizontal row; give it its own top-down layout.
-            ui.allocate_ui_with_layout(
-                vec2(240.0, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| {
-                    egui::Frame::new().stroke(focus_stroke(self.focus == Focus::Playlists)).show(
-                        ui,
-                        |ui| {
-                            ScrollArea::vertical()
-                                .id_salt("playlists")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.set_width(230.0);
-                                    if ui
-                                        .selectable_label(
-                                            self.playlist.is_none(),
-                                            format!(
-                                                "All tracks ({})",
-                                                library.library.tracks.len()
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.playlist = None;
-                                        self.focus = Focus::Playlists;
-                                    }
-                                    // USB folders can be closed; rows inside are skipped.
-                                    let mut hidden_below: Option<usize> = None;
-                                    let mut toggle = None;
-                                    for (i, row) in library.playlists.iter().enumerate() {
-                                        if hidden_below.is_some_and(|d| row.depth > d) {
-                                            continue;
-                                        }
-                                        hidden_below = None;
-                                        let folder = row.track_ids.is_none();
-                                        let open = !self.usb_collapsed.contains(&i);
-                                        if folder && !open {
-                                            hidden_below = Some(row.depth);
-                                        }
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(row.depth as f32 * 14.0);
-                                            if folder {
-                                                if crate::widgets::disclosure(ui, open).clicked() {
-                                                    toggle = Some(i);
-                                                }
-                                            } else {
-                                                ui.add_space(14.0 + ui.spacing().item_spacing.x);
-                                            }
-                                            let label = match &row.track_ids {
-                                                Some(ids) => {
-                                                    format!("♫ {} ({})", row.name, ids.len())
-                                                }
-                                                None => row.name.clone(),
-                                            };
-                                            let button = egui::Button::selectable(
-                                                self.playlist == Some(i),
-                                                label,
-                                            )
-                                            .truncate();
-                                            let response = ui.add(button).on_hover_text(&row.name);
-                                            if self.playlist == Some(i) && self.reveal_playlist {
-                                                response.scroll_to_me(Some(egui::Align::Center));
-                                            }
-                                            if response.clicked() {
-                                                if folder {
-                                                    toggle = Some(i);
-                                                } else {
-                                                    self.playlist = Some(i);
-                                                    self.focus = Focus::Playlists;
-                                                }
-                                            }
-                                        });
-                                    }
-                                    if let Some(i) = toggle
-                                        && !self.usb_collapsed.remove(&i)
-                                    {
-                                        self.usb_collapsed.insert(i);
-                                    }
-                                });
-                        },
-                    );
-                },
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search title, artist, album, genre")
+                    .desired_width(320.0),
             );
-            ui.separator();
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("🔍");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Search title, artist, album, genre")
-                            .desired_width(320.0),
-                    );
-                    if let Some(id) = self.selected {
-                        ui.separator();
+            if let Some(id) = self.selected {
+                ui.separator();
+                for deck in 0..deck_count {
+                    if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
+                        load = Some((id, deck));
+                    }
+                }
+            }
+        });
+        let options = TableOptions {
+            selected: self.selected,
+            selected_position: self.selected_position,
+            reveal_selected: std::mem::take(&mut self.reveal_selected),
+            loaded: &loaded,
+            draggable: false,
+            editable_rating: false,
+        };
+        let mut context_load = None;
+        let output = egui::Frame::new()
+            .stroke(focus_stroke(self.focus == Focus::Tracks))
+            .show(ui, |ui| {
+                track_table(
+                    ui,
+                    &rows,
+                    &mut self.config.columns,
+                    &mut self.config.sort,
+                    &options,
+                    &mut |ui, row| {
                         for deck in 0..deck_count {
                             if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
-                                load = Some((id, deck));
+                                context_load = Some((row.id, deck));
+                                ui.close();
                             }
                         }
-                    }
-                });
-                let options = TableOptions {
-                    selected: self.selected,
-                    selected_position: self.selected_position,
-                    reveal_selected: std::mem::take(&mut self.reveal_selected),
-                    loaded: &loaded,
-                    draggable: false,
-                    editable_rating: false,
-                };
-                let mut context_load = None;
-                let output = egui::Frame::new()
-                    .stroke(focus_stroke(self.focus == Focus::Tracks))
-                    .show(ui, |ui| {
-                        track_table(
-                            ui,
-                            &rows,
-                            &mut self.config.columns,
-                            &mut self.config.sort,
-                            &options,
-                            &mut |ui, row| {
-                                for deck in 0..deck_count {
-                                    if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
-                                        context_load = Some((row.id, deck));
-                                        ui.close();
-                                    }
-                                }
-                            },
-                        )
-                    })
-                    .inner;
-                if output.layout_changed {
-                    self.config.save();
-                }
-                if let Some((id, position)) = output.clicked {
-                    (self.selected, self.selected_position) = (Some(id), Some(position));
-                    self.focus = Focus::Tracks;
-                }
-                if let Some(id) = output.double_clicked {
-                    double_clicked = Some(id);
-                }
-                if context_load.is_some() {
-                    load = context_load;
-                }
-            });
-        });
+                    },
+                )
+            })
+            .inner;
+        if output.layout_changed {
+            self.config.save();
+        }
+        if let Some((id, position)) = output.clicked {
+            (self.selected, self.selected_position) = (Some(id), Some(position));
+            self.focus = Focus::Tracks;
+        }
+        if let Some(id) = output.double_clicked {
+            double_clicked = Some(id);
+        }
+        if context_load.is_some() {
+            load = context_load;
+        }
         if let (Some(id), Some(deck)) = (double_clicked, free) {
             load = Some((id, deck));
         }
@@ -2099,9 +2402,9 @@ impl DeckhandApp {
 
     /// The USB export's tracks for the list: playlist, search and sort applied.
     fn usb_rows(&self) -> Vec<Row> {
-        let Some(library) = &self.library else { return Vec::new() };
+        let Some(library) = self.usb() else { return Vec::new() };
         let mut rows: Vec<Row> = library
-            .numbered_tracks(self.playlist, &self.search)
+            .numbered_tracks(library.playlist, &self.search)
             .into_iter()
             .map(|(position, t)| Row {
                 id: t.track.id,
@@ -2708,6 +3011,14 @@ fn pad_face(
 }
 
 /// A button lit while `on`.
+/// A submenu that stays open while its contents are clicked (checkboxes,
+/// text fields); clicking outside it closes it.
+fn sticky_menu<R>(ui: &mut Ui, label: impl Into<String>, content: impl FnOnce(&mut Ui) -> R) {
+    use egui::containers::menu::{MenuConfig, SubMenuButton};
+    let config = MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    SubMenuButton::new(label.into()).config(config).ui(ui, content);
+}
+
 fn toggle(ui: &mut Ui, on: bool, label: &str) -> egui::Response {
     crate::widgets::lit_button(ui, label, on, ACTIVE)
 }

@@ -14,7 +14,10 @@ mod deck;
 mod effects;
 mod layout;
 mod library;
+mod parts;
 mod prefs_view;
+mod screen_layout;
+mod usb_import;
 mod waveform;
 mod widgets;
 
@@ -32,6 +35,11 @@ fn main() -> eframe::Result {
     {
         viewport = viewport.with_position([x, y]);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // Metal on macOS: OpenGL there is translated to Metal on the CPU.
+    #[cfg(target_os = "macos")]
+    let renderer = eframe::Renderer::Wgpu;
+    #[cfg(not(target_os = "macos"))]
+    let renderer = eframe::Renderer::Glow;
+    let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
     eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(app::DeckhandApp::new(cc)))))
 }

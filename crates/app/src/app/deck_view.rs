@@ -24,6 +24,7 @@ use crate::waveform::{Markers, draw_overview};
 #[derive(Default)]
 struct DeckOut {
     play: bool,
+    eject: bool,
     toggle_sync: bool,
     toggle_master: bool,
     key_sync: bool,
@@ -42,6 +43,8 @@ struct Parts<'a> {
     compact: bool,
     is_master: bool,
     needle_lock: bool,
+    /// Eject/Load Lock: a playing deck keeps its track.
+    load_lock: bool,
     out: DeckOut,
 }
 
@@ -81,6 +84,7 @@ impl DeckhandApp {
             compact,
             is_master: self.master == Some(index),
             needle_lock: self.config.prefs.needle_lock,
+            load_lock: self.config.prefs.load_lock,
             out: DeckOut::default(),
         };
         ui.horizontal_top(|ui| {
@@ -134,6 +138,9 @@ impl DeckhandApp {
         let ctx = ui.ctx().clone();
         for (action, pressed) in out.pad_events {
             self.apply_deck_event(index, action, Value::Pressed(pressed), &ctx);
+        }
+        if out.eject {
+            self.eject_deck(index);
         }
         if out.play {
             self.play_pause(index);
@@ -245,6 +252,21 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                     if let Some(title) = deck.loading_title() {
                         ui.spinner();
                         ui.label(format!("Loading {title}…"));
+                    }
+                    if deck.track.is_some() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let locked = p.load_lock && p.engine.is_playing(index);
+                            let hint = if locked {
+                                "Eject/Load Lock: stop the deck first"
+                            } else {
+                                "Take the track off this deck"
+                            };
+                            let eject = ui
+                                .add_enabled(!locked, egui::Button::new(RichText::new("Eject").small()))
+                                .on_hover_text(hint)
+                                .on_disabled_hover_text(hint);
+                            p.out.eject = eject.clicked();
+                        });
                     }
                 });
                 if let Some(err) = &deck.error {
