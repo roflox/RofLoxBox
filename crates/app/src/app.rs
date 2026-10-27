@@ -27,7 +27,7 @@ use eframe::egui::{
 use crate::browser::{Row, TableOptions, sort_rows, track_table};
 use crate::config::{AudioQuality, Config};
 use crate::controller::Controller;
-use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, key_sync_shift};
+use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, display_key, key_sync_shift};
 use crate::effects::{Effects, pad_fx_label};
 use crate::library::find_exports;
 use crate::prefs_view::{PrefsTab, deck_prefs, mixer_prefs};
@@ -518,6 +518,7 @@ impl DeckhandApp {
         for (index, deck) in self.decks.iter_mut().enumerate() {
             deck.prefs = DeckPrefs {
                 memory_call_lock: p.memory_call_lock,
+                key_notation: p.key_notation,
                 call_resizes_loop: p.call_resizes_loop,
                 gate_while_playing: p.gate_while_playing,
                 start_at_first_cue: p.start_at_first_cue,
@@ -749,7 +750,9 @@ impl DeckhandApp {
         use DeckAction as A;
         let pressed = matches!(value, Value::Pressed(true));
         // The deck a control layer is on becomes that side's active deck;
-        // mixer channel controls do not switch layers.
+        // mixer channel controls do not switch layers. Controllers with DECK
+        // buttons say so themselves: other messages arriving just after a
+        // switch (for the deck left behind) must not switch back.
         let mixer = matches!(
             action,
             A::Volume
@@ -765,7 +768,14 @@ impl DeckhandApp {
                 | A::FaderStartPlay
                 | A::FaderStartCue
         );
-        if !mixer && (action != A::Select || pressed) {
+        let deck_buttons = self
+            .controller
+            .mapping()
+            .bindings
+            .iter()
+            .any(|b| matches!(b.action, Action::Deck(_, A::Select)));
+        let switches = if deck_buttons { action == A::Select } else { !mixer };
+        if switches && (action != A::Select || pressed) {
             self.active_decks[d % 2] = d;
         }
         if action == A::Select {
@@ -1308,6 +1318,7 @@ impl eframe::App for DeckhandApp {
             self.controller_window(ctx);
         }
         self.duplicate_dialog(ctx);
+        self.cleanup_dialog(ctx);
         self.edit_dialog(ctx);
         if self.show_prefs {
             self.prefs_window(ctx);
@@ -2321,6 +2332,15 @@ impl DeckhandApp {
             return;
         };
         let root = library.root.clone();
+        // The stick's playlists, for "Add to playlist", and the one shown.
+        let stick_playlists: Vec<(u32, String)> = library
+            .playlists
+            .iter()
+            .filter(|r| r.track_ids.is_some())
+            .map(|r| (r.id, r.name.clone()))
+            .collect();
+        let shown_playlist = library.playlist.and_then(|i| library.playlists.get(i)).map(|r| r.id);
+        let mut usb_edit = None;
         let mut load: Option<(u32, usize)> = None;
         let mut double_clicked = None;
         let deck_count = self.deck_count();
@@ -2368,11 +2388,27 @@ impl DeckhandApp {
                     &mut self.config.sort,
                     &options,
                     &mut |ui, row| {
+                        use library_tree::UsbEdit;
                         for deck in 0..deck_count {
                             if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                                 context_load = Some((row.id, deck));
                                 ui.close();
                             }
+                        }
+                        ui.separator();
+                        ui.menu_button("Add to playlist", |ui| {
+                            for (id, name) in &stick_playlists {
+                                if ui.button(name).clicked() {
+                                    usb_edit = Some(UsbEdit::AddTracks(*id, vec![row.id]));
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if let Some(playlist) = shown_playlist
+                            && ui.button("Remove from this playlist").clicked()
+                        {
+                            usb_edit = Some(UsbEdit::RemoveEntry(playlist, row.position));
+                            ui.close();
                         }
                     },
                 )
@@ -2390,6 +2426,9 @@ impl DeckhandApp {
         }
         if context_load.is_some() {
             load = context_load;
+        }
+        if let Some(edit) = usb_edit {
+            self.edit_usb(&root, edit);
         }
         if let (Some(id), Some(deck)) = (double_clicked, free) {
             load = Some((id, deck));
@@ -2416,7 +2455,7 @@ impl DeckhandApp {
                 genre: t.genre.clone().unwrap_or_default(),
                 label: t.label.clone().unwrap_or_default(),
                 bpm: Some(t.track.bpm()).filter(|b| *b > 0.0),
-                key: t.key.clone(),
+                key: t.key.as_deref().map(|k| display_key(k, self.config.prefs.key_notation)),
                 duration: f64::from(t.track.duration_secs),
                 year: Some(t.track.year).filter(|y| *y > 0),
                 rating: t.track.rating.min(5),

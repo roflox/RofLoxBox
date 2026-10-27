@@ -63,6 +63,12 @@ impl UsbImport {
     }
 }
 
+/// Runs an import in this thread (tests).
+#[cfg(test)]
+pub fn run_for_tests(request: &ImportRequest) -> Result<Imported> {
+    run(request, &AtomicUsize::new(0), &AtomicBool::new(false))
+}
+
 fn run(request: &ImportRequest, done: &AtomicUsize, cancel: &AtomicBool) -> Result<Imported> {
     let mut tracks = Vec::new();
     let mut missing = 0;
@@ -176,19 +182,7 @@ fn added_seconds(date: &str) -> Option<u64> {
 /// Hot cues, memory cues and loops, and the beat grid as tempo markers,
 /// from rekordbox's analysis.
 fn cues_and_grid(dat: Option<&AnlzFile>, ext: Option<&AnlzFile>) -> (Vec<Cue>, Vec<TempoMarker>) {
-    let mut tempo: Vec<TempoMarker> = Vec::new();
-    if let Some(grid) = dat.and_then(AnlzFile::beat_grid) {
-        for beat in &grid.beats {
-            // A marker where the grid starts and wherever the tempo changes.
-            if tempo.last().is_none_or(|m| (m.bpm - beat.bpm()).abs() > 1e-6) {
-                tempo.push(TempoMarker {
-                    start: f64::from(beat.time_ms) / 1000.0,
-                    bpm: beat.bpm(),
-                    beat: beat.bar_position.clamp(1, 4) as u8,
-                });
-            }
-        }
-    }
+    let tempo = dat.and_then(AnlzFile::beat_grid).map(grid_markers).unwrap_or_default();
     // Extended cue lists carry colors and names; fall back to the basic ones.
     let lists: Vec<_> = ext
         .into_iter()
@@ -219,6 +213,22 @@ fn cues_and_grid(dat: Option<&AnlzFile>, ext: Option<&AnlzFile>) -> (Vec<Cue>, V
         }
     }
     (cues, tempo)
+}
+
+/// A beat grid as tempo markers: where it starts and wherever the tempo
+/// changes.
+pub fn grid_markers(grid: &deckhand_formats::anlz::BeatGrid) -> Vec<TempoMarker> {
+    let mut tempo: Vec<TempoMarker> = Vec::new();
+    for beat in &grid.beats {
+        if tempo.last().is_none_or(|m| (m.bpm - beat.bpm()).abs() > 1e-6) {
+            tempo.push(TempoMarker {
+                start: f64::from(beat.time_ms) / 1000.0,
+                bpm: beat.bpm(),
+                beat: beat.bar_position.clamp(1, 4) as u8,
+            });
+        }
+    }
+    tempo
 }
 
 fn playlist_node(node: &PlaylistNode) -> XmlNode {

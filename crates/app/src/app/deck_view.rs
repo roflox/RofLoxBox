@@ -14,7 +14,7 @@ use crate::widgets::{RoundIcon, round_button};
 
 /// Accent colours of lit buttons.
 const RED: Color32 = Color32::from_rgb(230, 60, 50);
-use crate::deck::{Deck, TempoRange, key_name};
+use crate::deck::{Deck, TempoRange, display_key, format_key};
 use crate::effects::Effects;
 use crate::layout::{DeckElement, Place};
 use crate::library::format_time;
@@ -305,7 +305,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 ui.separator();
                 // The key heard now; the shift in semitones when there is one.
                 let shifted = deck.key() != Some(heard);
-                let mut text = key_name(heard);
+                let mut text = format_key(heard, deck.prefs.key_notation);
                 if deck.key_shift != 0 {
                     text += &format!(" {:+}", deck.key_shift);
                 }
@@ -319,7 +319,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 ui.label(RichText::new(text).monospace().color(color));
             } else if let Some(key) = &track.key {
                 ui.separator();
-                ui.label(RichText::new(key).monospace());
+                ui.label(RichText::new(display_key(key, deck.prefs.key_notation)).monospace());
             }
             ui.separator();
             let size = if compact { 15.0 } else { 20.0 };

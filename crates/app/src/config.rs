@@ -169,6 +169,8 @@ pub struct FxSession {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
+    /// How keys are written on the decks and in the lists.
+    pub key_notation: crate::deck::KeyNotation,
     /// No loading onto a playing deck.
     pub load_lock: bool,
     /// No jumping by clicking the overview of a playing deck.
@@ -229,6 +231,7 @@ impl Default for Preferences {
             load_lock: true,
             needle_lock: true,
             memory_call_lock: true,
+            key_notation: Default::default(),
             call_resizes_loop: false,
             gate_while_playing: false,
             start_at_first_cue: true,

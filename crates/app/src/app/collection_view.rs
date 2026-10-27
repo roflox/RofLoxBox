@@ -474,6 +474,9 @@ impl DeckhandApp {
         count: usize,
     ) {
         let indent = depth as f32 * 14.0;
+        let sticks: Vec<(PathBuf, String)> =
+            self.libraries.iter().map(|l| (l.root.clone(), l.name())).collect();
+        let mut export_to: Option<PathBuf> = None;
         ui.horizontal(|ui| {
             ui.add_space(indent);
             if let Some((renaming, text)) = &mut self.collection_view.renaming
@@ -537,6 +540,30 @@ impl DeckhandApp {
                 self.request_add(*track, id);
             }
             response.context_menu(|ui| {
+                if kind == NodeKind::Playlist {
+                    ui.menu_button("Export to USB", |ui| {
+                        for (root, stick) in &sticks {
+                            if ui.button(stick).clicked() {
+                                export_to = Some(root.clone());
+                                ui.close();
+                            }
+                        }
+                        if !sticks.is_empty() {
+                            ui.separator();
+                        }
+                        if ui
+                            .button("Choose folder…")
+                            .on_hover_text("A stick or folder without an export gets a new one")
+                            .clicked()
+                        {
+                            ui.close();
+                            export_to = rfd::FileDialog::new()
+                                .set_title("Choose the USB stick (or a folder) to export to")
+                                .pick_folder();
+                        }
+                    });
+                    ui.separator();
+                }
                 if kind == NodeKind::Folder {
                     if ui.button("New playlist here").clicked() {
                         let new =
@@ -585,6 +612,9 @@ impl DeckhandApp {
                 }
             });
         });
+        if let Some(root) = export_to {
+            self.start_export(id, root);
+        }
     }
 
     /// The collection's tracks for the list: playlist, search and sort applied.
@@ -605,7 +635,10 @@ impl DeckhandApp {
                 genre: t.genre.clone(),
                 label: t.label.clone(),
                 bpm: t.bpm,
-                key: t.key.clone(),
+                key: t
+                    .key
+                    .as_deref()
+                    .map(|k| crate::deck::display_key(k, self.config.prefs.key_notation)),
                 duration: t.duration,
                 year: t.year,
                 rating: t.rating,

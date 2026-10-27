@@ -17,6 +17,7 @@ mod library;
 mod parts;
 mod prefs_view;
 mod screen_layout;
+mod usb_export;
 mod usb_import;
 mod waveform;
 mod widgets;
