@@ -10,7 +10,7 @@ use deckhand_audio::{
     Command, CrossfaderSide, Engine, TrackAudio, band_waveform, decode_file, peak_waveform,
 };
 use deckhand_control::PadMode;
-use deckhand_formats::anlz::{AnlzFile, CueKind, CueListKind};
+use deckhand_formats::anlz::{AnlzFile, CueKind, CueListKind, CueStatus};
 use deckhand_formats::pdb::LibraryTrack;
 use eframe::egui::{self, Color32};
 
@@ -20,14 +20,16 @@ use crate::waveform::WaveformData;
 pub const HOT_CUES: usize = 8;
 const HOT_CUE_DEFAULT: Color32 = Color32::from_rgb(40, 200, 80);
 
-/// Jog movement while paused, per step.
-const JOG_SECONDS_PER_STEP: f64 = 1.0 / 150.0;
+/// Audio moved by one turn of the jog, paused or scratching: like a
+/// 33⅓ rpm record, 1.8 s.
+const JOG_SECONDS_PER_TURN: f64 = 1.8;
 /// Speed change per jog step while playing, and how long it lasts.
-const NUDGE_PER_STEP: f64 = 0.01;
-const NUDGE_HOLD: Duration = Duration::from_millis(80);
-/// Audio moved per jog step while scratching: one turn of a 33⅓ rpm record
-/// is 1.8 s; assumes 1024 steps per turn.
-const SCRATCH_SECONDS_PER_STEP: f64 = 1.8 / 1024.0;
+/// Pitch bend when spinning one turn per second, at sensitivity 1.
+const BEND_PER_TURN_PER_SECOND: f64 = 0.25;
+/// The bend stops this long after the last jog movement.
+const NUDGE_HOLD: Duration = Duration::from_millis(35);
+/// Jog speed is measured over this much recent movement.
+const JOG_WINDOW: Duration = Duration::from_millis(50);
 /// Jog search movement per step.
 const SEARCH_SECONDS_PER_STEP: f64 = 0.1;
 /// Positions this close to the cue point count as "at the cue".
@@ -86,6 +88,8 @@ pub struct LoadedTrack {
     pub from_collection: bool,
     /// Auto Cue: where the first sound starts, when it was looked for.
     pub first_sound: Option<f64>,
+    /// A memory loop rekordbox marked active: it loops when playback gets there.
+    pub active_loop: Option<(f64, f64)>,
     pub title: String,
     pub artist: String,
     pub key: Option<String>,
@@ -136,6 +140,39 @@ impl LoadedTrack {
     pub fn nearest_beat_time(&self, seconds: f64) -> f64 {
         self.time_of_beat(self.beat_at(seconds).round())
     }
+
+    /// The bar (counted from 1 at the first downbeat) and the beat in it
+    /// (1–4) at `seconds`, like rekordbox's bar counter.
+    pub fn bar_and_beat(&self, seconds: f64) -> (i64, u16) {
+        let index = self.beat_at(seconds).floor() as i64;
+        let beats = &self.beats;
+        if beats.len() < 2 {
+            return (index.div_euclid(4) + 1, (index.rem_euclid(4) + 1) as u16);
+        }
+        // Beats before the first downbeat belong to bar 0 (a pickup).
+        let first_downbeat = beats.iter().position(|b| b.1 == 1).unwrap_or(0) as i64;
+        let in_grid = index.clamp(0, beats.len() as i64 - 1) as usize;
+        let beat = if index < 0 { 1 } else { beats[in_grid].1.clamp(1, 4) };
+        let bar = (index - first_downbeat).div_euclid(4) + 1;
+        (bar, beat)
+    }
+
+    /// Whole beats from `seconds` to the next memory cue or loop ahead.
+    pub fn beats_to_next_memory(&self, seconds: f64) -> Option<i64> {
+        let now = self.beat_at(seconds);
+        self.memory_cues
+            .iter()
+            .copied()
+            .chain(self.memory_loops.iter().map(|l| l.0))
+            .filter(|&t| t > seconds + 0.01)
+            .map(|t| (self.beat_at(t) - now).ceil() as i64)
+            .min()
+    }
+}
+
+/// Beats as rekordbox counts them down: `bars.beats`, e.g. 9 beats = "2.1".
+pub fn bars_label(beats: i64) -> String {
+    format!("{}.{}", beats / 4, beats % 4)
 }
 
 type LoadResult = Result<(LoadedTrack, Arc<TrackAudio>)>;
@@ -164,6 +201,17 @@ pub struct Deck {
     pub loop_active: bool,
     jog_touched: bool,
     nudge_until: Option<Instant>,
+    /// Jog steps since the last frame, and the smoothed spin speed
+    /// (steps per second) the pitch bend follows.
+    nudge_steps: std::collections::VecDeque<(Instant, f64)>,
+    nudge_velocity: f64,
+    nudge_sent: f64,
+    last_poll: Instant,
+    /// With SYNC: how far (in beats) this deck sits from the master's beat
+    /// on purpose, after the DJ nudged it; drift correction keeps it.
+    pub phase_offset: f64,
+    /// A nudge or scratch just ended: take the current phase as the offset.
+    pub rephase: bool,
     pub volume: f32,
     pub trim: f32,
     /// Knob positions, 0.5 = flat.
@@ -188,7 +236,11 @@ pub struct Deck {
     /// The key shift was set by key sync.
     pub key_synced: bool,
     pub pad_mode: PadMode,
+    /// The loaded track's cues or beat grid changed and should be saved.
+    pub edited: bool,
     pub prefs: DeckPrefs,
+    /// Jog steps the controller sends per turn of a wheel.
+    pub jog_steps_per_turn: f64,
     /// Instant Doubles: once loaded, pick up where this other deck plays.
     pub double_of: Option<usize>,
     /// The on-screen SHIFT button is latched.
@@ -228,13 +280,19 @@ impl Deck {
             loop_active: false,
             jog_touched: false,
             nudge_until: None,
+            nudge_steps: Default::default(),
+            nudge_velocity: 0.0,
+            nudge_sent: 0.0,
+            last_poll: Instant::now(),
+            phase_offset: 0.0,
+            rephase: false,
             volume: 1.0,
             trim: 0.5,
             eq: [0.5; 3],
             filter: 0.0,
             side: if index % 2 == 0 { CrossfaderSide::A } else { CrossfaderSide::B },
             headphone_cue: false,
-            hot_cue_gate: false,
+            hot_cue_gate: true,
             jump_size: 4.0,
             jump_range: 1.0,
             gate_held: None,
@@ -243,7 +301,9 @@ impl Deck {
             key_shift: 0,
             key_synced: false,
             pad_mode: PadMode::HotCue,
+            edited: false,
             prefs: DeckPrefs::default(),
+            jog_steps_per_turn: 720.0,
             double_of: None,
             screen_shift: false,
             pad_fx_page: 0,
@@ -349,15 +409,50 @@ impl Deck {
                         .unwrap_or(0.0);
                     engine.send(Command::Seek { deck: self.index, seconds: self.cue_point });
                     (self.loop_in, self.loop_region, self.loop_active) = (None, None, false);
+                    if let Some((start, end)) = track.active_loop {
+                        self.loop_in = Some(start);
+                        self.loop_region = Some((start, end));
+                        self.loop_active = true;
+                        engine.send(Command::SetLoop { deck: self.index, start, end });
+                    }
                     self.track = Some(track);
+                    self.edited = false;
+                    self.phase_offset = 0.0;
                     self.apply_tempo(engine);
                 }
                 Err(err) => self.error = Some(format!("{err:#}")),
             }
         }
-        if self.nudge_until.is_some_and(|until| Instant::now() >= until) {
-            self.nudge_until = None;
-            engine.send(Command::SetNudge { deck: self.index, amount: 0.0 });
+        // Pitch bend follows how fast the jog spins, smoothed over frames.
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_poll).as_secs_f64().clamp(1e-3, 0.1);
+        self.last_poll = now;
+        if self.nudge_until.is_some() {
+            // Spin speed over the last moments: steady while spinning, zero
+            // shortly after the wheel stops.
+            while self.nudge_steps.front().is_some_and(|(t, _)| now.duration_since(*t) > JOG_WINDOW)
+            {
+                self.nudge_steps.pop_front();
+            }
+            let speed =
+                self.nudge_steps.iter().map(|(_, s)| s).sum::<f64>() / JOG_WINDOW.as_secs_f64();
+            let spinning = !self.nudge_steps.is_empty();
+            let target = if spinning { speed } else { 0.0 };
+            // Quick to follow the hand, quicker still to stop with it.
+            let settle = if spinning { 0.025 } else { 0.012 };
+            self.nudge_velocity += (target - self.nudge_velocity) * (dt / settle).min(1.0);
+            let bend = (self.nudge_velocity / self.jog_steps_per_turn
+                * BEND_PER_TURN_PER_SECOND
+                * self.prefs.bend_sensitivity)
+                .clamp(-0.6, 0.6);
+            if !spinning && bend.abs() < 0.002 {
+                (self.nudge_until, self.nudge_velocity, self.nudge_sent) = (None, 0.0, 0.0);
+                self.rephase = true;
+                engine.send(Command::SetNudge { deck: self.index, amount: 0.0 });
+            } else if (bend - self.nudge_sent).abs() > 0.0005 {
+                self.nudge_sent = bend;
+                engine.send(Command::SetNudge { deck: self.index, amount: bend });
+            }
         }
     }
 
@@ -372,8 +467,10 @@ impl Deck {
         if self.track.is_none() {
             return;
         }
-        let playing = !engine.is_playing(self.index);
-        self.previewing = false;
+        // PLAY while CUE or a gated hot cue is held: keep playing after the
+        // release, like a CDJ.
+        let held = std::mem::take(&mut self.previewing) | self.gate_held.take().is_some();
+        let playing = held || !engine.is_playing(self.index);
         engine.send(Command::SetPlaying { deck: self.index, playing });
     }
 
@@ -414,7 +511,13 @@ impl Deck {
             // where it would have been.
             self.slip_pad = Some(slot);
             engine.send(Command::SlipHold { deck: self.index, held: true });
-        } else if is_set && (self.hot_cue_gate || force_gate) {
+        } else if is_set
+            && (force_gate
+                || (self.hot_cue_gate
+                    && (!engine.is_playing(self.index) || self.prefs.gate_while_playing)))
+        {
+            // Gate: plays while held, then back to the cue and paused. Like
+            // rekordbox, a playing deck just jumps (unless set otherwise).
             self.gate_held = Some(slot);
         }
         self.hot_cue(slot, engine);
@@ -453,10 +556,11 @@ impl Deck {
     }
 
     /// Calls the previous (`forward = false`) or next memory cue or loop
-    /// relative to the cue point (paused) or the position (playing).
+    /// relative to the cue point (paused) or the position (playing). During
+    /// loop playback it halves / doubles the loop instead when the
+    /// preference asks for Pioneer's way.
     pub fn memory_call(&mut self, forward: bool, engine: &mut Engine) {
-        // During loop playback the CALL buttons halve / double the loop.
-        if self.loop_active {
+        if self.loop_active && self.prefs.call_resizes_loop {
             self.resize_loop(if forward { 2.0 } else { 0.5 }, engine);
             return;
         }
@@ -501,12 +605,14 @@ impl Deck {
             Some(range) => {
                 if !track.memory_loops.iter().any(|l| (l.0 - range.0).abs() < AT_CUE) {
                     track.memory_loops.push(range);
+                    self.edited = true;
                 }
             }
             None => {
                 let t = if playing { position } else { cue_point };
                 if !track.memory_cues.iter().any(|m| (m - t).abs() < AT_CUE) {
                     track.memory_cues.push(t);
+                    self.edited = true;
                     track.memory_cues.sort_by(f64::total_cmp);
                 }
             }
@@ -518,6 +624,7 @@ impl Deck {
         let t = self.cue_point;
         if let Some(track) = self.track.as_mut() {
             track.memory_cues.retain(|m| (m - t).abs() >= AT_CUE);
+            self.edited = true;
             track.memory_loops.retain(|l| (l.0 - t).abs() >= AT_CUE);
         }
     }
@@ -528,11 +635,18 @@ impl Deck {
         let Some(track) = self.track.as_mut() else { return };
         match track.hot_cues[slot] {
             Some(cue) => {
+                // A hot cue leaves an active loop, wherever the cue is; the
+                // loop stays set for RELOOP.
+                if self.loop_active {
+                    self.loop_active = false;
+                    engine.send(Command::ClearLoop { deck: self.index });
+                }
                 engine.send(Command::Seek { deck: self.index, seconds: cue.seconds });
                 engine.send(Command::SetPlaying { deck: self.index, playing: true });
             }
             None => {
-                track.hot_cues[slot] = Some(HotCue { seconds: position, color: HOT_CUE_DEFAULT })
+                track.hot_cues[slot] = Some(HotCue { seconds: position, color: HOT_CUE_DEFAULT });
+                self.edited = true;
             }
         }
     }
@@ -540,6 +654,7 @@ impl Deck {
     pub fn clear_hot_cue(&mut self, slot: usize) {
         if let Some(track) = self.track.as_mut() {
             track.hot_cues[slot] = None;
+            self.edited = true;
         }
     }
 
@@ -614,7 +729,25 @@ impl Deck {
         }
     }
 
+    /// Without a loop of its own, RELOOP and Active Loop use the memory loop
+    /// playback is in, or else the next one ahead.
+    fn adopt_memory_loop(&mut self, engine: &Engine) {
+        if self.loop_region.is_some() {
+            return;
+        }
+        let Some(track) = &self.track else { return };
+        let position = engine.position_secs(self.index);
+        let inside = track.memory_loops.iter().find(|(s, e)| (*s..*e).contains(&position));
+        let ahead = track
+            .memory_loops
+            .iter()
+            .filter(|(s, _)| *s > position)
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        self.loop_region = inside.or(ahead).copied();
+    }
+
     pub fn reloop_exit(&mut self, engine: &mut Engine) {
+        self.adopt_memory_loop(engine);
         if self.loop_active {
             self.loop_active = false;
             engine.send(Command::ClearLoop { deck: self.index });
@@ -669,6 +802,16 @@ impl Deck {
         });
     }
 
+    /// The loop ½ / ×2 message a Pioneer controller sends from its CALL
+    /// buttons during loop playback: CALL as the preference says.
+    pub fn call_during_loop(&mut self, forward: bool, engine: &mut Engine) {
+        if self.prefs.call_resizes_loop {
+            self.resize_loop(if forward { 2.0 } else { 0.5 }, engine);
+        } else {
+            self.memory_call(forward, engine);
+        }
+    }
+
     pub fn resize_loop(&mut self, factor: f64, engine: &mut Engine) {
         if let Some((start, end)) = self.loop_region {
             let new_end = start + (end - start) * factor;
@@ -684,15 +827,13 @@ impl Deck {
     /// playing, moves through the track while paused.
     pub fn jog(&mut self, steps: i32, engine: &mut Engine) {
         if engine.is_playing(self.index) {
-            engine.send(Command::SetNudge {
-                deck: self.index,
-                amount: f64::from(steps) * NUDGE_PER_STEP,
-            });
+            // Bends while spinning; poll() turns the speed into a bend.
+            self.nudge_steps.push_back((Instant::now(), f64::from(steps)));
             self.nudge_until = Some(Instant::now() + NUDGE_HOLD);
         } else {
             engine.send(Command::JogMove {
                 deck: self.index,
-                seconds: f64::from(steps) * JOG_SECONDS_PER_STEP,
+                seconds: f64::from(steps) * JOG_SECONDS_PER_TURN / self.jog_steps_per_turn,
             });
         }
     }
@@ -702,8 +843,7 @@ impl Deck {
         if self.is_scratching() {
             engine.send(Command::JogMove {
                 deck: self.index,
-                seconds: f64::from(steps)
-                    * SCRATCH_SECONDS_PER_STEP
+                seconds: f64::from(steps) * JOG_SECONDS_PER_TURN / self.jog_steps_per_turn
                     * self.prefs.scratch_sensitivity,
             });
         } else {
@@ -712,7 +852,15 @@ impl Deck {
     }
 
     /// Touching the jog top in vinyl mode holds the record.
+    /// The jog or nudge buttons are moving the deck right now.
+    pub fn nudging(&self) -> bool {
+        self.nudge_until.is_some() || self.jog_touched
+    }
+
     pub fn jog_touch(&mut self, touched: bool, engine: &mut Engine) {
+        if self.jog_touched && !touched {
+            self.rephase = true;
+        }
         self.jog_touched = touched;
         if self.vinyl {
             engine.send(Command::Hold { deck: self.index, held: touched });
@@ -770,6 +918,7 @@ impl Deck {
         let Some(slot) = self.keyboard_cue else {
             if track.hot_cues[pad].is_none() {
                 track.hot_cues[pad] = Some(HotCue { seconds: position, color: HOT_CUE_DEFAULT });
+                self.edited = true;
             }
             self.keyboard_cue = Some(pad);
             return;
@@ -829,6 +978,7 @@ impl Deck {
             .take_while(|b| b.0 < track.duration)
             .collect();
         track.bpm = bpm;
+        self.edited = true;
         Some(bpm)
     }
 
@@ -860,6 +1010,7 @@ impl Deck {
 
     /// Turns the stored loop on or off without moving the playhead.
     pub fn toggle_active_loop(&mut self, engine: &mut Engine) {
+        self.adopt_memory_loop(engine);
         if self.loop_active {
             self.loop_active = false;
             engine.send(Command::ClearLoop { deck: self.index });
@@ -1015,11 +1166,16 @@ pub fn eq_db(knob: f32, isolator: bool) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeckPrefs {
     pub memory_call_lock: bool,
+    pub call_resizes_loop: bool,
+    /// Gated hot cues also stop on release when the deck was playing.
+    pub gate_while_playing: bool,
     pub start_at_first_cue: bool,
     /// Auto Cue level in dB, when Auto Cue is on for the deck.
     pub auto_cue_db: Option<f32>,
     pub isolator: bool,
     pub scratch_sensitivity: f64,
+    /// Jog pitch bend strength, 1.0 = a quarter faster per turn per second.
+    pub bend_sensitivity: f64,
     /// Vinyl Speed Adjust, seconds.
     pub vinyl_start: f64,
     pub vinyl_brake: f64,
@@ -1029,10 +1185,13 @@ impl Default for DeckPrefs {
     fn default() -> Self {
         Self {
             memory_call_lock: true,
+            call_resizes_loop: false,
+            gate_while_playing: false,
             start_at_first_cue: true,
             auto_cue_db: None,
             isolator: true,
             scratch_sensitivity: 1.0,
+            bend_sensitivity: 1.0,
             vinyl_start: 0.0,
             vinyl_brake: 0.0,
         }
@@ -1165,6 +1324,17 @@ impl LoadRequest {
             }
         }
         memory_cues.sort_by(f64::total_cmp);
+        // rekordbox's "active loop": flagged in the basic memory cue list.
+        let active_loop = dat
+            .iter()
+            .flat_map(|f| f.cue_lists())
+            .filter(|l| !l.extended && l.kind == CueListKind::Memory)
+            .flat_map(|l| l.cues.clone())
+            .find(|c| c.status == Some(CueStatus::ActiveLoop))
+            .and_then(|c| {
+                c.loop_end_ms.map(|end| (f64::from(c.time_ms) / 1000.0, f64::from(end) / 1000.0))
+            })
+            .filter(|(start, end)| end > start);
         if let Some(known) = self.known {
             if beats.is_empty() {
                 beats = known.beats;
@@ -1182,6 +1352,7 @@ impl LoadRequest {
             id: self.id,
             from_collection: self.from_collection,
             first_sound: self.auto_cue_db.and_then(|db| first_sound(&audio, db)),
+            active_loop,
             title: self.title,
             artist: self.artist,
             key: self.key,
@@ -1206,6 +1377,7 @@ mod tests {
             id: 1,
             from_collection: false,
             first_sound: None,
+            active_loop: None,
             title: String::new(),
             artist: String::new(),
             key: None,
@@ -1301,5 +1473,21 @@ mod tests {
         assert_eq!(key_sync_shift((9, true), (0, false)), 0);
         // Never more than a tritone away.
         assert_eq!(key_sync_shift((0, false), (11, false)), -1);
+    }
+
+    #[test]
+    fn bar_counter_and_memory_countdown() {
+        // 120 BPM, grid starting on beat 4 (a one-beat pickup).
+        let beats: Vec<(f64, u16)> =
+            (0..40).map(|i| (i as f64 * 0.5, ((i + 3) % 4 + 1) as u16)).collect();
+        let mut t = track(beats, 120.0);
+        assert_eq!(t.bar_and_beat(0.1), (0, 4), "pickup beat");
+        assert_eq!(t.bar_and_beat(0.6), (1, 1));
+        assert_eq!(t.bar_and_beat(2.6), (2, 1));
+        t.memory_cues = vec![8.5];
+        assert_eq!(t.beats_to_next_memory(0.5), Some(16));
+        assert_eq!(bars_label(16), "4.0");
+        assert_eq!(bars_label(9), "2.1");
+        assert_eq!(t.beats_to_next_memory(9.0), None);
     }
 }

@@ -2,6 +2,8 @@
 
 mod collection_view;
 mod deck_view;
+mod hotplug;
+mod recording;
 mod session;
 mod status_bar;
 
@@ -67,6 +69,8 @@ pub struct DeckhandApp {
     config: Config,
     engine: Option<Engine>,
     engine_error: Option<String>,
+    /// Jog steps per turn the engine was last told (None: not since it started).
+    jog_resolution: Option<u32>,
     decks: Vec<Deck>,
     master: Option<usize>,
     last_drift_check: Instant,
@@ -92,6 +96,26 @@ pub struct DeckhandApp {
     status_bar: status_bar::StatusBar,
     /// Deck elements can be dragged around.
     editing_layout: bool,
+    moved_window: bool,
+    hotplug: hotplug::Hotplug,
+    /// Each deck's jog bend at the last frame, to notice it ending.
+    was_bending: [bool; DECKS],
+    /// USB export folders closed in the sidebar (by row).
+    usb_collapsed: std::collections::HashSet<usize>,
+    /// F12: window and screen details for troubleshooting.
+    show_diagnostics: bool,
+    /// The master being recorded.
+    recording: Option<deckhand_audio::Recording>,
+    /// The deck each side of the controller drives (left 1/3, right 2/4).
+    active_decks: [usize; 2],
+    /// Position of the selected row in the list, telling duplicate tracks
+    /// apart (`None`: the first copy).
+    selected_position: Option<usize>,
+    /// The playlist sidebar scrolls to the selected playlist (browse knob).
+    reveal_playlist: bool,
+    /// The list scrolls to the selected track on the next frame (set when the
+    /// controller's browse knob moves the selection).
+    reveal_selected: bool,
     /// When the remembered settings were last compared and saved.
     session_checked: Instant,
     /// For flashing LEDs.
@@ -144,6 +168,7 @@ impl DeckhandApp {
         let mut app = Self {
             engine: None,
             engine_error: None,
+            jog_resolution: None,
             decks: (0..DECKS).map(Deck::new).collect(),
             master: None,
             last_drift_check: Instant::now(),
@@ -165,7 +190,9 @@ impl DeckhandApp {
             show_controller: std::env::var_os("DECKHAND_SHOW_CONTROLLER").is_some(),
             show_prefs: std::env::var_os("DECKHAND_SHOW_AUDIO").is_some()
                 || std::env::var_os("DECKHAND_SHOW_PREFS").is_some(),
-            prefs_tab: if std::env::var_os("DECKHAND_SHOW_AUDIO").is_some() {
+            prefs_tab: if std::env::var_os("DECKHAND_SHOW_MIXER_PREFS").is_some() {
+                PrefsTab::Mixer
+            } else if std::env::var_os("DECKHAND_SHOW_AUDIO").is_some() {
                 PrefsTab::Audio
             } else {
                 PrefsTab::default()
@@ -173,6 +200,16 @@ impl DeckhandApp {
             effects: Effects::default(),
             status_bar: status_bar::StatusBar::default(),
             editing_layout: std::env::var_os("DECKHAND_EDIT_LAYOUT").is_some(),
+            reveal_selected: false,
+            reveal_playlist: false,
+            selected_position: None,
+            active_decks: [0, 1],
+            recording: None,
+            moved_window: false,
+            usb_collapsed: Default::default(),
+            hotplug: Default::default(),
+            was_bending: [false; DECKS],
+            show_diagnostics: std::env::var_os("DECKHAND_DIAGNOSTICS").is_some(),
             session_checked: Instant::now(),
             started: Instant::now(),
             audio_caps: None,
@@ -196,6 +233,11 @@ impl DeckhandApp {
             config,
         };
         app.restore_session();
+        // Test aid: record into this folder from the start.
+        let record_to = std::env::var_os("DECKHAND_RECORD").map(PathBuf::from);
+        if let Some(dir) = &record_to {
+            app.config.recordings_dir = Some(dir.clone());
+        }
         app.effects.load_samples(&crate::config::samples_dir());
         if let Some(mode) = pad_mode {
             for deck in &mut app.decks {
@@ -221,10 +263,15 @@ impl DeckhandApp {
         if !app.collection.tracks.is_empty() && prefer_collection || app.library.is_none() {
             app.set_source(Source::Collection);
         }
-        let ports = input_ports();
+        let only = std::env::var("DECKHAND_PORT_FILTER").ok();
+        let ports: Vec<String> = input_ports()
+            .into_iter()
+            .filter(|p| only.as_ref().is_none_or(|f| p.contains(f.as_str())))
+            .collect();
         // Tests can force a port (for example a virtual test device).
         let forced = std::env::var("DECKHAND_MIDI_PORT").ok();
         let port = forced
+            .clone()
             .or_else(|| app.config.midi_port.clone().filter(|p| ports.contains(p)))
             .or_else(|| {
                 ports
@@ -236,8 +283,16 @@ impl DeckhandApp {
                     })
                     .cloned()
             });
+        app.note_ports(ports);
         if let Some(port) = port {
-            app.controller.open(&port, &cc.egui_ctx);
+            if forced.is_some() {
+                app.controller.open(&port, &cc.egui_ctx);
+            } else {
+                app.connect_controller(&port, &cc.egui_ctx);
+            }
+        }
+        if record_to.is_some() {
+            app.toggle_recording();
         }
         if app.screenshot.is_some() {
             let ids = app.visible_track_ids();
@@ -257,6 +312,7 @@ impl DeckhandApp {
     /// (Re)starts the audio output with the configured options; loaded
     /// tracks carry on where they were.
     fn start_engine(&mut self, device: Option<String>) {
+        self.finish_recording();
         let state: Vec<(f64, bool)> = (0..DECKS)
             .map(|d| {
                 self.engine.as_ref().map_or((0.0, false), |e| (e.position_secs(d), e.is_playing(d)))
@@ -290,6 +346,8 @@ impl DeckhandApp {
                     deck.restore(&mut engine, position, playing);
                 }
                 self.effects.apply_all(&mut engine);
+                self.controller.set_jog_sender(engine.take_jog_sender());
+                self.jog_resolution = None;
                 self.engine = Some(engine);
                 self.apply_preferences();
                 let Some(mut engine) = self.engine.take() else { return };
@@ -401,15 +459,34 @@ impl DeckhandApp {
     }
 
     /// Hands the Preferences to the decks and the engine.
+    /// Tells the decks and the engine how many steps the connected
+    /// controller's jog sends per turn, so a turn moves the same distance on
+    /// every controller.
+    fn sync_jog_resolution(&mut self) {
+        let steps = self.controller.mapping().jog_steps_per_turn();
+        for deck in &mut self.decks {
+            deck.jog_steps_per_turn = f64::from(steps);
+        }
+        if let Some(engine) = self.engine.as_mut()
+            && self.jog_resolution != Some(steps)
+        {
+            engine.send(Command::SetJogResolution(f64::from(steps)));
+            self.jog_resolution = Some(steps);
+        }
+    }
+
     fn apply_preferences(&mut self) {
         let p = self.config.prefs.clone();
         for (index, deck) in self.decks.iter_mut().enumerate() {
             deck.prefs = DeckPrefs {
                 memory_call_lock: p.memory_call_lock,
+                call_resizes_loop: p.call_resizes_loop,
+                gate_while_playing: p.gate_while_playing,
                 start_at_first_cue: p.start_at_first_cue,
                 auto_cue_db: p.auto_cue[index].then_some(p.auto_cue_level_db),
                 isolator: p.isolator,
                 scratch_sensitivity: f64::from(p.scratch_sensitivity),
+                bend_sensitivity: f64::from(p.bend_sensitivity),
                 vinyl_start: f64::from(p.vinyl_start),
                 vinyl_brake: f64::from(p.vinyl_brake),
             };
@@ -418,6 +495,8 @@ impl DeckhandApp {
         for deck in &self.decks {
             deck.apply_mixer(engine);
         }
+        engine.send(Command::SetEqSettings(p.eq_settings()));
+        engine.send(Command::SetBendSensitivity(f64::from(p.bend_sensitivity)));
         engine.send(Command::SetCrossfaderCurve(p.crossfader_curve.engine()));
         engine.send(Command::SetFaderCurve(p.fader_curve.engine()));
         engine.send(Command::SetLimiter(p.limiter));
@@ -425,11 +504,17 @@ impl DeckhandApp {
 
     /// Track ids in the order the list shows them.
     fn visible_track_ids(&self) -> Vec<u32> {
+        self.visible_rows().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// (track, position in the list) in the order the list shows them; the
+    /// position tells duplicates apart.
+    fn visible_rows(&self) -> Vec<(u32, usize)> {
         let rows = match self.source {
             Source::Collection => self.collection_rows(),
             Source::Usb => self.usb_rows(),
         };
-        rows.into_iter().map(|r| r.id).collect()
+        rows.into_iter().map(|r| (r.id, r.position)).collect()
     }
 
     // Sync
@@ -458,12 +543,14 @@ impl DeckhandApp {
             Some(master) => {
                 self.master.get_or_insert(master);
                 self.decks[deck].sync = true;
+                (self.decks[deck].phase_offset, self.decks[deck].rephase) = (0.0, false);
                 self.follow_master(deck, true);
             }
+            // Like rekordbox: with no other deck to follow, SYNC still turns
+            // on and this deck becomes the master the others follow.
             None => {
-                self.status = Some(
-                    "Sync needs another loaded deck that is playing (or set one as master)".into(),
-                )
+                self.decks[deck].sync = true;
+                self.master.get_or_insert(deck);
             }
         }
     }
@@ -488,9 +575,17 @@ impl DeckhandApp {
             target.sync_ratio = Some(ratio);
             target.apply_tempo(engine);
         }
-        if align && engine.is_playing(master) {
+        // While the DJ nudges, leave the phase alone; afterwards keep the
+        // offset they chose (the grid can be off, so they get the last word).
+        if align && engine.is_playing(master) && !target.nudging() && !engine.is_bending(deck) {
             let beat = track.beat_at(engine.position_secs(deck));
-            let mut error = beat.fract() - master_beat.fract();
+            let mut phase = beat.fract() - master_beat.fract();
+            phase -= phase.round();
+            if std::mem::take(&mut target.rephase) {
+                target.phase_offset = phase;
+                return;
+            }
+            let mut error = phase - target.phase_offset;
             error -= error.round();
             if error.abs() > DRIFT_LIMIT {
                 let seconds = track.time_of_beat(beat - error) - track.time_of_beat(beat);
@@ -500,6 +595,17 @@ impl DeckhandApp {
     }
 
     fn update_sync(&mut self) {
+        // A jog bend (handled in the audio engine) that just ended leaves
+        // the phase where the DJ put it.
+        if let Some(engine) = &self.engine {
+            for deck in 0..DECKS {
+                let bending = engine.is_bending(deck);
+                if self.was_bending[deck] && !bending {
+                    self.decks[deck].rephase = true;
+                }
+                self.was_bending[deck] = bending;
+            }
+        }
         let check_drift = self.last_drift_check.elapsed() >= DRIFT_CHECK;
         if check_drift {
             self.last_drift_check = Instant::now();
@@ -542,6 +648,29 @@ impl DeckhandApp {
     ) {
         use DeckAction as A;
         let pressed = matches!(value, Value::Pressed(true));
+        // The deck a control layer is on becomes that side's active deck;
+        // mixer channel controls do not switch layers.
+        let mixer = matches!(
+            action,
+            A::Volume
+                | A::Trim
+                | A::EqLow
+                | A::EqMid
+                | A::EqHigh
+                | A::Filter
+                | A::HeadphoneCue
+                | A::CrossfaderAssignA
+                | A::CrossfaderAssignThru
+                | A::CrossfaderAssignB
+                | A::FaderStartPlay
+                | A::FaderStartCue
+        );
+        if !mixer && (action != A::Select || pressed) {
+            self.active_decks[d % 2] = d;
+        }
+        if action == A::Select {
+            return;
+        }
         match (action, value) {
             (A::PlayPause, _) if pressed => return self.play_pause(d),
             (A::Sync, _) if pressed => return self.toggle_sync(d),
@@ -623,8 +752,10 @@ impl DeckhandApp {
             (A::LoopOut, _) if pressed => deck.loop_out(engine),
             (A::ReloopExit, _) if pressed => deck.reloop_exit(engine),
             (A::AutoLoop, _) if pressed => deck.beat_loop(4.0, engine),
-            (A::LoopHalf, _) if pressed => deck.resize_loop(0.5, engine),
-            (A::LoopDouble, _) if pressed => deck.resize_loop(2.0, engine),
+            (A::LoopHalf, _) if pressed => deck.call_during_loop(false, engine),
+            (A::LoopDouble, _) if pressed => deck.call_during_loop(true, engine),
+            (A::LoopResizeHalf, _) if pressed => deck.resize_loop(0.5, engine),
+            (A::LoopResizeDouble, _) if pressed => deck.resize_loop(2.0, engine),
             (A::BeatJump(n), _) if pressed => deck.pad_beat_jump(usize::from(n), engine),
             (A::BeatJumpBack, _) if pressed => deck.beat_jump(-deck.jump_size, engine),
             (A::BeatJumpForward, _) if pressed => deck.beat_jump(deck.jump_size, engine),
@@ -749,8 +880,13 @@ impl DeckhandApp {
     fn apply_global_event(&mut self, action: GlobalAction, value: Value) {
         match (action, value) {
             (GlobalAction::BrowseTurn, Value::Relative(steps)) => self.browse(steps),
+            // Pressing the browse knob (rekordbox's Forward on most
+            // controllers) goes into the playlist, or back out to the playlists.
             (GlobalAction::BrowseForward | GlobalAction::BrowsePress, Value::Pressed(true)) => {
-                self.focus = Focus::Tracks;
+                self.focus = match self.focus {
+                    Focus::Playlists => Focus::Tracks,
+                    Focus::Tracks => Focus::Playlists,
+                };
             }
             (GlobalAction::BrowseBack, Value::Pressed(true)) => self.focus = Focus::Playlists,
             (GlobalAction::BrowsePageUp, Value::Pressed(true)) => self.browse(-10),
@@ -832,6 +968,8 @@ impl DeckhandApp {
 
     /// The browse knob moves through playlists or tracks, whichever has focus.
     fn browse(&mut self, steps: i32) {
+        self.reveal_selected = true;
+        self.reveal_playlist = true;
         let step = |current: Option<usize>, len: usize| -> Option<usize> {
             if len == 0 {
                 return None;
@@ -843,10 +981,16 @@ impl DeckhandApp {
         };
         match self.focus {
             Focus::Tracks => {
-                let ids = self.visible_track_ids();
-                let current = self.selected.and_then(|s| ids.iter().position(|&id| id == s));
-                if let Some(next) = step(current, ids.len()) {
-                    self.selected = Some(ids[next]);
+                let rows = self.visible_rows();
+                // The selected row itself, or the first copy of the track.
+                let current = self.selected.and_then(|s| {
+                    rows.iter()
+                        .position(|&r| r == (s, self.selected_position.unwrap_or(usize::MAX)))
+                        .or_else(|| rows.iter().position(|&(id, _)| id == s))
+                });
+                if let Some(next) = step(current, rows.len()) {
+                    (self.selected, self.selected_position) =
+                        (Some(rows[next].0), Some(rows[next].1));
                 }
             }
             Focus::Playlists if self.source == Source::Collection => {
@@ -858,17 +1002,21 @@ impl DeckhandApp {
             }
             Focus::Playlists => {
                 let Some(library) = &self.library else { return };
-                // Position 0 is "All tracks"; folders are skipped.
-                let entries: Vec<Option<usize>> = std::iter::once(None)
-                    .chain(
-                        library
-                            .playlists
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, p)| p.track_ids.is_some())
-                            .map(|(i, _)| Some(i)),
-                    )
-                    .collect();
+                // Position 0 is "All tracks"; folders, and playlists inside
+                // closed folders, are skipped.
+                let mut entries: Vec<Option<usize>> = vec![None];
+                let mut hidden_below: Option<usize> = None;
+                for (i, row) in library.playlists.iter().enumerate() {
+                    if hidden_below.is_some_and(|d| row.depth > d) {
+                        continue;
+                    }
+                    hidden_below = None;
+                    match &row.track_ids {
+                        None if self.usb_collapsed.contains(&i) => hidden_below = Some(row.depth),
+                        None => {}
+                        Some(_) => entries.push(Some(i)),
+                    }
+                }
                 let current = entries.iter().position(|&e| e == self.playlist);
                 if let Some(next) = step(current, entries.len()) {
                     self.playlist = entries[next];
@@ -957,6 +1105,7 @@ impl DeckhandApp {
         values.insert(Feedback::Global(GlobalFeedback::FxRelease), on(fx.release));
         values.insert(Feedback::Global(GlobalFeedback::ColorFxOn), on(fx.color_on));
         values.insert(Feedback::Global(GlobalFeedback::MasterCue), on(fx.master_cue));
+        values.insert(Feedback::Global(GlobalFeedback::FxBeat), fx.beat_indicator());
         values
     }
 }
@@ -967,6 +1116,7 @@ impl eframe::App for DeckhandApp {
         // nothing needs cleaning up, so leave directly.
         if ctx.input(|i| i.viewport().close_requested()) {
             self.save_session(true);
+            self.finish_recording();
             self.config.save();
             std::process::exit(0);
         }
@@ -976,10 +1126,13 @@ impl eframe::App for DeckhandApp {
                 deck.poll(engine);
             }
         }
+        self.sync_jog_resolution();
         for event in self.controller.poll() {
             self.apply_event(event, ctx);
         }
+        self.save_track_edits();
         self.poll_collection(ctx);
+        self.check_controllers(ctx);
         self.save_session(false);
         self.finish_doubles();
         self.update_sync();
@@ -990,7 +1143,10 @@ impl eframe::App for DeckhandApp {
         let values = self.feedback_values();
         self.controller.send_feedback(|f| values.get(&f).copied().unwrap_or(0));
 
-        let busy = self.engine.as_ref().is_some_and(|e| (0..DECKS).any(|d| e.is_playing(d)))
+        let busy = self
+            .engine
+            .as_ref()
+            .is_some_and(|e| (0..DECKS).any(|d| e.is_playing(d) || e.is_moving(d)))
             || self.decks.iter().any(|d| d.loading_title().is_some() || d.is_scratching());
         if busy {
             ctx.request_repaint();
@@ -1013,19 +1169,66 @@ impl eframe::App for DeckhandApp {
             egui::TopBottomPanel::top("fx").show(ctx, |ui| self.fx_panel(ui));
         }
         self.update_status();
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            self.show_diagnostics = !self.show_diagnostics;
+        }
+        if self.show_diagnostics {
+            // Window and screen details, drawn as a panel (not a floating
+            // layer) so it shows even when floating things do not.
+            let info = ctx.input(|i| {
+                let v = i.viewport();
+                format!(
+                    "viewport {:?} | content {:?} | points/pixel {:.2} (native {:?}) | monitor {:?} | outer {:?} | inner {:?} | fullscreen {:?} | maximized {:?} | focused {:?}",
+                    i.viewport_rect(),
+                    i.content_rect(),
+                    i.pixels_per_point,
+                    v.native_pixels_per_point,
+                    v.monitor_size,
+                    v.outer_rect,
+                    v.inner_rect,
+                    v.fullscreen,
+                    v.maximized,
+                    v.focused,
+                )
+            });
+            let layers = ctx
+                .memory(|m| m.layer_ids().filter(|l| l.order != egui::Order::Background).count());
+            let bending: Vec<bool> =
+                (0..DECKS).map(|d| self.engine.as_ref().is_some_and(|e| e.is_bending(d))).collect();
+            let info = format!("{info} | jog bending {bending:?}");
+            egui::TopBottomPanel::bottom("diagnostics").show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("{info} | floating layers {layers}")).small().monospace(),
+                );
+            });
+        }
         self.status_bar(ctx);
         if self.config.show_library {
             egui::TopBottomPanel::bottom("library")
                 .resizable(true)
                 .default_height(if self.config.four_decks { 200.0 } else { 300.0 })
                 .show(ctx, |ui| self.library_ui(ui, ctx));
+            self.reveal_playlist = false;
         }
         egui::CentralPanel::default().show(ctx, |ui| self.central(ui));
         if self.show_controller {
             self.controller_window(ctx);
         }
+        self.duplicate_dialog(ctx);
+        self.edit_dialog(ctx);
         if self.show_prefs {
             self.prefs_window(ctx);
+        }
+        // Test aid: move the window to "x,y" two seconds after start (to
+        // try another monitor while running).
+        if let Ok(target) = std::env::var("DECKHAND_MOVE_TO")
+            && self.started.elapsed() > Duration::from_secs(2)
+            && !self.moved_window
+            && let Some((x, y)) = target.split_once(',')
+            && let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>())
+        {
+            self.moved_window = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
         }
         self.handle_screenshot(ctx);
     }
@@ -1096,6 +1299,8 @@ impl DeckhandApp {
                     ui.label(format!("{} Hz · {} ch", info.sample_rate, info.channels));
                 }
                 ui.toggle_value(&mut self.show_prefs, "⚙ Preferences");
+                ui.separator();
+                self.record_button(ui);
                 ui.separator();
                 let mut four = self.config.four_decks;
                 ui.selectable_value(&mut four, false, "2 decks");
@@ -1189,13 +1394,16 @@ impl DeckhandApp {
 
     /// One deck's scrolling waveform; dragging it moves through the track.
     fn deck_waveform(&mut self, ui: &mut Ui, index: usize, size: egui::Vec2, vertical: bool) {
+        // The zoom is real time: a deck playing faster shows more of its
+        // track, so beats of synced decks line up across the whole width.
+        let visible = self.seconds_visible * self.decks[index].tempo_ratio().max(0.05);
         let Some(engine) = self.engine.as_mut() else { return };
         let deck = &self.decks[index];
         let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
         let painter = ui.painter_at(rect);
         match &deck.track {
             Some(track) => {
-                let position = engine.position_secs(index);
+                let position = engine.display_position_secs(index);
                 let hot_cues = hot_cue_marks(track);
                 let markers = Markers {
                     beats: &track.beats,
@@ -1212,9 +1420,9 @@ impl DeckhandApp {
                     vertical,
                     &track.waveform,
                     position,
-                    self.seconds_visible,
+                    visible,
                     self.config.waveform_style,
-                    deck.eq_gains(),
+                    if self.config.prefs.eq_waveforms { deck.eq_gains() } else { [1.0; 3] },
                     &markers,
                 );
                 if response.dragged() {
@@ -1223,7 +1431,7 @@ impl DeckhandApp {
                     let delta = response.drag_delta();
                     let (moved, length) =
                         if vertical { (delta.y, rect.height()) } else { (-delta.x, rect.width()) };
-                    let seconds = f64::from(moved) / f64::from(length) * self.seconds_visible;
+                    let seconds = f64::from(moved) / f64::from(length) * visible;
                     engine.send(Command::Shift { deck: index, seconds });
                 }
             }
@@ -1262,7 +1470,9 @@ impl DeckhandApp {
             if grid.drag_stopped() || (grid.changed() && !grid.dragged()) {
                 self.config.save();
             }
-            ui.label(RichText::new("waveforms follow each channel's EQ").small().weak());
+            if self.config.prefs.eq_waveforms {
+                ui.label(RichText::new("waveforms follow each channel's EQ").small().weak());
+            }
         });
     }
 
@@ -1325,7 +1535,18 @@ impl DeckhandApp {
             ui.set_width(width);
             ScrollArea::vertical().id_salt(("decks", decks[0])).show(ui, |ui| {
                 for &deck in decks {
-                    self.deck_ui(ui, deck, compact);
+                    // With four decks, the one each controller side drives is framed.
+                    let active = self.config.four_decks && self.active_decks[deck % 2] == deck;
+                    let stroke = if active {
+                        Stroke::new(2.0_f32, DECK_COLORS[deck])
+                    } else {
+                        Stroke::new(2.0_f32, Color32::TRANSPARENT)
+                    };
+                    egui::Frame::new()
+                        .stroke(stroke)
+                        .corner_radius(4)
+                        .inner_margin(3.0)
+                        .show(ui, |ui| self.deck_ui(ui, deck, compact));
                     if compact {
                         ui.separator();
                     }
@@ -1748,26 +1969,57 @@ impl DeckhandApp {
                                         self.playlist = None;
                                         self.focus = Focus::Playlists;
                                     }
+                                    // USB folders can be closed; rows inside are skipped.
+                                    let mut hidden_below: Option<usize> = None;
+                                    let mut toggle = None;
                                     for (i, row) in library.playlists.iter().enumerate() {
-                                        let indent = "    ".repeat(row.depth);
-                                        let label = match &row.track_ids {
-                                            Some(ids) => {
-                                                format!("{indent}♫ {} ({})", row.name, ids.len())
-                                            }
-                                            None => format!("{indent}📁 {}", row.name),
-                                        };
-                                        let button = egui::Button::selectable(
-                                            self.playlist == Some(i),
-                                            label,
-                                        )
-                                        .truncate();
-                                        let response = ui
-                                            .add_enabled(row.track_ids.is_some(), button)
-                                            .on_hover_text(&row.name);
-                                        if response.clicked() {
-                                            self.playlist = Some(i);
-                                            self.focus = Focus::Playlists;
+                                        if hidden_below.is_some_and(|d| row.depth > d) {
+                                            continue;
                                         }
+                                        hidden_below = None;
+                                        let folder = row.track_ids.is_none();
+                                        let open = !self.usb_collapsed.contains(&i);
+                                        if folder && !open {
+                                            hidden_below = Some(row.depth);
+                                        }
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(row.depth as f32 * 14.0);
+                                            if folder {
+                                                if crate::widgets::disclosure(ui, open).clicked() {
+                                                    toggle = Some(i);
+                                                }
+                                            } else {
+                                                ui.add_space(14.0 + ui.spacing().item_spacing.x);
+                                            }
+                                            let label = match &row.track_ids {
+                                                Some(ids) => {
+                                                    format!("♫ {} ({})", row.name, ids.len())
+                                                }
+                                                None => row.name.clone(),
+                                            };
+                                            let button = egui::Button::selectable(
+                                                self.playlist == Some(i),
+                                                label,
+                                            )
+                                            .truncate();
+                                            let response = ui.add(button).on_hover_text(&row.name);
+                                            if self.playlist == Some(i) && self.reveal_playlist {
+                                                response.scroll_to_me(Some(egui::Align::Center));
+                                            }
+                                            if response.clicked() {
+                                                if folder {
+                                                    toggle = Some(i);
+                                                } else {
+                                                    self.playlist = Some(i);
+                                                    self.focus = Focus::Playlists;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    if let Some(i) = toggle
+                                        && !self.usb_collapsed.remove(&i)
+                                    {
+                                        self.usb_collapsed.insert(i);
                                     }
                                 });
                         },
@@ -1794,6 +2046,8 @@ impl DeckhandApp {
                 });
                 let options = TableOptions {
                     selected: self.selected,
+                    selected_position: self.selected_position,
+                    reveal_selected: std::mem::take(&mut self.reveal_selected),
                     loaded: &loaded,
                     draggable: false,
                     editable_rating: false,
@@ -1822,8 +2076,8 @@ impl DeckhandApp {
                 if output.layout_changed {
                     self.config.save();
                 }
-                if let Some(id) = output.clicked {
-                    self.selected = Some(id);
+                if let Some((id, position)) = output.clicked {
+                    (self.selected, self.selected_position) = (Some(id), Some(position));
                     self.focus = Focus::Tracks;
                 }
                 if let Some(id) = output.double_clicked {
@@ -1847,10 +2101,12 @@ impl DeckhandApp {
     fn usb_rows(&self) -> Vec<Row> {
         let Some(library) = &self.library else { return Vec::new() };
         let mut rows: Vec<Row> = library
-            .tracks(self.playlist, &self.search)
+            .numbered_tracks(self.playlist, &self.search)
             .into_iter()
-            .map(|t| Row {
+            .map(|(position, t)| Row {
                 id: t.track.id,
+                entry: None,
+                position,
                 title: t.track.title.clone(),
                 artist: t.artist.clone().unwrap_or_default(),
                 album: t.album.clone().unwrap_or_default(),
@@ -1894,24 +2150,28 @@ impl DeckhandApp {
         let mut prefs_changed = false;
         let decks = self.deck_count();
         egui::Window::new("Preferences").open(&mut open).default_width(560.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for tab in PrefsTab::ALL {
-                    ui.selectable_value(&mut self.prefs_tab, tab, RichText::new(tab.label()).strong());
+                ui.horizontal(|ui| {
+                    for tab in PrefsTab::ALL {
+                        ui.selectable_value(
+                            &mut self.prefs_tab,
+                            tab,
+                            RichText::new(tab.label()).strong(),
+                        );
+                    }
+                });
+                ui.separator();
+                match self.prefs_tab {
+                    PrefsTab::Deck => {
+                        prefs_changed |= deck_prefs(ui, &mut self.config.prefs, decks);
+                        return;
+                    }
+                    PrefsTab::Mixer => {
+                        prefs_changed |= mixer_prefs(ui, &mut self.config.prefs);
+                        return;
+                    }
+                    PrefsTab::Audio => {}
                 }
-            });
-            ui.separator();
-            match self.prefs_tab {
-                PrefsTab::Deck => {
-                    prefs_changed |= deck_prefs(ui, &mut self.config.prefs, decks);
-                    return;
-                }
-                PrefsTab::Mixer => {
-                    prefs_changed |= mixer_prefs(ui, &mut self.config.prefs);
-                    return;
-                }
-                PrefsTab::Audio => {}
-            }
-            egui::Grid::new("audio settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                egui::Grid::new("audio settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Output");
                 let current = info.as_ref().map_or("No audio".to_owned(), |i| i.device.clone());
                 egui::ComboBox::from_id_salt("audio device").selected_text(current).width(240.0).show_ui(ui, |ui| {
@@ -1970,19 +2230,28 @@ impl DeckhandApp {
                 });
                 ui.end_row();
             });
-            ui.separator();
-            if let Some(info) = &info {
-                let buffer = info.latency_ms().map_or("device default buffer".to_owned(), |ms| {
-                    format!("{} samples = {ms:.1} ms", info.buffer_frames.unwrap_or_default())
-                });
-                ui.label(format!("Running: {} Hz · {} channels · {buffer}", info.sample_rate, info.channels));
-            }
-            ui.label(
+                self.recording_prefs(ui);
+                ui.separator();
+                if let Some(info) = &info {
+                    let buffer =
+                        info.latency_ms().map_or("device default buffer".to_owned(), |ms| {
+                            format!(
+                                "{} samples = {ms:.1} ms",
+                                info.buffer_frames.unwrap_or_default()
+                            )
+                        });
+                    ui.label(format!(
+                        "Running: {} Hz · {} channels · {buffer}",
+                        info.sample_rate, info.channels
+                    ));
+                }
+                ui.label(
                 RichText::new("Smaller buffers make the controller respond sooner; raise the buffer if you hear crackles or dropouts.")
                     .small()
                     .weak(),
             );
-        });
+            },
+        );
         self.show_prefs = open;
         if prefs_changed {
             self.config.save();
@@ -1996,44 +2265,49 @@ impl DeckhandApp {
     fn controller_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_controller;
         egui::Window::new("Controller").open(&mut open).default_width(560.0).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let current = self.controller.port().unwrap_or("Not connected").to_owned();
-                let mut chosen = None;
-                egui::ComboBox::from_id_salt("midi").selected_text(current).width(260.0).show_ui(ui, |ui| {
-                    for port in input_ports() {
-                        if ui.selectable_label(false, &port).clicked() {
-                            chosen = Some(port);
-                        }
+                ui.horizontal(|ui| {
+                    let current = self.controller.port().unwrap_or("Not connected").to_owned();
+                    let mut chosen = None;
+                    egui::ComboBox::from_id_salt("midi")
+                        .selected_text(current)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for port in input_ports() {
+                                if ui.selectable_label(false, &port).clicked() {
+                                    chosen = Some(port);
+                                }
+                            }
+                        });
+                    if let Some(port) = chosen {
+                        self.connect_controller(&port, ctx);
+                    }
+                    if self.controller.port().is_some() && ui.button("Disconnect").clicked() {
+                        self.decline_controller();
+                    }
+                    if self.controller.port().is_some() {
+                        ui.label(if self.controller.has_output() {
+                            "LEDs: on"
+                        } else {
+                            "LEDs: no output port"
+                        });
                     }
                 });
-                if let Some(port) = chosen {
-                    self.controller.open(&port, ctx);
-                    self.config.midi_port = Some(port);
-                    self.config.save();
+                if let Some(err) = &self.controller.error {
+                    ui.colored_label(WARN, err);
                 }
-                if self.controller.port().is_some() && ui.button("Disconnect").clicked() {
-                    self.controller.close();
+                if self.controller.port().is_none() {
+                    ui.label("Connect the controller by USB, then pick its MIDI port above.");
+                    return;
                 }
-                if self.controller.port().is_some() {
-                    ui.label(if self.controller.has_output() { "LEDs: on" } else { "LEDs: no output port" });
-                }
-            });
-            if let Some(err) = &self.controller.error {
-                ui.colored_label(WARN, err);
-            }
-            if self.controller.port().is_none() {
-                ui.label("Connect the controller by USB, then pick its MIDI port above.");
-                return;
-            }
 
-            ui.separator();
-            ui.label(RichText::new("Automatic mapping").strong());
-            let extra = vec![crate::config::extra_mapping_dir()];
-            let files = rekordbox::mapping_files_with(&extra);
-            if files.is_empty() {
-                ui.label("No rekordbox installation found; map controls with Learn below.");
-            } else {
-                ui.horizontal(|ui| {
+                ui.separator();
+                ui.label(RichText::new("Automatic mapping").strong());
+                let extra = vec![crate::config::extra_mapping_dir()];
+                let files = rekordbox::mapping_files_with(&extra);
+                if files.is_empty() {
+                    ui.label("No rekordbox installation found; map controls with Learn below.");
+                } else {
+                    ui.horizontal(|ui| {
                     let suggested = self
                         .controller
                         .port()
@@ -2053,10 +2327,18 @@ impl DeckhandApp {
                     {
                         self.controller.import_from(&files[i].1);
                     }
+                    if let Some(i) = choice
+                        && ui
+                            .button("Add missing only")
+                            .on_hover_text("Keep your mapping; add only functions and lights it does not have yet (on controls not used already)")
+                            .clicked()
+                    {
+                        self.controller.import_missing_from(&files[i].1);
+                    }
                 });
-                ui.label(RichText::new("Reads the mapping file of your installed rekordbox; nothing is copied into RofLoxBox.").small().weak());
-            }
-            ui.horizontal(|ui| {
+                    ui.label(RichText::new("Reads the mapping file of your installed rekordbox; nothing is copied into RofLoxBox.").small().weak());
+                }
+                ui.horizontal(|ui| {
                 if ui
                     .button("Import mapping file…")
                     .on_hover_text("Use a rekordbox .midi.csv mapping, e.g. from rekordbox 6 or another computer")
@@ -2076,12 +2358,12 @@ impl DeckhandApp {
                     let _ = std::process::Command::new(opener).arg(&dir).spawn();
                 }
             });
-            if let Some(notice) = &self.controller.notice {
-                ui.label(RichText::new(notice).small());
-            }
+                if let Some(notice) = &self.controller.notice {
+                    ui.label(RichText::new(notice).small());
+                }
 
-            ui.separator();
-            ui.horizontal(|ui| {
+                ui.separator();
+                ui.horizontal(|ui| {
                 let count = self.controller.mapping().shift_controls.len();
                 ui.label(format!("Shift buttons: {}", if count == 0 { "none".to_owned() } else { count.to_string() }))
                     .on_hover_text("While a Shift button is held, functions marked Shift take over their control");
@@ -2092,9 +2374,9 @@ impl DeckhandApp {
                     self.controller.clear_shift_controls();
                 }
             });
-            match self.controller.learning() {
-                Some(action) => {
-                    ui.horizontal(|ui| {
+                match self.controller.learning() {
+                    Some(action) => {
+                        ui.horizontal(|ui| {
                         ui.colored_label(
                             CUE_COLOR,
                             format!("Learning {action}: press or move that control (hold Shift for a Shift combination)…"),
@@ -2103,84 +2385,108 @@ impl DeckhandApp {
                             self.controller.cancel_learn();
                         }
                     });
-                }
-                None if self.controller.learning_shift() => {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(CUE_COLOR, "Press the button to use as Shift…");
-                        if ui.button("Cancel").clicked() {
-                            self.controller.cancel_learn();
-                        }
-                    });
-                }
-                None => {
-                    ui.label("To change a control: press Learn next to a function, then press or move it on the controller. Hold a Shift button while doing so to make a Shift combination.");
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("🔍");
-                ui.add(egui::TextEdit::singleline(&mut self.action_filter).hint_text("Filter functions, e.g. deck1 or loop").desired_width(260.0));
-                ui.label(format!(
-                    "{} controls, {} lights mapped",
-                    self.controller.mapping().bindings.len(),
-                    self.controller.mapping().outputs.len()
-                ));
-            });
-            let filter = self.action_filter.to_lowercase();
-            ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                egui::Grid::new("bindings").striped(true).num_columns(5).show(ui, |ui| {
-                    for action in Action::all().into_iter().filter(|a| a.to_string().contains(&filter)) {
-                        ui.label(action.to_string());
-                        let bindings: Vec<_> = self.controller.mapping().bindings.iter().filter(|b| b.action == action).cloned().collect();
-                        if bindings.is_empty() {
-                            ui.weak("—");
-                        } else {
-                            let text: Vec<String> = bindings
-                                .iter()
-                                .map(|b| {
-                                    let shift = if b.shift { "Shift + " } else { "" };
-                                    format!("{shift}{:?} ch{} #{:02X}", b.message, b.channel, b.number)
-                                })
-                                .collect();
-                            ui.monospace(text.join(", "));
-                        }
+                    }
+                    None if self.controller.learning_shift() => {
                         ui.horizontal(|ui| {
-                            if ui.small_button("Learn").clicked() {
-                                self.controller.learn(action);
-                            }
-                            if !bindings.is_empty() && ui.small_button("×").on_hover_text("Remove the binding").clicked() {
-                                self.controller.unbind(action);
+                            ui.colored_label(CUE_COLOR, "Press the button to use as Shift…");
+                            if ui.button("Cancel").clicked() {
+                                self.controller.cancel_learn();
                             }
                         });
-                        if let (Some(b), ActionKind::Absolute) = (bindings.first(), action.kind()) {
-                            let mut invert = b.invert;
-                            if ui.checkbox(&mut invert, "invert").changed() {
-                                self.controller.set_inverted(action, invert);
+                    }
+                    None => {
+                        ui.label("To change a control: press Learn next to a function, then press or move it on the controller. Hold a Shift button while doing so to make a Shift combination.");
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("🔍");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.action_filter)
+                            .hint_text("Filter functions, e.g. deck1 or loop")
+                            .desired_width(260.0),
+                    );
+                    ui.label(format!(
+                        "{} controls, {} lights mapped",
+                        self.controller.mapping().bindings.len(),
+                        self.controller.mapping().outputs.len()
+                    ));
+                });
+                let filter = self.action_filter.to_lowercase();
+                ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    egui::Grid::new("bindings").striped(true).num_columns(5).show(ui, |ui| {
+                        for action in
+                            Action::all().into_iter().filter(|a| a.to_string().contains(&filter))
+                        {
+                            ui.label(action.to_string());
+                            let bindings: Vec<_> = self
+                                .controller
+                                .mapping()
+                                .bindings
+                                .iter()
+                                .filter(|b| b.action == action)
+                                .cloned()
+                                .collect();
+                            if bindings.is_empty() {
+                                ui.weak("—");
+                            } else {
+                                let text: Vec<String> = bindings
+                                    .iter()
+                                    .map(|b| {
+                                        let shift = if b.shift { "Shift + " } else { "" };
+                                        format!(
+                                            "{shift}{:?} ch{} #{:02X}",
+                                            b.message, b.channel, b.number
+                                        )
+                                    })
+                                    .collect();
+                                ui.monospace(text.join(", "));
                             }
-                        } else {
-                            ui.label("");
-                        }
-                        if let Some(b) = bindings.first() {
-                            let mut shift = b.shift;
-                            if ui
-                                .checkbox(&mut shift, "Shift")
-                                .on_hover_text("Only while a Shift button is held")
-                                .changed()
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Learn").clicked() {
+                                    self.controller.learn(action);
+                                }
+                                if !bindings.is_empty()
+                                    && ui
+                                        .small_button("×")
+                                        .on_hover_text("Remove the binding")
+                                        .clicked()
+                                {
+                                    self.controller.unbind(action);
+                                }
+                            });
+                            if let (Some(b), ActionKind::Absolute) =
+                                (bindings.first(), action.kind())
                             {
-                                self.controller.set_shifted(action, shift);
+                                let mut invert = b.invert;
+                                if ui.checkbox(&mut invert, "invert").changed() {
+                                    self.controller.set_inverted(action, invert);
+                                }
+                            } else {
+                                ui.label("");
                             }
-                        } else {
-                            ui.label("");
+                            if let Some(b) = bindings.first() {
+                                let mut shift = b.shift;
+                                if ui
+                                    .checkbox(&mut shift, "Shift")
+                                    .on_hover_text("Only while a Shift button is held")
+                                    .changed()
+                                {
+                                    self.controller.set_shifted(action, shift);
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
+                    });
+                });
+                ui.collapsing("MIDI monitor", |ui| {
+                    for line in &self.controller.log {
+                        ui.monospace(line);
                     }
                 });
-            });
-            ui.collapsing("MIDI monitor", |ui| {
-                for line in &self.controller.log {
-                    ui.monospace(line);
-                }
-            });
-        });
+            },
+        );
         self.show_controller = open;
     }
 
@@ -2201,6 +2507,7 @@ impl DeckhandApp {
             if let Err(err) = save_png(&shot.path, &image) {
                 eprintln!("screenshot: {err:#}");
             }
+            self.finish_recording();
             std::process::exit(0);
         }
         ctx.request_repaint();

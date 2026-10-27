@@ -292,6 +292,8 @@ fn target(name: &str, number: u8, comment: &str) -> Option<Target> {
         "Parameter1Left_Keyboard" => Target::Deck(D::KeyboardDown),
         "Parameter1Right_Keyboard" => Target::Deck(D::KeyboardUp),
         "ActiveLoop" => Target::Deck(D::ActiveLoop),
+        // DECK button, and the controller reporting which deck is active.
+        "Deck" | "DeckState" => Target::Deck(D::Select),
         "ChannelFaderStartPlay" => Target::Deck(D::FaderStartPlay),
         "ChannelFaderStartCue" => Target::Deck(D::FaderStartCue),
         _ if pad_mode(name).is_some() => Target::Deck(D::PadMode(pad_mode(name)?)),
@@ -400,6 +402,7 @@ fn feedback(name: &str, number: u8, comment: &str) -> Option<Shows> {
         "FX1ReleaseFXOn" => return Some(Shows::Global(GlobalFeedback::FxRelease)),
         "CFXOn" => return Some(Shows::Global(GlobalFeedback::ColorFxOn)),
         "MasterCue" => return Some(Shows::Global(GlobalFeedback::MasterCue)),
+        "FX1BeatMultiplier" => return Some(Shows::Global(GlobalFeedback::FxBeat)),
         _ => {}
     }
     deck_feedback(name, number, comment).map(Shows::Deck)
@@ -662,6 +665,7 @@ PAD3_HotCue+Shift,PAD3.HotCue+Shift,Pad,9002,8,10,12,14,9002,8,10,12,14,Fast,Del
 CFXParameterCH2,CFXParameterCH2,KnobSliderHiRes,B618,,,,,,,,,,Fast,CH2 CFX
 ChannelLevel,ChannelLevel,Indicator,,,,,,B002,0,1,2,3,RO,Level
 LoadedIndicator,LoadedIndicator,Indicator,,,,,,,9F00,9F01,9F02,9F03,RO,Loaded
+FX1BeatMultiplier,FX1BeatMultiplier,Indicator,,,,,,B464,,,,,,FX1 BeatMultiplier No
 Vinyl,Slip+Shift,Button,9017,0,1,2,3,9017,0,1,2,3,,Vinyl Mode
 PlayPause,PlayPause+Shift,Button,9047,0,1,2,3,9047,0,1,2,3,Fast,Play/Pause
 DrumSwap1,DrumSwap1,Button,9000,0,1,2,3,9000,0,1,2,3,Fast,Drum
@@ -695,6 +699,12 @@ DrumSwap1,DrumSwap1,Button,9000,0,1,2,3,9000,0,1,2,3,Fast,Drum
         let filter = find(&mapping, "deck2.filter");
         assert_eq!((filter.channel, filter.number), (7, 0x18));
         assert_eq!(unsupported, ["DrumSwap1"]);
+        let beat = mapping
+            .outputs
+            .iter()
+            .find(|o| o.feedback == Feedback::Global(GlobalFeedback::FxBeat))
+            .expect("beat indicator");
+        assert_eq!((beat.message, beat.channel, beat.number), (MessageType::Cc, 5, 0x64));
 
         let output = |text: &str| {
             let feedback: Feedback = text.parse().unwrap();

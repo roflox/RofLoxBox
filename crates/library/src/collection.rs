@@ -69,6 +69,32 @@ pub struct Track {
     /// Beat grid: where the tempo starts or changes.
     #[serde(default)]
     pub tempo: Vec<TempoMarker>,
+    /// Text fields changed in deckhand; rescans and imports leave them alone.
+    /// The audio file is never changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edited: Vec<EditedField>,
+}
+
+/// A track field that can be edited in deckhand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditedField {
+    Title,
+    Artist,
+    Album,
+    Genre,
+    Label,
+    Comment,
+}
+
+/// New text for a track's fields; `None` leaves a field as it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackEdit {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub label: Option<String>,
+    pub comment: Option<String>,
 }
 
 /// A beat-grid anchor: from `start` on, beats follow at `bpm`, and the beat
@@ -140,7 +166,7 @@ pub struct Node {
     pub kind: NodeKind,
     /// `None` at the top level.
     pub parent: Option<u32>,
-    /// Playlist entries in order (a track may appear only once).
+    /// Playlist entries in order; a track may appear more than once.
     #[serde(default)]
     pub tracks: Vec<u32>,
 }
@@ -211,6 +237,39 @@ impl Collection {
     pub fn update_track(&mut self, id: u32, change: impl FnOnce(&mut Track)) {
         if let Some(track) = self.tracks.iter_mut().find(|t| t.id == id) {
             change(track);
+            self.dirty = true;
+        }
+    }
+
+    /// Changes a track's text fields in the collection only (not in the
+    /// file) and remembers them as edited.
+    pub fn edit_track(&mut self, id: u32, edit: TrackEdit) {
+        let Some(track) = self.tracks.iter_mut().find(|t| t.id == id) else { return };
+        let fields = [
+            (EditedField::Title, edit.title, &mut track.title),
+            (EditedField::Artist, edit.artist, &mut track.artist),
+            (EditedField::Album, edit.album, &mut track.album),
+            (EditedField::Genre, edit.genre, &mut track.genre),
+            (EditedField::Label, edit.label, &mut track.label),
+            (EditedField::Comment, edit.comment, &mut track.comment),
+        ];
+        for (field, new, value) in fields {
+            if let Some(new) = new.filter(|n| n != value) {
+                *value = new;
+                if !track.edited.contains(&field) {
+                    track.edited.push(field);
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Forgets the edits of a track; the next scan of its file brings the
+    /// file's tags back.
+    pub fn revert_edits(&mut self, id: u32) {
+        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == id) {
+            track.edited.clear();
+            track.modified = 0;
             self.dirty = true;
         }
     }
@@ -411,20 +470,18 @@ impl Collection {
         let Some(node) = self.node_mut(id).filter(|n| n.kind == NodeKind::Playlist) else {
             return 0;
         };
-        let before = node.tracks.len();
-        for &track in tracks {
-            if !node.tracks.contains(&track) {
-                node.tracks.push(track);
-            }
-        }
-        let added = node.tracks.len() - before;
-        self.dirty |= added > 0;
-        added
+        // Duplicates are kept: a track can be in a set twice on purpose.
+        node.tracks.extend_from_slice(tracks);
+        self.dirty |= !tracks.is_empty();
+        tracks.len()
     }
 
-    pub fn remove_from_playlist(&mut self, id: u32, tracks: &[u32]) {
-        if let Some(node) = self.node_mut(id) {
-            node.tracks.retain(|t| !tracks.contains(t));
+    /// Removes one entry of a playlist, by its position.
+    pub fn remove_playlist_entry(&mut self, id: u32, entry: usize) {
+        if let Some(node) = self.node_mut(id)
+            && entry < node.tracks.len()
+        {
+            node.tracks.remove(entry);
             self.dirty = true;
         }
     }
@@ -501,6 +558,23 @@ mod tests {
     }
 
     #[test]
+    fn edits_survive_rescans() {
+        let mut c = Collection::default();
+        c.merge(vec![scanned("/a.mp3", "From tags")]);
+        let id = c.tracks[0].id;
+        c.edit_track(id, TrackEdit { title: Some("My name".into()), ..TrackEdit::default() });
+        c.merge(vec![ScannedFile {
+            artist: "New artist".into(),
+            ..scanned("/a.mp3", "From tags")
+        }]);
+        let track = c.track(id).unwrap();
+        assert_eq!((track.title.as_str(), track.artist.as_str()), ("My name", "New artist"));
+        c.revert_edits(id);
+        c.merge(vec![scanned("/a.mp3", "From tags")]);
+        assert_eq!(c.track(id).unwrap().title, "From tags");
+    }
+
+    #[test]
     fn playlists_nest_and_delete_with_their_contents() {
         let mut c = Collection::default();
         c.merge(vec![scanned("/a.mp3", "A"), scanned("/b.mp3", "B")]);
@@ -508,9 +582,11 @@ mod tests {
         let folder = c.create("Sets", NodeKind::Folder, None);
         let list = c.create("Friday", NodeKind::Playlist, Some(folder));
         let top = c.create("Warmup", NodeKind::Playlist, None);
-        assert_eq!(c.add_to_playlist(list, &[a, b, a]), 2);
+        assert_eq!(c.add_to_playlist(list, &[a, b, a]), 3, "duplicates are kept");
         c.move_in_playlist(list, 1, 0);
-        assert_eq!(c.node(list).unwrap().tracks, [b, a]);
+        assert_eq!(c.node(list).unwrap().tracks, [b, a, a]);
+        c.remove_playlist_entry(list, 2);
+        assert_eq!(c.node(list).unwrap().tracks, [b, a], "one entry goes, not every copy");
         let names: Vec<_> = c.tree().iter().map(|(d, n)| (*d, n.name.as_str())).collect();
         assert_eq!(names, [(0, "Sets"), (1, "Friday"), (0, "Warmup")]);
         // A folder cannot go inside itself.

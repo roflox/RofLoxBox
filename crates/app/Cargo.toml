@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 deckhand-audio = { version = "0.1.0", path = "../audio" }
 deckhand-control = { version = "0.1.0", path = "../control" }
 deckhand-formats = { version = "0.1.0", path = "../formats" }

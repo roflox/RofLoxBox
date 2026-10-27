@@ -12,6 +12,8 @@ use crate::library::format_time;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TrackColumn {
+    /// Position in the playlist (or collection).
+    Number,
     Title,
     Artist,
     Album,
@@ -29,7 +31,8 @@ pub enum TrackColumn {
 }
 
 impl TrackColumn {
-    pub const ALL: [TrackColumn; 14] = [
+    pub const ALL: [TrackColumn; 15] = [
+        Self::Number,
         Self::Title,
         Self::Artist,
         Self::Album,
@@ -47,11 +50,21 @@ impl TrackColumn {
     ];
 
     pub fn default_set() -> Vec<TrackColumn> {
-        vec![Self::Title, Self::Artist, Self::Bpm, Self::Key, Self::Time, Self::Genre, Self::Rating]
+        vec![
+            Self::Number,
+            Self::Title,
+            Self::Artist,
+            Self::Bpm,
+            Self::Key,
+            Self::Time,
+            Self::Genre,
+            Self::Rating,
+        ]
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::Number => "#",
             Self::Title => "Title",
             Self::Artist => "Artist",
             Self::Album => "Album",
@@ -71,6 +84,7 @@ impl TrackColumn {
 
     fn width(self) -> f32 {
         match self {
+            Self::Number => 40.0,
             Self::Title => 240.0,
             Self::Artist | Self::Album | Self::Comment => 170.0,
             Self::Genre | Self::Label => 110.0,
@@ -98,6 +112,11 @@ pub struct Sort {
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub id: u32,
+    /// Position in the playlist shown (a track can be in it more than once).
+    pub entry: Option<usize>,
+    /// Position in the list as stored (the playlist, or the collection), for
+    /// the # column.
+    pub position: usize,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -120,6 +139,7 @@ pub struct Row {
 impl Row {
     fn text(&self, column: TrackColumn) -> String {
         match column {
+            TrackColumn::Number => (self.position + 1).to_string(),
             TrackColumn::Title => self.title.clone(),
             TrackColumn::Artist => self.artist.clone(),
             TrackColumn::Album => self.album.clone(),
@@ -153,6 +173,7 @@ impl Row {
             (None, None) => Ordering::Equal,
         };
         match column {
+            TrackColumn::Number => self.position.cmp(&other.position),
             TrackColumn::Bpm => number(self.bpm, other.bpm),
             TrackColumn::Key => number(self.camelot(), other.camelot()),
             TrackColumn::Time => self.duration.total_cmp(&other.duration),
@@ -190,7 +211,8 @@ pub fn sort_rows(rows: &mut [Row], sort: Option<Sort>) {
 /// What happened in the list this frame.
 #[derive(Default)]
 pub struct TableOutput {
-    pub clicked: Option<u32>,
+    /// (track, position in the list).
+    pub clicked: Option<(u32, usize)>,
     pub double_clicked: Option<u32>,
     /// (track, stars) set by clicking the rating.
     pub rated: Option<(u32, u8)>,
@@ -200,6 +222,10 @@ pub struct TableOutput {
 
 pub struct TableOptions<'a> {
     pub selected: Option<u32>,
+    /// The selected row's position, for duplicates (`None`: first copy).
+    pub selected_position: Option<usize>,
+    /// Scroll so the selected row is visible (after the controller moved it).
+    pub reveal_selected: bool,
     /// Track loaded on each deck, for the `[1]` markers.
     pub loaded: &'a [Option<u32>],
     /// Rows can be dragged (onto playlists); the payload is the track id.
@@ -227,14 +253,20 @@ pub fn track_table(
         .resizable(true);
     for (i, column) in shown.iter().enumerate() {
         table = table.column(if i == 0 {
-            Column::initial(column.width()).at_least(120.0).clip(true)
+            Column::initial(column.width()).at_least(column.width().min(120.0)).clip(true)
         } else if i == shown.len() - 1 {
             Column::remainder().at_least(column.width().min(60.0)).clip(true)
         } else {
             Column::initial(column.width()).at_least(30.0).clip(true)
         });
     }
-    if let Some(row) = options.selected.and_then(|s| rows.iter().position(|r| r.id == s)) {
+    // The selected row; with duplicates, the copy at the selected position.
+    let selected_row = options.selected.and_then(|s| {
+        rows.iter()
+            .position(|r| r.id == s && Some(r.position) == options.selected_position)
+            .or_else(|| rows.iter().position(|r| r.id == s))
+    });
+    if let Some(row) = selected_row.filter(|_| options.reveal_selected) {
         table = table.scroll_to_row(row, None);
     }
     table
@@ -246,7 +278,7 @@ pub fn track_table(
                         .horizontal(|ui| {
                             let label = ui.add(
                                 egui::Label::new(RichText::new(column.label()).strong())
-                                    .sense(Sense::click()),
+                                    .sense(Sense::click_and_drag()),
                             );
                             if let Some(descending) = direction {
                                 sort_arrow(ui, descending);
@@ -254,7 +286,26 @@ pub fn track_table(
                             label
                         })
                         .inner
-                        .on_hover_text("Click to sort; again to reverse; a third time for playlist order. Right-click to choose columns.");
+                        .on_hover_text("Click to sort; again to reverse; a third time for playlist order. Drag to move the column. Right-click to choose columns.");
+                    // Dragging a header onto another moves it there (in front
+                    // of it, or behind it on its right half).
+                    response.dnd_set_drag_payload(column);
+                    let cell = ui.max_rect();
+                    let target = ui.interact(cell, ui.id().with(("column drop", column)), Sense::hover());
+                    let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
+                    let after = pointer.is_some_and(|p| p.x > cell.center().x);
+                    if target.dnd_hover_payload::<TrackColumn>().is_some_and(|d| *d != column) {
+                        let x = if after { cell.right() } else { cell.left() };
+                        ui.painter().vline(x, cell.y_range(), egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill));
+                    }
+                    if let Some(dragged) = target.dnd_release_payload::<TrackColumn>()
+                        && *dragged != column
+                    {
+                        columns.retain(|c| c != &*dragged);
+                        let at = columns.iter().position(|c| *c == column).map_or(columns.len(), |i| i + usize::from(after));
+                        columns.insert(at, *dragged);
+                        output.layout_changed = true;
+                    }
                     if response.clicked() {
                         // Unsorted → first direction → reversed → unsorted.
                         *sort = match *sort {
@@ -289,7 +340,7 @@ pub fn track_table(
         .body(|body| {
             body.rows(20.0, rows.len(), |mut table_row| {
                 let row = &rows[table_row.index()];
-                table_row.set_selected(options.selected == Some(row.id));
+                table_row.set_selected(selected_row == Some(table_row.index()));
                 for &column in &shown {
                     table_row.col(|ui| {
                         if column == TrackColumn::Rating {
@@ -314,7 +365,7 @@ pub fn track_table(
                     response.dnd_set_drag_payload(row.id);
                 }
                 if response.clicked() || response.drag_started() {
-                    output.clicked = Some(row.id);
+                    output.clicked = Some((row.id, row.position));
                 }
                 if response.double_clicked() {
                     output.double_clicked = Some(row.id);
@@ -403,5 +454,15 @@ mod tests {
         assert_eq!(c("Abm"), 2.0); // 1A
         assert_eq!(c("B"), 3.0); // 1B
         assert_eq!(c("Dbm"), 24.0); // 12A
+    }
+
+    #[test]
+    fn number_column_restores_list_order() {
+        let mut rows: Vec<Row> = [(2, "c"), (0, "b"), (1, "a")]
+            .map(|(position, title)| Row { position, title: title.into(), ..Row::default() })
+            .into();
+        sort_rows(&mut rows, Some(Sort { column: TrackColumn::Number, descending: false }));
+        assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), ["b", "a", "c"]);
+        assert_eq!(rows[0].text(TrackColumn::Number), "1");
     }
 }

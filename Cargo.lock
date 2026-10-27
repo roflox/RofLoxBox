@@ -1008,6 +1008,7 @@ name = "deckhand-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "deckhand-audio",
  "deckhand-control",
  "deckhand-formats",

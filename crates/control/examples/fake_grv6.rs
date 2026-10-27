@@ -6,7 +6,7 @@
 //!
 //! The argument is how many seconds to stay connected; a second argument
 //! `cues` runs the cue script (memory cue calls, gated hot cue) instead of
-//! the mixer script. Deck 1's channel fader is pulled down first, so any
+//! the mixer script; `hold` presses deck 1's CUE and holds it. Deck 1's channel fader is pulled down first, so any
 //! playback stays silent.
 
 use std::time::Duration;
@@ -26,7 +26,78 @@ fn main() -> anyhow::Result<()> {
 
     // Give the app time to start, find the port and import the mapping.
     std::thread::sleep(Duration::from_secs(seconds / 2));
-    let cues = std::env::args().nth(2).as_deref() == Some("cues");
+    let mode = std::env::args().nth(2).unwrap_or_default();
+    let cues = mode == "cues";
+    if mode == "jog" {
+        // Deck 1 silent and playing, then its jog side spun (+5 steps every 5 ms).
+        for message in
+            [[0xb0, 0x13, 0x00], [0xb0, 0x33, 0x00], [0x90, 0x0b, 0x7f], [0x90, 0x0b, 0x00]]
+        {
+            device.send(&message)?;
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        for _ in 0..(seconds * 200) {
+            device.send(&[0xb0, 0x21, 0x45])?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        return Ok(());
+    }
+    if mode == "sync" {
+        // Both faders down, deck 1 plays, deck 2 syncs to it and plays.
+        let script: [[u8; 3]; 10] = [
+            [0xb0, 0x13, 0x00],
+            [0xb0, 0x33, 0x00],
+            [0xb1, 0x13, 0x00],
+            [0xb1, 0x33, 0x00],
+            [0x90, 0x0b, 0x7f],
+            [0x90, 0x0b, 0x00],
+            [0x91, 0x58, 0x7f],
+            [0x91, 0x58, 0x00],
+            [0x91, 0x0b, 0x7f],
+            [0x91, 0x0b, 0x00],
+        ];
+        for message in script {
+            println!("SEND {message:02X?}");
+            device.send(&message)?;
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_secs(seconds - seconds / 2));
+        return Ok(());
+    }
+    if mode == "reloop" {
+        // Deck 1: RELOOP/EXIT with no loop set (picks up the memory loop).
+        for message in
+            [[0xb0, 0x13, 0x00], [0xb0, 0x33, 0x00], [0x90, 0x4d, 0x7f], [0x90, 0x4d, 0x00]]
+        {
+            println!("SEND {message:02X?}");
+            device.send(&message)?;
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_secs(seconds - seconds / 2));
+        return Ok(());
+    }
+    if mode == "setcue" {
+        // Deck 1: hot cue pad C (empty in the test track) sets a hot cue.
+        for message in [[0x97, 0x02, 0x7f], [0x97, 0x02, 0x00]] {
+            println!("SEND {message:02X?}");
+            device.send(&message)?;
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_secs(seconds - seconds / 2));
+        return Ok(());
+    }
+    if mode == "hold" {
+        // Silent deck 1, then CUE (at the cue point: preview) held down.
+        for message in [[0xb0, 0x13, 0x00], [0xb0, 0x33, 0x00], [0x90, 0x0c, 0x7f]] {
+            println!("SEND {message:02X?}");
+            device.send(&message)?;
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        std::thread::sleep(Duration::from_secs(seconds - seconds / 2));
+        println!("SEND CUE release");
+        device.send(&[0x90, 0x0c, 0x00])?;
+        return Ok(());
+    }
     let cue_script: &[(&str, [u8; 3])] = &[
         ("deck 1 channel fader MSB down", [0xb0, 0x13, 0x00]),
         ("deck 1 channel fader LSB", [0xb0, 0x33, 0x00]),

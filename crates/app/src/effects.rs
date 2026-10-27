@@ -15,7 +15,11 @@ use deckhand_audio::{
 pub const BANK_SLOTS: usize = 16;
 
 /// Beat values the ◀ / ▶ buttons step through.
-pub const FX_BEATS: [f64; 10] = [1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0, 16.0];
+pub const FX_BEATS: [f64; 11] =
+    [1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+/// What Pioneer controllers' beat indicators expect for each of [`FX_BEATS`]
+/// (the controller lights or flashes the matching LED itself).
+const FX_BEAT_INDICATOR: [u8; 11] = [1, 2, 3, 4, 33, 5, 6, 7, 8, 9, 10];
 const DEFAULT_BEAT: usize = 5;
 
 /// Pad FX slots 1–8 and, with Shift, 9–16: (effect, beats, depth).
@@ -187,6 +191,11 @@ impl Effects {
         beat_label(FX_BEATS[self.beat])
     }
 
+    /// Value for the controller's beat indicator.
+    pub fn beat_indicator(&self) -> u8 {
+        FX_BEAT_INDICATOR[self.beat]
+    }
+
     pub fn change_beat(&mut self, steps: i32) {
         self.beat = (self.beat as i32 + steps).clamp(0, FX_BEATS.len() as i32 - 1) as usize;
     }
@@ -286,7 +295,7 @@ mod tests {
     #[test]
     fn beat_labels() {
         let labels: Vec<String> = FX_BEATS.iter().map(|&b| beat_label(b)).collect();
-        assert_eq!(labels, ["1/16", "1/8", "1/4", "1/2", "3/4", "1", "2", "4", "8", "16"]);
+        assert_eq!(labels, ["1/16", "1/8", "1/4", "1/2", "3/4", "1", "2", "4", "8", "16", "32"]);
     }
 
     #[test]

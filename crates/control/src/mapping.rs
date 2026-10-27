@@ -134,9 +134,28 @@ pub struct Mapping {
     /// Shift buttons (one per deck on most controllers).
     #[serde(default, rename = "shift", skip_serializing_if = "Vec::is_empty")]
     pub shift_controls: Vec<ShiftControl>,
+    /// Jog steps the controller sends for one full turn of a wheel; when
+    /// unset, the known value for the model (see [`Mapping::jog_steps_per_turn`]).
+    #[serde(default, rename = "jog_steps_per_turn", skip_serializing_if = "Option::is_none")]
+    pub jog_resolution: Option<u32>,
 }
 
+/// Jog steps per turn of models whose wheels differ from the common 720.
+const JOG_STEPS_PER_TURN: &[(&str, u32)] = &[("DDJ-GRV6", 6480)];
+/// Jog steps per turn on most Pioneer DDJ controllers.
+const DEFAULT_JOG_STEPS_PER_TURN: u32 = 720;
+
 impl Mapping {
+    /// How many jog steps make one full turn of a wheel.
+    pub fn jog_steps_per_turn(&self) -> u32 {
+        self.jog_resolution.filter(|&n| n > 0).unwrap_or_else(|| {
+            JOG_STEPS_PER_TURN
+                .iter()
+                .find(|(model, _)| self.name.eq_ignore_ascii_case(model))
+                .map_or(DEFAULT_JOG_STEPS_PER_TURN, |&(_, n)| n)
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -162,6 +181,48 @@ impl Mapping {
                     && b.shift == binding.shift)
         });
         self.bindings.push(binding);
+    }
+
+    /// Adds what `other` has and this mapping lacks: bindings for functions
+    /// with no binding here, on controls not already used here (in the same
+    /// Shift layer); lights not mapped yet; Shift buttons. Nothing here is
+    /// changed. Returns (bindings, lights) added.
+    /// Adds the other mapping's lights for things this one lights nothing
+    /// for; returns how many were added.
+    pub fn add_missing_outputs(&mut self, other: &Mapping) -> usize {
+        let mut added = 0;
+        for output in &other.outputs {
+            if !self.outputs.iter().any(|o| o.feedback == output.feedback) {
+                self.outputs.push(output.clone());
+                added += 1;
+            }
+        }
+        added
+    }
+
+    pub fn add_missing(&mut self, other: &Mapping) -> (usize, usize) {
+        let same_control = |a: &Binding, b: &Binding| {
+            a.message == b.message
+                && a.channel == b.channel
+                && (a.number == b.number || a.lsb == Some(b.number) || b.lsb == Some(a.number))
+                && a.shift == b.shift
+        };
+        let mut bindings = 0;
+        for binding in &other.bindings {
+            let has_action = self.bindings.iter().any(|b| b.action == binding.action);
+            let control_used = self.bindings.iter().any(|b| same_control(b, binding));
+            if !has_action && !control_used {
+                self.bindings.push(binding.clone());
+                bindings += 1;
+            }
+        }
+        let outputs = self.add_missing_outputs(other);
+        for control in &other.shift_controls {
+            if !self.shift_controls.contains(control) {
+                self.shift_controls.push(*control);
+            }
+        }
+        (bindings, outputs)
     }
 
     /// The same mapping under another name.
@@ -401,6 +462,7 @@ mod tests {
             outputs: Vec::new(),
             channel_order: None,
             shift_controls: Vec::new(),
+            jog_resolution: None,
         }
     }
 
@@ -484,5 +546,39 @@ mod tests {
         // Letting go of Shift first still releases the shifted action.
         t.translate(off(0x3F));
         assert_eq!(actions(t.translate(off(11))), [(a(D::JumpToStart), Value::Pressed(false))]);
+    }
+
+    #[test]
+    fn add_missing_keeps_existing_bindings() {
+        use crate::action::DeckAction as D;
+        let note = |action, number| Binding {
+            action: Action::Deck(0, action),
+            message: MessageType::Note,
+            channel: 1,
+            number,
+            encoding: Encoding::Button,
+            lsb: None,
+            invert: false,
+            shift: false,
+        };
+        // Mine: PLAY learned on note 20 (the rekordbox file uses 11).
+        let grv6 = Mapping { name: "DDJ-GRV6".into(), ..Mapping::default() };
+        assert_eq!(grv6.jog_steps_per_turn(), 6480);
+        assert_eq!(Mapping::default().jog_steps_per_turn(), 720);
+        let set = Mapping { jog_resolution: Some(1000), ..grv6 };
+        assert_eq!(set.jog_steps_per_turn(), 1000);
+        let mut mine = Mapping { bindings: vec![note(D::PlayPause, 20)], ..Mapping::default() };
+        let theirs = Mapping {
+            bindings: vec![
+                note(D::PlayPause, 11), // already bound here: skipped
+                note(D::Cue, 20),       // control used here: skipped
+                note(D::Sync, 30),      // new: added
+            ],
+            ..Mapping::default()
+        };
+        assert_eq!(mine.add_missing(&theirs), (1, 0));
+        assert_eq!(mine.bindings.len(), 2);
+        assert_eq!(mine.bindings[0], note(D::PlayPause, 20));
+        assert_eq!(mine.bindings[1].action, Action::Deck(0, D::Sync));
     }
 }

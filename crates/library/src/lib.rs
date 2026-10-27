@@ -8,7 +8,10 @@ mod collection;
 mod rekordbox_xml;
 mod scan;
 
-pub use collection::{Collection, Cue, CueKind, ImportSummary, Node, NodeKind, TempoMarker, Track};
+pub use collection::{
+    Collection, Cue, CueKind, EditedField, ImportSummary, Node, NodeKind, TempoMarker, Track,
+    TrackEdit,
+};
 pub use rekordbox_xml::{XmlLibrary, XmlNode, XmlTrack, path_from_location};
 pub use scan::{AUDIO_EXTENSIONS, Scan, ScannedFile, read_file};
 

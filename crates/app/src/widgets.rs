@@ -255,6 +255,8 @@ pub enum RoundIcon {
 }
 
 /// The round CUE / PLAY buttons of a CDJ: a coloured ring that fills when lit.
+/// Senses drags too: egui stops treating a press held longer than 0.8 s as a
+/// click, and a held CUE must keep counting as held.
 pub fn round_button(
     ui: &mut Ui,
     icon: RoundIcon,
@@ -262,7 +264,8 @@ pub fn round_button(
     lit: bool,
     diameter: f32,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(diameter, diameter), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(diameter, diameter), Sense::click_and_drag());
     if ui.is_rect_visible(rect) {
         let enabled = ui.is_enabled();
         let hovered = response.hovered() && enabled;
@@ -354,5 +357,25 @@ pub fn apply_theme(ctx: &eframe::egui::Context) {
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, gray(45));
     v.widgets.noninteractive.corner_radius = corner;
     ctx.set_visuals(v);
-    ctx.style_mut(|style| style.spacing.button_padding = vec2(5.0, 2.0));
+    ctx.style_mut(|style| {
+        style.spacing.button_padding = vec2(5.0, 2.0);
+        // Labels are not text to select; no I-beam cursor over the library.
+        style.interaction.selectable_labels = false;
+    });
+}
+
+/// A small triangle for folders: pointing right when closed, down when
+/// open. Returns the click response.
+pub fn disclosure(ui: &mut Ui, open: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
+    let c = rect.center();
+    let s = 4.0;
+    let points = if open {
+        vec![pos2(c.x - s, c.y - s * 0.6), pos2(c.x + s, c.y - s * 0.6), pos2(c.x, c.y + s * 0.8)]
+    } else {
+        vec![pos2(c.x - s * 0.6, c.y - s), pos2(c.x - s * 0.6, c.y + s), pos2(c.x + s * 0.8, c.y)]
+    };
+    let color = if response.hovered() { Color32::WHITE } else { Color32::from_gray(170) };
+    ui.painter().add(Shape::convex_polygon(points, color, Stroke::NONE));
+    response
 }

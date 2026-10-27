@@ -308,6 +308,22 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                     .monospace()
                     .weak(),
             );
+            // Bar counter, and bars until the next memory cue, like rekordbox.
+            ui.separator();
+            let (bar, beat) = track.bar_and_beat(position);
+            ui.label(RichText::new(format!("{bar}.{beat}")).size(size).monospace())
+                .on_hover_text("Bar and beat");
+            if let Some(beats) = track.beats_to_next_memory(position) {
+                let soon = beats <= 16;
+                let color = if soon { CUE_COLOR } else { ui.visuals().weak_text_color() };
+                ui.label(
+                    RichText::new(format!("{} Bars", crate::deck::bars_label(beats)))
+                        .size(size * 0.8)
+                        .monospace()
+                        .color(color),
+                )
+                .on_hover_text("Bars.beats to the next memory cue");
+            }
         }
         E::Overview => {
             let Some(track) = &deck.track else { return };
@@ -321,10 +337,11 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 memory_cues: &track.memory_cues,
                 memory_loops: &track.memory_loops,
                 cue_point: deck.cue_point,
-                active_loop: None,
+                active_loop: deck.loop_region.map(|r| (r, deck.loop_active)),
                 grid_strength: 0.0,
             };
-            draw_overview(&ui.painter_at(rect), rect, &track.waveform, position, track.duration, &markers);
+            let shown = engine.display_position_secs(index);
+            draw_overview(&ui.painter_at(rect), rect, &track.waveform, shown, track.duration, &markers);
             if let Some(pointer) =
                 response.interact_pointer_pos().filter(|_| response.clicked() || response.dragged())
             {
@@ -428,7 +445,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Gate => {
             if toggle(ui, deck.hot_cue_gate, "GATE")
-                .on_hover_text("Gate: hot cues play only while held, then return and pause")
+                .on_hover_text("Gate: from pause, hot cues play only while held, then return and pause (see Preferences for playing decks)")
                 .clicked()
             {
                 deck.hot_cue_gate = !deck.hot_cue_gate;
@@ -515,7 +532,11 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                             let text = RichText::new(face.label)
                                 .strong()
                                 .size(if compact { 10.0 } else { 12.0 });
-                            let button = egui::Button::new(text).fill(face.fill).min_size(size);
+                            // Held pads must keep counting as held past egui's click time.
+                            let button = egui::Button::new(text)
+                                .fill(face.fill)
+                                .min_size(size)
+                                .sense(Sense::click_and_drag());
                             let response = ui
                                 .add_enabled(deck.track.is_some() || deck.pad_mode == PadMode::Sampler, button)
                                 .on_hover_text(face.hover);
@@ -619,10 +640,10 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Nudge => {
             ui.horizontal(|ui| {
-                if ui.button("−").on_hover_text("Nudge slower (hold)").is_pointer_button_down_on() {
+                if ui.add(egui::Button::new("−").sense(Sense::click_and_drag())).on_hover_text("Nudge slower (hold)").is_pointer_button_down_on() {
                     deck.jog(-3, engine);
                 }
-                if ui.button("+").on_hover_text("Nudge faster (hold)").is_pointer_button_down_on() {
+                if ui.add(egui::Button::new("+").sense(Sense::click_and_drag())).on_hover_text("Nudge faster (hold)").is_pointer_button_down_on() {
                     deck.jog(3, engine);
                 }
             });
