@@ -39,8 +39,13 @@ impl UsbLibrary {
     }
 
     /// Tracks of a playlist (or the whole collection for `None`), filtered
-    /// by a case-insensitive search over title, artist, album and genre.
-    pub fn tracks(&self, playlist: Option<usize>, search: &str) -> Vec<&LibraryTrack> {
+    /// by a case-insensitive search over title, artist, album and genre,
+    /// each with its position in the list before searching.
+    pub fn numbered_tracks(
+        &self,
+        playlist: Option<usize>,
+        search: &str,
+    ) -> Vec<(usize, &LibraryTrack)> {
         let needle = search.trim().to_lowercase();
         let matches = |t: &&LibraryTrack| {
             needle.is_empty()
@@ -50,10 +55,13 @@ impl UsbLibrary {
                     .any(|field| field.to_lowercase().contains(&needle))
         };
         match playlist.and_then(|i| self.playlists.get(i)).and_then(|p| p.track_ids.as_ref()) {
-            Some(ids) => {
-                ids.iter().filter_map(|id| self.library.track(*id)).filter(matches).collect()
-            }
-            None => self.library.tracks.iter().filter(matches).collect(),
+            Some(ids) => ids
+                .iter()
+                .enumerate()
+                .filter_map(|(i, id)| self.library.track(*id).map(|t| (i, t)))
+                .filter(|(_, t)| matches(t))
+                .collect(),
+            None => self.library.tracks.iter().enumerate().filter(|(_, t)| matches(t)).collect(),
         }
     }
 

@@ -39,8 +39,17 @@ pub struct Config {
     pub columns: Vec<crate::browser::TrackColumn>,
     #[serde(default)]
     pub sort: Option<crate::browser::Sort>,
+    /// The # column was added to saved column sets once (later removals stick).
+    #[serde(default)]
+    pub number_column_added: bool,
     #[serde(default)]
     pub prefs: Preferences,
+    /// Collection folders shown closed in the sidebar.
+    #[serde(default)]
+    pub collapsed_folders: Vec<u32>,
+    /// Where recordings go; `None`: Music/RofLoxBox Recordings.
+    #[serde(default)]
+    pub recordings_dir: Option<PathBuf>,
     /// Deck, mixer and FX settings as they were when deckhand last ran.
     #[serde(default)]
     pub session: Session,
@@ -92,6 +101,9 @@ pub struct DeckSession {
     pub vinyl: bool,
     pub key_lock: bool,
     pub slip: bool,
+    /// Hot cues from pause play while held (GATE). Saved under a new name:
+    /// it used to default to off.
+    #[serde(rename = "hot_cue_hold")]
     pub hot_cue_gate: bool,
     pub pad_mode: deckhand_control::PadMode,
     pub jump_size: f64,
@@ -113,7 +125,7 @@ impl Default for DeckSession {
             vinyl: true,
             key_lock: false,
             slip: false,
-            hot_cue_gate: false,
+            hot_cue_gate: true,
             pad_mode: deckhand_control::PadMode::default(),
             jump_size: 4.0,
             jump_range: 1.0,
@@ -152,6 +164,11 @@ pub struct Preferences {
     pub needle_lock: bool,
     /// No calling memory cues on a playing deck.
     pub memory_call_lock: bool,
+    /// CALL ◀ ▶ during loop playback halves / doubles the loop (Pioneer's
+    /// way) instead of moving between memory cues and loops.
+    pub call_resizes_loop: bool,
+    /// GATE hot cues also stop on release while the deck is playing.
+    pub gate_while_playing: bool,
     /// A loaded track starts at its earliest memory or hot cue.
     pub start_at_first_cue: bool,
     /// Loading a track that plays on another deck picks it up there, in time.
@@ -164,11 +181,35 @@ pub struct Preferences {
     pub vinyl_brake: f32,
     /// Jog wheel scratch speed, 1.0 = one turn moves 1.8 s.
     pub scratch_sensitivity: f32,
+    /// Jog pitch bend strength.
+    pub bend_sensitivity: f32,
     pub crossfader_curve: CrossfaderCurveSetting,
     pub fader_curve: FaderCurveSetting,
     /// Isolator: the EQ knobs cut fully; EQ: down to −26 dB.
     pub isolator: bool,
+    /// Waveforms shrink the bands the EQ turns down.
+    pub eq_waveforms: bool,
+    /// EQ mode: low shelf, mid peak and high shelf in Hz.
+    pub eq_low_hz: f32,
+    pub eq_mid_hz: f32,
+    pub eq_high_hz: f32,
+    /// Isolator mode: low/mid and mid/high split points in Hz.
+    pub iso_low_hz: f32,
+    pub iso_high_hz: f32,
     pub limiter: bool,
+}
+
+impl Preferences {
+    pub fn eq_settings(&self) -> deckhand_audio::EqSettings {
+        deckhand_audio::EqSettings {
+            isolator: self.isolator,
+            low_hz: self.eq_low_hz,
+            mid_hz: self.eq_mid_hz,
+            high_hz: self.eq_high_hz,
+            split_low_hz: self.iso_low_hz,
+            split_high_hz: self.iso_high_hz,
+        }
+    }
 }
 
 impl Default for Preferences {
@@ -177,6 +218,8 @@ impl Default for Preferences {
             load_lock: true,
             needle_lock: true,
             memory_call_lock: true,
+            call_resizes_loop: false,
+            gate_while_playing: false,
             start_at_first_cue: true,
             instant_doubles: false,
             auto_cue: [false; 4],
@@ -184,9 +227,16 @@ impl Default for Preferences {
             vinyl_start: 0.0,
             vinyl_brake: 0.0,
             scratch_sensitivity: 1.0,
+            bend_sensitivity: 1.0,
             crossfader_curve: CrossfaderCurveSetting::Standard,
             fader_curve: FaderCurveSetting::Standard,
             isolator: true,
+            eq_waveforms: true,
+            eq_low_hz: 70.0,
+            eq_mid_hz: 1_000.0,
+            eq_high_hz: 13_000.0,
+            iso_low_hz: 250.0,
+            iso_high_hz: 4_000.0,
             limiter: true,
         }
     }
@@ -297,7 +347,10 @@ impl Default for Config {
             use_collection: true,
             columns: crate::browser::TrackColumn::default_set(),
             sort: None,
+            number_column_added: true,
             prefs: Preferences::default(),
+            recordings_dir: None,
+            collapsed_folders: Vec::new(),
             session: Session::default(),
             layout_two: crate::layout::DeckLayout::default(),
             layout_four: crate::layout::DeckLayout::four_decks(),
@@ -336,6 +389,12 @@ impl Config {
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
+        if !config.number_column_added {
+            config.number_column_added = true;
+            if !config.columns.contains(&crate::browser::TrackColumn::Number) {
+                config.columns.insert(0, crate::browser::TrackColumn::Number);
+            }
+        }
         config.layout_two.repair();
         config.layout_four.repair();
         config

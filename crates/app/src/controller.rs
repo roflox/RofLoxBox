@@ -5,8 +5,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use deckhand_control::{
-    Action, ControlEvent, Feedback, Learner, Mapping, MessageType, MidiInput, MidiMessage,
-    MidiOutput, ShiftControl, Translator,
+    Action, ControlEvent, DeckAction, Encoding, Feedback, Learner, Mapping, MessageType, MidiInput,
+    MidiMessage, MidiOutput, ShiftControl, Translator,
 };
 use deckhand_control::{pioneer, rekordbox};
 use eframe::egui;
@@ -23,6 +23,8 @@ pub struct Controller {
     learner: Option<Learner>,
     /// The next button pressed becomes a Shift button.
     learning_shift: bool,
+    /// Where jog wheel movement goes straight from the MIDI thread.
+    jog: Option<std::sync::Arc<std::sync::Mutex<deckhand_audio::JogSender>>>,
     /// Last value sent per (status, number), so only changes are sent.
     sent: HashMap<(u8, u8), u8>,
     pub log: VecDeque<String>,
@@ -59,7 +61,20 @@ impl Controller {
         self.sent.clear();
         self.error = None;
         match Mapping::load(&mapping_path(port)) {
-            Ok(mapping) => self.translator.set_mapping(mapping),
+            Ok(mut mapping) => {
+                // Lights RofLoxBox learned to drive since the mapping was
+                // made; the controls stay as they are.
+                let rekordbox =
+                    rekordbox::find_for_port_with(port, &[crate::config::extra_mapping_dir()])
+                        .and_then(|(_, path)| rekordbox::import_file(&path).ok());
+                if let Some(import) = rekordbox
+                    && mapping.add_missing_outputs(&import.mapping) > 0
+                    && let Err(err) = mapping.save(&mapping_path(port))
+                {
+                    self.error = Some(format!("saving mapping: {err:#}"));
+                }
+                self.translator.set_mapping(mapping);
+            }
             Err(_) => {
                 match rekordbox::find_for_port_with(port, &[crate::config::extra_mapping_dir()]) {
                     Some((_, path)) => self.import_from(&path),
@@ -75,6 +90,7 @@ impl Controller {
         {
             output.send(&request);
         }
+        self.install_jog();
     }
 
     pub fn close(&mut self) {
@@ -103,17 +119,44 @@ impl Controller {
         }
     }
 
+    /// Adds only what the rekordbox mapping has and the current one lacks;
+    /// everything mapped already stays as it is.
+    pub fn import_missing_from(&mut self, path: &Path) {
+        match rekordbox::import_file(path) {
+            Ok(import) => {
+                let mut mapping = self.translator.mapping().clone();
+                let (bindings, lights) = mapping.add_missing(&import.mapping);
+                self.notice = Some(if bindings + lights == 0 {
+                    format!(
+                        "Nothing missing: everything in rekordbox's {} mapping is mapped already.",
+                        import.mapping.name
+                    )
+                } else {
+                    format!(
+                        "Added {bindings} controls and {lights} lights from rekordbox's {} mapping; your existing mapping was kept.",
+                        import.mapping.name
+                    )
+                });
+                self.sent.clear();
+                self.store(mapping);
+            }
+            Err(err) => self.error = Some(format!("importing {}: {err:#}", path.display())),
+        }
+    }
+
     pub fn learning(&self) -> Option<Action> {
         self.learner.as_ref().map(Learner::action)
     }
 
     pub fn learn(&mut self, action: Action) {
         self.learner = Some(Learner::new(action));
+        self.install_jog();
     }
 
     pub fn cancel_learn(&mut self) {
         self.learner = None;
         self.learning_shift = false;
+        self.install_jog();
     }
 
     pub fn learning_shift(&self) -> bool {
@@ -124,6 +167,7 @@ impl Controller {
     pub fn learn_shift(&mut self) {
         self.learner = None;
         self.learning_shift = true;
+        self.install_jog();
     }
 
     pub fn clear_shift_controls(&mut self) {
@@ -174,6 +218,68 @@ impl Controller {
             self.error = Some(format!("saving mapping: {err:#}"));
         }
         self.translator.set_mapping(mapping);
+        self.install_jog();
+    }
+
+    /// Jog movement goes to this engine from now on.
+    pub fn set_jog_sender(&mut self, sender: Option<deckhand_audio::JogSender>) {
+        self.jog = sender.map(|s| std::sync::Arc::new(std::sync::Mutex::new(s)));
+        self.install_jog();
+    }
+
+    /// Routes the jog wheels' pitch-bend controls straight from the MIDI
+    /// thread to the audio engine, so the bend reacts at audio speed
+    /// rather than once per screen refresh. Off while learning.
+    fn install_jog(&mut self) {
+        let Some(input) = self.input.as_ref() else { return };
+        let sender = self.jog.clone().filter(|_| self.learner.is_none() && !self.learning_shift);
+        let Some(sender) = sender else {
+            input.set_fast_path(None);
+            return;
+        };
+        // (channel 0–15, controller, deck, encoding) of every jog bend control.
+        let jogs: Vec<(u8, u8, usize, Encoding)> = self
+            .translator
+            .mapping()
+            .bindings
+            .iter()
+            .filter_map(|b| match b.action {
+                Action::Deck(deck, DeckAction::JogTurn)
+                    if b.message == MessageType::Cc
+                        && !b.shift
+                        && matches!(
+                            b.encoding,
+                            Encoding::RelativeOffset64 | Encoding::RelativeTwos
+                        ) =>
+                {
+                    Some((b.channel.saturating_sub(1), b.number, deck, b.encoding))
+                }
+                _ => None,
+            })
+            .collect();
+        if jogs.is_empty() {
+            input.set_fast_path(None);
+            return;
+        }
+        input.set_fast_path(Some(Box::new(move |message| {
+            let MidiMessage::ControlChange { channel, control, value } = *message else {
+                return false;
+            };
+            let Some(&(_, _, deck, encoding)) =
+                jogs.iter().find(|(c, n, ..)| *c == channel && *n == control)
+            else {
+                return false;
+            };
+            let steps = match encoding {
+                Encoding::RelativeOffset64 => i32::from(value) - 64,
+                _ if value < 64 => i32::from(value),
+                _ => i32::from(value) - 128,
+            };
+            if let Ok(mut sender) = sender.lock() {
+                sender.send(deck, steps);
+            }
+            true
+        })));
     }
 
     /// Reads pending MIDI messages. While learning, a finished binding is

@@ -175,8 +175,13 @@ pub enum DeckAction {
     ReloopExit,
     /// Four-beat loop from the current position.
     AutoLoop,
+    /// Pioneer controllers send these from the CALL buttons during loop
+    /// playback; what they do follows the "CALL during loop" preference.
     LoopHalf,
     LoopDouble,
+    /// Always halve / double the active loop (for a button of its own).
+    LoopResizeHalf,
+    LoopResizeDouble,
     /// Beat-jump pads 0–7: back/forward pairs of 1, 2, 4 and 8 beats,
     /// scaled by the deck's jump range.
     BeatJump(u8),
@@ -237,6 +242,8 @@ pub enum DeckAction {
     /// Beat-loop pads' lengths halved / doubled.
     BeatLoopSizesHalf,
     BeatLoopSizesDouble,
+    /// The controller's DECK button: this deck is the one its side controls.
+    Select,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -324,6 +331,8 @@ impl DeckAction {
             AutoLoop,
             LoopHalf,
             LoopDouble,
+            LoopResizeHalf,
+            LoopResizeDouble,
         ]);
         all.extend((0..8).map(BeatJump));
         all.extend([BeatJumpBack, BeatJumpForward, BeatJumpRangeHalf, BeatJumpRangeDouble]);
@@ -347,6 +356,7 @@ impl DeckAction {
             BeatJumpRangeSixteen,
             BeatLoopSizesHalf,
             BeatLoopSizesDouble,
+            Select,
         ]);
         all
     }
@@ -390,6 +400,8 @@ impl DeckAction {
             AutoLoop => "auto_loop".into(),
             LoopHalf => "loop_half".into(),
             LoopDouble => "loop_double".into(),
+            LoopResizeHalf => "loop_resize_half".into(),
+            LoopResizeDouble => "loop_resize_double".into(),
             BeatJump(n) => format!("beat_jump_{}", n + 1),
             BeatJumpBack => "beat_jump_back".into(),
             BeatJumpForward => "beat_jump_forward".into(),
@@ -419,6 +431,7 @@ impl DeckAction {
             BeatJumpRangeSixteen => "beat_jump_range_sixteen".into(),
             BeatLoopSizesHalf => "beat_loop_sizes_half".into(),
             BeatLoopSizesDouble => "beat_loop_sizes_double".into(),
+            Select => "deck_select".into(),
             PadMode(mode) => format!("pad_mode_{}", mode.name()),
             Keyboard(n) => format!("keyboard_{}", n + 1),
             KeyboardDown => "keyboard_down".into(),
@@ -605,11 +618,14 @@ pub enum GlobalFeedback {
     FxRelease,
     ColorFxOn,
     MasterCue,
+    /// Beat FX beat length, as the value that lights the controller's beat
+    /// indicator for it.
+    FxBeat,
 }
 
 impl GlobalFeedback {
-    const ALL: [GlobalFeedback; 4] =
-        [Self::FxOn, Self::FxRelease, Self::ColorFxOn, Self::MasterCue];
+    const ALL: [GlobalFeedback; 5] =
+        [Self::FxOn, Self::FxRelease, Self::ColorFxOn, Self::MasterCue, Self::FxBeat];
 
     fn name(self) -> &'static str {
         match self {
@@ -617,6 +633,7 @@ impl GlobalFeedback {
             Self::FxRelease => "fx_release",
             Self::ColorFxOn => "color_fx_on",
             Self::MasterCue => "master_cue",
+            Self::FxBeat => "fx_beat",
         }
     }
 }

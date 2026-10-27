@@ -52,8 +52,14 @@ pub fn input_ports() -> Vec<String> {
 
 /// An open MIDI input. Messages arrive on [`MidiInput::messages`]; `wake`
 /// runs after each message so a UI can redraw immediately.
+/// Runs on the MIDI thread for every message before the UI sees it;
+/// returning `true` takes the message (the UI never gets it). Used for jog
+/// wheels, which must not wait for the next screen refresh.
+pub type FastPath = Box<dyn FnMut(&MidiMessage) -> bool + Send>;
+
 pub struct MidiInput {
     port: String,
+    fast: std::sync::Arc<std::sync::Mutex<Option<FastPath>>>,
     messages: Receiver<MidiMessage>,
     _connection: midir::MidiInputConnection<Sender<MidiMessage>>,
 }
@@ -68,20 +74,36 @@ impl MidiInput {
             .find(|port| input.port_name(port).is_ok_and(|name| name == port_name))
             .ok_or_else(|| anyhow!("MIDI port {port_name} not found"))?;
         let (tx, messages) = channel();
+        let fast: std::sync::Arc<std::sync::Mutex<Option<FastPath>>> = Default::default();
+        let hook = fast.clone();
         let connection = input
             .connect(
                 &port,
                 "deckhand-in",
                 move |_, bytes, tx: &mut Sender<MidiMessage>| {
                     if let Some(message) = MidiMessage::parse(bytes) {
-                        let _ = tx.send(message);
-                        wake();
+                        let taken = hook
+                            .lock()
+                            .ok()
+                            .and_then(|mut f| f.as_mut().map(|f| f(&message)))
+                            .unwrap_or(false);
+                        if !taken {
+                            let _ = tx.send(message);
+                            wake();
+                        }
                     }
                 },
                 tx,
             )
             .map_err(|err| anyhow!("connecting to {port_name}: {err}"))?;
-        Ok(Self { port: port_name.to_owned(), messages, _connection: connection })
+        Ok(Self { port: port_name.to_owned(), fast, messages, _connection: connection })
+    }
+
+    /// Installs (or with `None` removes) the [`FastPath`].
+    pub fn set_fast_path(&self, fast: Option<FastPath>) {
+        if let Ok(mut slot) = self.fast.lock() {
+            *slot = fast;
+        }
     }
 
     pub fn port(&self) -> &str {

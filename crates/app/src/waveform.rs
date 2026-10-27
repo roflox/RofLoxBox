@@ -348,13 +348,17 @@ pub fn draw_detail(
     for &range in markers.memory_loops {
         shade(range, Color32::from_rgba_unmultiplied(230, 50, 50, 55));
     }
+    // The deck's loop: bright orange with solid in/out lines while it loops,
+    // a grey outline when it is set but off.
+    let mut loop_edges = None;
     if let Some((range, active)) = markers.active_loop {
         let color = if active {
-            Color32::from_rgba_unmultiplied(255, 170, 0, 40)
+            Color32::from_rgba_unmultiplied(255, 150, 0, 75)
         } else {
-            Color32::from_white_alpha(10)
+            Color32::from_white_alpha(14)
         };
         shade(range, color);
+        loop_edges = Some((range, active));
     }
 
     let use_bands = style == WaveformStyle::ThreeBand && data.has_bands();
@@ -390,6 +394,26 @@ pub fn draw_detail(
     }
 
     draw_beat_grid(painter, axes, markers.beats, along_of, markers.grid_strength);
+    if let Some(((start, end), active)) = loop_edges {
+        let (color, width) = if active {
+            (Color32::from_rgb(255, 160, 0), 2.5_f32)
+        } else {
+            (Color32::from_gray(120), 1.0_f32)
+        };
+        for t in [start, end] {
+            let a = along_of(t);
+            if (0.0..=length).contains(&a) {
+                axes.line(painter, a, 0.0, breadth, Stroke::new(width, color));
+            }
+        }
+        if active {
+            let a = along_of(start).max(2.0);
+            if a < length - 30.0 {
+                let pos = axes.at(a + 3.0, breadth - 2.0);
+                painter.text(pos, Align2::LEFT_BOTTOM, "LOOP", FontId::proportional(11.0), color);
+            }
+        }
+    }
 
     let visible = |a: f32| (-20.0..=length).contains(&a);
     let inward = axes.inward();
@@ -436,6 +460,19 @@ pub fn draw_overview(
             Rect::from_x_y_ranges(x_of(a)..=x_of(b).max(x_of(a) + 1.0), rect.y_range()),
             0.0,
             Color32::from_rgba_unmultiplied(230, 50, 50, 50),
+        );
+    }
+    if let Some(((a, b), active)) = markers.active_loop {
+        let span = Rect::from_x_y_ranges(x_of(a)..=x_of(b).max(x_of(a) + 2.0), rect.y_range());
+        if active {
+            painter.rect_filled(span, 0.0, Color32::from_rgba_unmultiplied(255, 150, 0, 90));
+        }
+        let color = if active { Color32::from_rgb(255, 160, 0) } else { Color32::from_gray(130) };
+        painter.rect_stroke(
+            span,
+            0.0,
+            Stroke::new(1.5_f32, color),
+            eframe::egui::StrokeKind::Inside,
         );
     }
     let n = data.overview.len() as f32;
@@ -535,7 +572,8 @@ mod tests {
         assert!(bass.r() > 200 && bass.g() < 100 && bass.b() < 100, "{bass:?}");
         let hats = band_color([0.05, 0.1, 0.6]);
         assert!(hats.b() > 200 && hats.r() < 100, "{hats:?}");
-        let mut data = WaveformData::from_peaks(&[0.5, 1.0], vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]);
+        let mut data =
+            WaveformData::from_peaks(&[0.5, 1.0], vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]);
         data.color_from_bands();
         assert!(data.colored && data.detail[0].color.r() > data.detail[0].color.b());
     }

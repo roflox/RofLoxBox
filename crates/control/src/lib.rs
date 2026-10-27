@@ -16,4 +16,4 @@ pub use learn::Learner;
 pub use mapping::{
     Binding, ControlEvent, Encoding, Mapping, MessageType, Output, ShiftControl, Translator, Value,
 };
-pub use midi::{MidiInput, MidiMessage, MidiOutput, input_ports, output_ports};
+pub use midi::{FastPath, MidiInput, MidiMessage, MidiOutput, input_ports, output_ports};

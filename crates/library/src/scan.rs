@@ -11,7 +11,7 @@ use anyhow::Result;
 use lofty::prelude::*;
 use lofty::tag::ItemKey;
 
-use crate::collection::{Track, now};
+use crate::collection::{EditedField, Track, now};
 
 /// File extensions treated as audio (lower case).
 pub const AUDIO_EXTENSIONS: [&str; 10] =
@@ -67,20 +67,39 @@ impl ScannedFile {
             modified: 0,
             cues: Vec::new(),
             tempo: Vec::new(),
+            edited: Vec::new(),
         };
         self.apply_to(&mut track);
         track
     }
 
     /// Refreshes the tag fields of a track, leaving what the user set.
+    /// Fields the user edited in deckhand are kept.
     pub(crate) fn apply_to(self, track: &mut Track) {
+        let keep = |field: EditedField| track.edited.contains(&field);
+        let (title, artist, album) =
+            (keep(EditedField::Title), keep(EditedField::Artist), keep(EditedField::Album));
+        let (genre, label, comment) =
+            (keep(EditedField::Genre), keep(EditedField::Label), keep(EditedField::Comment));
         track.path = self.path;
-        track.title = self.title;
-        track.artist = self.artist;
-        track.album = self.album;
-        track.genre = self.genre;
-        track.label = self.label;
-        track.comment = self.comment;
+        if !title {
+            track.title = self.title;
+        }
+        if !artist {
+            track.artist = self.artist;
+        }
+        if !album {
+            track.album = self.album;
+        }
+        if !genre {
+            track.genre = self.genre;
+        }
+        if !label {
+            track.label = self.label;
+        }
+        if !comment {
+            track.comment = self.comment;
+        }
         track.year = self.year;
         track.track_number = self.track_number;
         track.duration = self.duration;

@@ -18,6 +18,11 @@ pub struct CollectionView {
     /// A playlist or folder being renamed, with the text typed so far.
     renaming: Option<(u32, String)>,
     pub error: Option<String>,
+    /// A track whose info is being edited: (id, title, artist, album, genre,
+    /// label, comment).
+    editing: Option<(u32, [String; 6])>,
+    /// A track (and playlist) waiting for "add it again?" to be answered.
+    pending_duplicate: Option<(u32, u32)>,
     /// A rekordbox XML file being read.
     xml: Option<std::sync::mpsc::Receiver<anyhow::Result<deckhand_library::XmlLibrary>>>,
 }
@@ -25,7 +30,9 @@ pub struct CollectionView {
 impl DeckhandApp {
     /// Tracks shown for the collection: the chosen playlist or everything,
     /// filtered by the search text.
-    pub(super) fn collection_track_ids(&self) -> Vec<u32> {
+    /// Tracks shown with their position in the list and whether that list
+    /// is a playlist.
+    fn collection_entries(&self) -> Vec<(u32, usize, bool)> {
         let needle = self.search.trim().to_lowercase();
         let c = &self.collection;
         let matches = |id: &u32| {
@@ -37,23 +44,43 @@ impl DeckhandApp {
                 })
         };
         match self.collection_view.node.and_then(|n| c.node(n)) {
-            Some(node) => node.tracks.iter().copied().filter(matches).collect(),
-            None => c.tracks.iter().map(|t| t.id).filter(matches).collect(),
+            Some(node) => node
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| matches(id))
+                .map(|(i, &id)| (id, i, true))
+                .collect(),
+            None => c
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| matches(&t.id))
+                .map(|(i, t)| (t.id, i, false))
+                .collect(),
         }
     }
 
     /// Playlists the browse knob steps through: `None` (everything) first,
     /// folders skipped.
     pub(super) fn collection_browse_entries(&self) -> Vec<Option<u32>> {
-        std::iter::once(None)
-            .chain(
-                self.collection
-                    .tree()
-                    .into_iter()
-                    .filter(|(_, n)| n.kind == NodeKind::Playlist)
-                    .map(|(_, n)| Some(n.id)),
-            )
-            .collect()
+        // Playlists inside closed folders are not visible, so not visited.
+        let mut entries = vec![None];
+        let mut hidden_below: Option<usize> = None;
+        for (depth, node) in self.collection.tree() {
+            if hidden_below.is_some_and(|d| depth > d) {
+                continue;
+            }
+            hidden_below = None;
+            match node.kind {
+                NodeKind::Folder if self.config.collapsed_folders.contains(&node.id) => {
+                    hidden_below = Some(depth);
+                }
+                NodeKind::Folder => {}
+                NodeKind::Playlist => entries.push(Some(node.id)),
+            }
+        }
+        entries
     }
 
     /// Adds folders or files to the collection, reading them in the background.
@@ -262,11 +289,191 @@ impl DeckhandApp {
                     .into_iter()
                     .map(|(depth, n)| (depth, n.id, n.name.clone(), n.kind.clone(), n.tracks.len()))
                     .collect();
+                // Rows inside a collapsed folder are skipped.
+                let mut hidden_below: Option<usize> = None;
                 for (depth, id, name, kind, count) in rows {
+                    if hidden_below.is_some_and(|d| depth > d) {
+                        continue;
+                    }
+                    hidden_below = None;
+                    if kind == NodeKind::Folder && self.config.collapsed_folders.contains(&id) {
+                        hidden_below = Some(depth);
+                    }
                     self.tree_row(ui, depth, id, &name, kind, count);
                 }
             },
         );
+    }
+
+    /// Writes hot cues, memory cues/loops and a tapped beat grid of loaded
+    /// collection tracks into the collection. Call every frame.
+    pub(super) fn save_track_edits(&mut self) {
+        use deckhand_library::{Cue, CueKind, TempoMarker};
+        for deck in &mut self.decks {
+            if !std::mem::take(&mut deck.edited) {
+                continue;
+            }
+            let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection) else { continue };
+            let Some(stored) = self.collection.track(loaded.id) else { continue };
+            // Names, colours and hot-loop ends the deck does not track are kept.
+            let previous = |kind: CueKind, start: f64| {
+                stored
+                    .cues
+                    .iter()
+                    .find(|c| c.kind == kind && (c.start - start).abs() < 0.001)
+                    .cloned()
+            };
+            let mut cues = Vec::new();
+            for (n, hot) in loaded.hot_cues.iter().enumerate() {
+                let Some(hot) = hot else { continue };
+                let kind = CueKind::Hot(n as u8);
+                let old = previous(kind, hot.seconds);
+                cues.push(Cue {
+                    kind,
+                    start: hot.seconds,
+                    end: old.as_ref().and_then(|c| c.end),
+                    color: Some([hot.color.r(), hot.color.g(), hot.color.b()]),
+                    name: old.map(|c| c.name).unwrap_or_default(),
+                });
+            }
+            let memory = loaded.memory_cues.iter().map(|&s| (s, None));
+            let loops = loaded.memory_loops.iter().map(|&(s, e)| (s, Some(e)));
+            for (start, end) in memory.chain(loops) {
+                let old = previous(CueKind::Memory, start);
+                cues.push(Cue {
+                    kind: CueKind::Memory,
+                    start,
+                    end,
+                    color: old.as_ref().and_then(|c| c.color),
+                    name: old.map(|c| c.name).unwrap_or_default(),
+                });
+            }
+            // A changed BPM means the grid was tapped: one straight grid.
+            let tapped = (stored.bpm != Some(loaded.bpm) && loaded.bpm > 0.0)
+                .then(|| loaded.beats.first().map(|&(start, beat)| (start, beat)))
+                .flatten();
+            let bpm = loaded.bpm;
+            self.collection.update_track(loaded.id, |t| {
+                t.cues = cues;
+                if let Some((start, beat)) = tapped {
+                    t.bpm = Some(bpm);
+                    t.tempo = vec![TempoMarker { start, bpm, beat: beat.clamp(1, 4) as u8 }];
+                }
+            });
+        }
+    }
+
+    /// Adds a track to a playlist, asking first if it is already in it.
+    fn request_add(&mut self, track: u32, playlist: u32) {
+        let already = self.collection.node(playlist).is_some_and(|n| n.tracks.contains(&track));
+        if already {
+            self.collection_view.pending_duplicate = Some((track, playlist));
+        } else {
+            self.collection.add_to_playlist(playlist, &[track]);
+            let name = self.collection.node(playlist).map_or_else(String::new, |n| n.name.clone());
+            self.status = Some(format!("Added to {name}"));
+        }
+    }
+
+    /// The track info editor; call every frame.
+    pub(super) fn edit_dialog(&mut self, ctx: &egui::Context) {
+        const NAMES: [&str; 6] = ["Title", "Artist", "Album", "Genre", "Label", "Comment"];
+        let Some((id, fields)) = self.collection_view.editing.as_mut() else { return };
+        let id = *id;
+        let edited = self.collection.track(id).is_some_and(|t| !t.edited.is_empty());
+        let (mut save, mut close, mut revert) = (false, false, false);
+        egui::Window::new("Edit track info")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Grid::new("track fields").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    for (name, value) in NAMES.iter().zip(fields.iter_mut()) {
+                        ui.label(*name);
+                        ui.add(egui::TextEdit::singleline(value).desired_width(320.0));
+                        ui.end_row();
+                    }
+                });
+                ui.label(
+                    RichText::new("Changes stay in RofLoxBox; the audio file is not changed, and rescans keep your edits.")
+                        .small()
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    save = ui.button("Save").clicked();
+                    close = ui.button("Cancel").clicked();
+                    if edited {
+                        revert = ui
+                            .button("Back to the file's tags")
+                            .on_hover_text("Forget the edits and read the tags from the file again")
+                            .clicked();
+                    }
+                });
+            });
+        if save {
+            let [title, artist, album, genre, label, comment] = fields.clone();
+            self.collection.edit_track(
+                id,
+                deckhand_library::TrackEdit {
+                    title: Some(title.trim().to_owned()).filter(|t| !t.is_empty()),
+                    artist: Some(artist.trim().to_owned()),
+                    album: Some(album.trim().to_owned()),
+                    genre: Some(genre.trim().to_owned()),
+                    label: Some(label.trim().to_owned()),
+                    comment: Some(comment.trim().to_owned()),
+                },
+            );
+            // A loaded copy shows the new name too.
+            if let Some(t) = self.collection.track(id) {
+                let (title, artist) = (t.title.clone(), t.artist.clone());
+                for deck in &mut self.decks {
+                    if let Some(loaded) =
+                        deck.track.as_mut().filter(|l| l.from_collection && l.id == id)
+                    {
+                        (loaded.title, loaded.artist) = (title.clone(), artist.clone());
+                    }
+                }
+            }
+        }
+        if revert {
+            self.collection.revert_edits(id);
+            if let Some(path) = self.collection.track(id).map(|t| t.path.clone()) {
+                self.add_music(vec![path]);
+            }
+        }
+        if save || close || revert {
+            self.collection_view.editing = None;
+        }
+    }
+
+    /// The "already in this playlist" question; call every frame.
+    pub(super) fn duplicate_dialog(&mut self, ctx: &egui::Context) {
+        let Some((track, playlist)) = self.collection_view.pending_duplicate else { return };
+        let title = self.collection.track(track).map_or_else(String::new, |t| t.title.clone());
+        let name = self.collection.node(playlist).map_or_else(String::new, |n| n.name.clone());
+        let mut answer = None;
+        egui::Window::new("Already in the playlist")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("\"{title}\" is already in \"{name}\". Add it again?"));
+                ui.horizontal(|ui| {
+                    if ui.button("Add again").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        if let Some(add) = answer {
+            self.collection_view.pending_duplicate = None;
+            if add {
+                self.collection.add_to_playlist(playlist, &[track]);
+                self.status = Some(format!("Added to {name} again"));
+            }
+        }
     }
 
     /// The folder new playlists go into: the selected one, or the selected
@@ -305,12 +512,41 @@ impl DeckhandApp {
                 }
                 return;
             }
+            if kind == NodeKind::Folder {
+                let open = !self.config.collapsed_folders.contains(&id);
+                if crate::widgets::disclosure(ui, open)
+                    .on_hover_text("Open or close the folder")
+                    .clicked()
+                {
+                    if open {
+                        self.config.collapsed_folders.push(id);
+                    } else {
+                        self.config.collapsed_folders.retain(|f| *f != id);
+                    }
+                    self.config.save();
+                }
+            } else {
+                ui.add_space(14.0 + ui.spacing().item_spacing.x);
+            }
             let label = match kind {
                 NodeKind::Playlist => format!("♫ {name} ({count})"),
-                NodeKind::Folder => format!("▶ {name}"),
+                NodeKind::Folder => name.to_owned(),
             };
             let selected = self.collection_view.node == Some(id);
             let response = ui.add(egui::Button::selectable(selected, label).truncate());
+            if selected && self.reveal_playlist {
+                response.scroll_to_me(Some(egui::Align::Center));
+            }
+            // Clicking a folder opens or closes it (and selects it, for new
+            // playlists).
+            if response.clicked() && kind == NodeKind::Folder {
+                if !self.config.collapsed_folders.contains(&id) {
+                    self.config.collapsed_folders.push(id);
+                } else {
+                    self.config.collapsed_folders.retain(|f| *f != id);
+                }
+                self.config.save();
+            }
             if response.clicked() {
                 self.collection_view.node = Some(id);
                 self.focus = Focus::Playlists;
@@ -319,12 +555,7 @@ impl DeckhandApp {
             if kind == NodeKind::Playlist
                 && let Some(track) = response.dnd_release_payload::<u32>()
             {
-                let added = self.collection.add_to_playlist(id, &[*track]);
-                self.status = Some(if added > 0 {
-                    format!("Added to {name}")
-                } else {
-                    format!("Already in {name}")
-                });
+                self.request_add(*track, id);
             }
             response.context_menu(|ui| {
                 if kind == NodeKind::Folder {
@@ -380,11 +611,15 @@ impl DeckhandApp {
     /// The collection's tracks for the list: playlist, search and sort applied.
     pub(super) fn collection_rows(&self) -> Vec<Row> {
         let mut rows: Vec<Row> = self
-            .collection_track_ids()
+            .collection_entries()
             .into_iter()
-            .filter_map(|id| self.collection.track(id))
-            .map(|t| Row {
+            .filter_map(|(id, position, playlist)| {
+                self.collection.track(id).map(|t| (t, position, playlist))
+            })
+            .map(|(t, position, playlist)| Row {
                 id: t.id,
+                entry: playlist.then_some(position),
+                position,
                 title: t.title.clone(),
                 artist: t.artist.clone(),
                 album: t.album.clone(),
@@ -454,6 +689,8 @@ impl DeckhandApp {
         let free = self.free_deck(&loaded);
         let options = TableOptions {
             selected: self.selected,
+            selected_position: self.selected_position,
+            reveal_selected: std::mem::take(&mut self.reveal_selected),
             loaded: &loaded,
             draggable: true,
             editable_rating: true,
@@ -491,13 +728,17 @@ impl DeckhandApp {
                         if let Some(playlist) = in_playlist
                             && ui.button("Remove from playlist").clicked()
                         {
-                            actions.push(TrackAction::RemoveFrom(id, playlist));
+                            actions.push(TrackAction::RemoveFrom(row.entry, playlist));
                             ui.close();
                         }
                         if let Some(path) = paths.get(&id)
                             && ui.button(reveal_label()).clicked()
                         {
                             reveal(path);
+                            ui.close();
+                        }
+                        if ui.button("Edit track info…").clicked() {
+                            actions.push(TrackAction::Edit(id));
                             ui.close();
                         }
                         if ui.button("Remove from collection").clicked() {
@@ -511,8 +752,8 @@ impl DeckhandApp {
         if output.layout_changed {
             self.config.save();
         }
-        if let Some(id) = output.clicked {
-            self.selected = Some(id);
+        if let Some((id, position)) = output.clicked {
+            (self.selected, self.selected_position) = (Some(id), Some(position));
             self.focus = Focus::Tracks;
         }
         if let (Some(id), Some(deck)) = (output.double_clicked, free) {
@@ -524,13 +765,20 @@ impl DeckhandApp {
         for action in actions {
             match action {
                 TrackAction::Load(id, deck) => load = Some((id, deck)),
-                TrackAction::AddTo(id, playlist) => {
-                    self.collection.add_to_playlist(playlist, &[id]);
-                }
-                TrackAction::RemoveFrom(id, playlist) => {
-                    self.collection.remove_from_playlist(playlist, &[id]);
+                TrackAction::AddTo(id, playlist) => self.request_add(id, playlist),
+                TrackAction::RemoveFrom(entry, playlist) => {
+                    if let Some(entry) = entry {
+                        self.collection.remove_playlist_entry(playlist, entry);
+                    }
                 }
                 TrackAction::Forget(id) => self.collection.remove_tracks(&[id]),
+                TrackAction::Edit(id) => {
+                    if let Some(t) = self.collection.track(id) {
+                        let fields =
+                            [&t.title, &t.artist, &t.album, &t.genre, &t.label, &t.comment];
+                        self.collection_view.editing = Some((id, fields.map(Clone::clone)));
+                    }
+                }
             }
         }
         load
@@ -540,8 +788,10 @@ impl DeckhandApp {
 enum TrackAction {
     Load(u32, usize),
     AddTo(u32, u32),
-    RemoveFrom(u32, u32),
+    /// (playlist position, playlist).
+    RemoveFrom(Option<usize>, u32),
     Forget(u32),
+    Edit(u32),
 }
 
 /// Unix seconds → `YYYY-MM-DD` (UTC).

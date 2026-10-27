@@ -7,6 +7,7 @@
 use std::f32::consts::FRAC_PI_2;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -28,6 +29,8 @@ const JOG_FOLLOW_SECS: f64 = 0.015;
 const JOG_SMOOTH_SECS: f64 = 0.008;
 /// Fastest scratch, times normal speed.
 const MAX_SCRATCH_SPEED: f64 = 8.0;
+/// The screen guesses the position at most this far past the last buffer.
+const MAX_EXTRAPOLATION_SECS: f64 = 0.05;
 
 /// How samples between the source frames are computed when the speed or
 /// sample rate differs from the original.
@@ -144,7 +147,15 @@ pub enum Command {
         slot: usize,
     },
     SetSamplerVolume(f32),
+    /// EQ or isolator, and its frequencies, for every channel.
+    SetEqSettings(crate::eq::EqSettings),
+    /// Jog pitch bend strength (1.0 = a quarter faster per turn per second).
+    SetBendSensitivity(f64),
+    /// Jog steps the controller sends per turn of a wheel.
+    SetJogResolution(f64),
     SetCrossfaderCurve(CrossfaderCurve),
+    /// Starts (Some) or ends (None) taking the master into a recording.
+    Record(Option<crate::record::RecordTap>),
     SetFaderCurve(FaderCurve),
     /// Off: the master is only clipped at full scale.
     SetLimiter(bool),
@@ -206,7 +217,14 @@ pub enum Command {
 #[derive(Debug, Default)]
 struct DeckMeter {
     position_secs: AtomicU64,
+    /// How fast the position moved over the last buffer (track seconds per
+    /// second) and when it was published (nanoseconds since [`Shared::epoch`]),
+    /// so the screen can tell where the record is between buffers.
+    speed: AtomicU64,
+    published_nanos: AtomicU64,
     playing: AtomicBool,
+    /// The jog is bending the tempo right now.
+    bending: AtomicBool,
     peak: AtomicU32,
 }
 
@@ -215,6 +233,7 @@ struct Shared {
     decks: [DeckMeter; DECKS],
     master_peak: AtomicU32,
     sampler_playing: [AtomicBool; SAMPLER_SLOTS],
+    epoch: Instant,
 }
 
 // Arrays this long have no derived `Default`.
@@ -224,6 +243,7 @@ impl Default for Shared {
             decks: Default::default(),
             master_peak: AtomicU32::default(),
             sampler_playing: std::array::from_fn(|_| AtomicBool::default()),
+            epoch: Instant::now(),
         }
     }
 }
@@ -263,7 +283,42 @@ impl OutputInfo {
     }
 }
 
+/// Jog movement sent straight from the MIDI thread: (deck, steps).
+pub type JogEvent = (u8, i16);
+
+/// Sends jog movement to the audio thread without going through the UI.
+pub struct JogSender(rtrb::Producer<JogEvent>);
+
+impl JogSender {
+    /// Never blocks; drops the event if the queue is full.
+    pub fn send(&mut self, deck: usize, steps: i32) {
+        let _ = self
+            .0
+            .push((deck as u8, steps.clamp(-i32::from(i16::MAX), i32::from(i16::MAX)) as i16));
+    }
+}
+
+/// Jog steps in one turn of the wheel until [`Command::SetJogResolution`]
+/// says otherwise: 720 on most Pioneer DDJ controllers.
+const DEFAULT_JOG_STEPS_PER_TURN: f64 = 720.0;
+/// Pitch bend when spinning one turn per second, at sensitivity 1.
+const BEND_PER_TURN_PER_SECOND: f64 = 0.25;
+/// Jog speed is measured over this much recent audio time.
+const JOG_WINDOW_SECS: f64 = 0.04;
+/// Audio moved by one turn of the jog: like a 33⅓ rpm record, 1.8 s.
+const JOG_SECONDS_PER_TURN: f64 = 1.8;
+/// How far a held or gliding record may trail the jog, in seconds at the
+/// fastest scratch speed. Movement beyond that is jumped over, so the track
+/// never keeps running after the wheel has stopped.
+const MAX_JOG_LAG_SECS: f64 = 0.03;
+/// After letting go of a scratched record, the track follows the coasting
+/// platter until it has sent no movement for this long.
+const COAST_SECS: f64 = 0.06;
+/// Recent jog events kept per deck.
+const JOG_EVENTS: usize = 64;
+
 pub struct Engine {
+    jog: Option<JogSender>,
     commands: rtrb::Producer<Command>,
     trash: rtrb::Consumer<Arc<TrackAudio>>,
     shared: Arc<Shared>,
@@ -349,8 +404,10 @@ impl Engine {
 
         let (mut commands, command_rx) = rtrb::RingBuffer::new(QUEUE);
         let (trash_tx, trash) = rtrb::RingBuffer::new(QUEUE);
+        let (jog_tx, jog_rx) = rtrb::RingBuffer::new(QUEUE);
         let shared = Arc::new(Shared::default());
-        let mixer = Mixer::new(info.sample_rate, command_rx, trash_tx, shared.clone());
+        let mut mixer = Mixer::new(info.sample_rate, command_rx, trash_tx, shared.clone());
+        mixer.jog = Some(jog_rx);
         let _ = commands.push(Command::SetQuality(options.quality));
         let stream = match format {
             SampleFormat::F32 => build::<f32>(&device, config, mixer)?,
@@ -359,7 +416,7 @@ impl Engine {
             other => return Err(anyhow!("unsupported sample format {other}")),
         };
         stream.play()?;
-        Ok(Self { commands, trash, shared, info, _stream: stream })
+        Ok(Self { jog: Some(JogSender(jog_tx)), commands, trash, shared, info, _stream: stream })
     }
 
     pub fn info(&self) -> &OutputInfo {
@@ -375,6 +432,23 @@ impl Engine {
         f64::from_bits(self.shared.decks[deck].position_secs.load(Ordering::Relaxed))
     }
 
+    /// Where the record is right now, for drawing: the last published
+    /// position moved on by its speed since then, so waveforms glide
+    /// smoothly however large the audio buffer is.
+    pub fn display_position_secs(&self, deck: usize) -> f64 {
+        let meter = &self.shared.decks[deck];
+        let speed = f64::from_bits(meter.speed.load(Ordering::Relaxed));
+        let published = meter.published_nanos.load(Ordering::Relaxed);
+        let now = self.shared.epoch.elapsed().as_nanos() as u64;
+        let since = now.saturating_sub(published) as f64 * 1e-9;
+        self.position_secs(deck) + speed * since.min(MAX_EXTRAPOLATION_SECS)
+    }
+
+    /// The record is moving (playing, scratched or gliding to a jog position).
+    pub fn is_moving(&self, deck: usize) -> bool {
+        f64::from_bits(self.shared.decks[deck].speed.load(Ordering::Relaxed)) != 0.0
+    }
+
     pub fn is_playing(&self, deck: usize) -> bool {
         self.shared.decks[deck].playing.load(Ordering::Relaxed)
     }
@@ -382,6 +456,41 @@ impl Engine {
     /// Recent peak level of a deck after its fader, 0.0–1.0+.
     pub fn deck_peak(&self, deck: usize) -> f32 {
         load_f32(&self.shared.decks[deck].peak)
+    }
+
+    /// Starts recording the master to a 24-bit WAV at `path`.
+    pub fn start_recording(&mut self, path: &std::path::Path) -> Result<crate::record::Recording> {
+        let (recording, tap) = crate::record::Recording::start(path, self.info.sample_rate)?;
+        if self.commands.push(Command::Record(Some(tap))).is_err() {
+            return Err(anyhow!("the audio engine is busy; try again"));
+        }
+        Ok(recording)
+    }
+
+    /// Stops recording and finishes the file.
+    pub fn stop_recording(
+        &mut self,
+        recording: crate::record::Recording,
+    ) -> Result<std::path::PathBuf> {
+        // Retry briefly if the command queue is momentarily full.
+        for _ in 0..100 {
+            if self.commands.push(Command::Record(None)).is_ok() {
+                return recording.finish();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(anyhow!("could not stop the recording"))
+    }
+
+    /// The sender for jog movement from the MIDI thread (once per engine).
+    pub fn take_jog_sender(&mut self) -> Option<JogSender> {
+        self.jog.take()
+    }
+
+    /// The jog is moving this deck right now: bending its tempo, or the
+    /// released record following the coasting platter.
+    pub fn is_bending(&self, deck: usize) -> bool {
+        self.shared.decks[deck].bending.load(Ordering::Relaxed)
     }
 
     pub fn sampler_playing(&self, slot: usize) -> bool {
@@ -418,6 +527,15 @@ struct DeckState {
     playing: bool,
     tempo: f64,
     nudge: f64,
+    /// Recent jog movement as (sample clock, steps), and the bend it makes.
+    jog_events: [(u64, f32); JOG_EVENTS],
+    jog_next: usize,
+    jog_bend: f64,
+    /// Let go of after scratching, the platter still spinning: playback
+    /// follows the jog until it stops.
+    coasting: bool,
+    /// Sample clock of the last jog movement.
+    last_jog: u64,
     key_lock: bool,
     stretcher: Stretcher,
     /// Where the jog wants the record, in source frames, while it is held
@@ -451,6 +569,12 @@ struct DeckState {
 
 struct Mixer {
     rate: f64,
+    /// Jog movement from the MIDI thread.
+    jog: Option<rtrb::Consumer<JogEvent>>,
+    /// Frames rendered so far: the clock jog speed is measured against.
+    clock: u64,
+    bend_sensitivity: f64,
+    jog_steps_per_turn: f64,
     quality: Quality,
     decks: [DeckState; DECKS],
     crossfader: f32,
@@ -459,6 +583,7 @@ struct Mixer {
     headphone_volume: f32,
     master_peak: f32,
     master_cue: bool,
+    recorder: Option<crate::record::RecordTap>,
     crossfader_curve: CrossfaderCurve,
     fader_curve: FaderCurve,
     limiter: bool,
@@ -555,6 +680,11 @@ impl Mixer {
             playing: false,
             tempo: 1.0,
             nudge: 0.0,
+            jog_events: [(0, 0.0); JOG_EVENTS],
+            jog_next: 0,
+            jog_bend: 0.0,
+            coasting: false,
+            last_jog: 0,
             key_lock: false,
             stretcher: Stretcher::new(rate),
             target: None,
@@ -579,6 +709,10 @@ impl Mixer {
             peak: 0.0,
         };
         Self {
+            jog: None,
+            clock: 0,
+            bend_sensitivity: 1.0,
+            jog_steps_per_turn: DEFAULT_JOG_STEPS_PER_TURN,
             rate: f64::from(rate),
             quality: Quality::default(),
             decks: std::array::from_fn(deck),
@@ -588,6 +722,7 @@ impl Mixer {
             headphone_volume: 0.8,
             master_peak: 0.0,
             master_cue: false,
+            recorder: None,
             crossfader_curve: CrossfaderCurve::default(),
             fader_curve: FaderCurve::default(),
             limiter: true,
@@ -611,7 +746,7 @@ impl Mixer {
                 }
                 (d.position, d.playing, d.nudge, d.target, d.held, d.loop_frames) =
                     (0.0, false, 0.0, None, false, None);
-                (d.velocity, d.braking) = (0.0, false);
+                (d.velocity, d.braking, d.coasting) = (0.0, false, false);
             }
             Command::Unload { deck } => {
                 let d = &mut self.decks[deck];
@@ -625,7 +760,7 @@ impl Mixer {
                 // Stopping with a brake time lets the record slow down.
                 d.braking = !playing && d.playing && d.brake_secs > 0.0 && d.target.is_none();
                 d.playing = playing && d.audio.is_some();
-                if d.playing && !d.held {
+                if d.playing && !d.held && !d.coasting {
                     d.target = None;
                 }
             }
@@ -650,23 +785,29 @@ impl Mixer {
             Command::SetKeyLock { deck, on } => self.decks[deck].key_lock = on,
             Command::Hold { deck, held } => {
                 let d = &mut self.decks[deck];
+                let was_held = d.held;
                 d.held = held && d.audio.is_some();
                 if d.held {
+                    d.coasting = false;
                     d.target.get_or_insert(d.position);
-                } else if d.playing {
-                    // Let go of the record: back to the tempo.
-                    d.target = None;
+                } else if was_held {
+                    // Let go of the record: while the platter still spins on,
+                    // the track keeps following it (apply_jog ends this).
+                    d.coasting = true;
+                    d.last_jog = self.clock;
                 }
             }
             Command::JogMove { deck, seconds } => {
                 let d = &mut self.decks[deck];
                 if let Some(audio) = &d.audio
-                    && (d.held || !d.playing)
+                    && (d.held || d.coasting || !d.playing)
                 {
-                    let target = d.target.unwrap_or(d.position);
+                    let rate = f64::from(audio.sample_rate);
                     let end = audio.frames() as f64;
-                    d.target =
-                        Some((target + seconds * f64::from(audio.sample_rate)).clamp(0.0, end));
+                    let target = (d.target.unwrap_or(d.position) + seconds * rate).clamp(0.0, end);
+                    let lag = MAX_SCRATCH_SPEED * MAX_JOG_LAG_SECS * rate;
+                    d.position = d.position.clamp(target - lag, target + lag);
+                    d.target = Some(target);
                 }
             }
             Command::SetQuality(quality) => self.quality = quality,
@@ -715,7 +856,22 @@ impl Mixer {
                 }
             }
             Command::SetSamplerVolume(level) => self.sampler_volume = level,
+            Command::SetEqSettings(settings) => {
+                for deck in &mut self.decks {
+                    deck.eq.configure(settings);
+                }
+            }
+            Command::SetBendSensitivity(s) => self.bend_sensitivity = s.clamp(0.05, 10.0),
+            Command::SetJogResolution(steps) => {
+                self.jog_steps_per_turn =
+                    if steps >= 1.0 { steps } else { DEFAULT_JOG_STEPS_PER_TURN };
+            }
             Command::SetCrossfaderCurve(curve) => self.crossfader_curve = curve,
+            Command::Record(tap) => {
+                // Dropping the old tap (an Arc) frees nothing large here: the
+                // writer still holds the buffer.
+                self.recorder = tap;
+            }
             Command::SetFaderCurve(curve) => self.fader_curve = curve,
             Command::SetLimiter(on) => self.limiter = on,
             Command::SetVinylSpeed { deck, start, brake } => {
@@ -731,10 +887,59 @@ impl Mixer {
         }
     }
 
+    /// Takes jog movement from the MIDI thread: on a playing deck it bends
+    /// the tempo by how fast the jog spins (measured in audio time, updated
+    /// every buffer); on a paused or held deck it moves the record.
+    fn apply_jog(&mut self, frames: usize) {
+        let now = self.clock;
+        self.clock += frames as u64;
+        while let Some(Ok((deck, steps))) = self.jog.as_mut().map(rtrb::Consumer::pop) {
+            let Some(d) = self.decks.get_mut(usize::from(deck)) else { continue };
+            d.last_jog = now;
+            if d.playing && !d.held && !d.coasting {
+                d.jog_events[d.jog_next] = (now, f32::from(steps));
+                d.jog_next = (d.jog_next + 1) % JOG_EVENTS;
+            } else {
+                let seconds = f64::from(steps) * JOG_SECONDS_PER_TURN / self.jog_steps_per_turn;
+                self.apply(Command::JogMove { deck: usize::from(deck), seconds });
+            }
+        }
+        let window = (JOG_WINDOW_SECS * self.rate) as u64;
+        let block = frames as f64 / self.rate;
+        let coast_end = (COAST_SECS * self.rate) as u64;
+        for d in &mut self.decks {
+            // The released platter stopped: back to normal playback.
+            if d.coasting && now.saturating_sub(d.last_jog) > coast_end {
+                d.coasting = false;
+                if d.playing {
+                    d.target = None;
+                }
+            }
+            let recent =
+                d.jog_events.iter().filter(|(t, s)| *s != 0.0 && now.saturating_sub(*t) <= window);
+            let (count, steps) =
+                recent.fold((0, 0.0f64), |(n, sum), (_, s)| (n + 1, sum + f64::from(*s)));
+            let target = if count > 0 {
+                steps / JOG_WINDOW_SECS / self.jog_steps_per_turn
+                    * BEND_PER_TURN_PER_SECOND
+                    * self.bend_sensitivity
+            } else {
+                0.0
+            };
+            // Quick to follow the hand, quicker still to stop with it.
+            let settle = if count > 0 { 0.012 } else { 0.006 };
+            d.jog_bend += (target.clamp(-0.6, 0.6) - d.jog_bend) * (block / settle).min(1.0);
+            if count == 0 && d.jog_bend.abs() < 0.001 {
+                d.jog_bend = 0.0;
+            }
+        }
+    }
+
     fn render<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T], channels: usize) {
         while let Ok(command) = self.commands.pop() {
             self.apply(command);
         }
+        self.apply_jog(out.len() / channels.max(1));
         let xfade = crossfader_gains(self.crossfader, self.crossfader_curve);
         let master_gain = fader_gain(self.master) * 1.25;
         let headphone_gain = fader_gain(self.headphone_volume) * 1.25;
@@ -754,12 +959,12 @@ impl Mixer {
                 // returns to it afterwards.
                 let slipping = deck.slip
                     && deck.playing
-                    && (deck.held || deck.loop_frames.is_some() || deck.slip_hold);
+                    && (deck.held || deck.coasting || deck.loop_frames.is_some() || deck.slip_hold);
                 if deck.was_slipping && !slipping && deck.slip && deck.playing {
                     deck.position = deck.shadow;
                 }
                 if slipping {
-                    deck.shadow += deck.tempo * (1.0 + deck.nudge) * step;
+                    deck.shadow += deck.tempo * (1.0 + deck.nudge + deck.jog_bend) * step;
                 } else {
                     deck.shadow = deck.position;
                 }
@@ -773,13 +978,13 @@ impl Mixer {
                     deck.velocity += (wanted - deck.velocity) / (JOG_SMOOTH_SECS * self.rate);
                     let settled =
                         (target - deck.position).abs() < 0.5 && deck.velocity.abs() < 1e-3;
-                    if settled && !deck.held {
+                    if settled && !deck.held && !deck.coasting {
                         deck.target = None;
                         deck.velocity = 0.0;
                         continue;
                     }
                 } else if deck.playing {
-                    let speed = deck.tempo * (1.0 + deck.nudge) * step;
+                    let speed = deck.tempo * (1.0 + deck.nudge + deck.jog_bend) * step;
                     if deck.start_secs > 0.0 {
                         // Spins up from standstill like a turntable motor.
                         let rise = step / (deck.start_secs * self.rate);
@@ -875,6 +1080,9 @@ impl Mixer {
                 if limiter { limit(s * master_gain) } else { (s * master_gain).clamp(-1.0, 1.0) }
             });
             self.master_peak = self.master_peak.max(master[0].abs()).max(master[1].abs());
+            if let Some(recorder) = self.recorder.as_mut() {
+                recorder.push(master);
+            }
             for (channel, slot) in frame.iter_mut().enumerate() {
                 let value = match channel {
                     0 | 1 => master[channel],
@@ -890,10 +1098,21 @@ impl Mixer {
             }
         }
 
+        let frames = out.len() / channels.max(1);
+        let buffer_secs = frames as f64 / self.rate;
+        let now = self.shared.epoch.elapsed().as_nanos() as u64;
         for (deck, meter) in self.decks.iter_mut().zip(&self.shared.decks) {
             let rate = deck.audio.as_ref().map_or(1.0, |a| f64::from(a.sample_rate));
-            store_f64(&meter.position_secs, deck.position / rate);
+            let position = deck.position / rate;
+            let previous = f64::from_bits(meter.position_secs.load(Ordering::Relaxed));
+            // Jumps (cues, loops, seeks) are not movement to carry on with.
+            let speed = (position - previous) / buffer_secs.max(1e-6);
+            let speed = if speed.abs() <= MAX_SCRATCH_SPEED * 1.5 { speed } else { 0.0 };
+            store_f64(&meter.speed, speed);
+            meter.published_nanos.store(now, Ordering::Relaxed);
+            store_f64(&meter.position_secs, position);
             meter.playing.store(deck.playing, Ordering::Relaxed);
+            meter.bending.store(deck.jog_bend != 0.0 || deck.coasting, Ordering::Relaxed);
             // Publish and decay the peak so meters fall back smoothly.
             store_f32(&meter.peak, deck.peak);
             deck.peak *= 0.9;
@@ -1138,5 +1357,125 @@ mod tests {
             position(&shared, 0) - before
         );
         assert!(!shared.decks[0].playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn jog_bend_follows_the_wheel_and_stops_with_it() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, shared) = mixer(rate);
+        let (jog_tx, jog_rx) = rtrb::RingBuffer::new(256);
+        mixer.jog = Some(jog_rx);
+        let mut jog = JogSender(jog_tx);
+        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        let mut out = vec![0f32; 256 * 2];
+        mixer.render(&mut out, 2);
+        // About 1,000 steps a second (5 per 256-frame block): 1.39 turns a second.
+        for _ in 0..40 {
+            jog.send(0, 5);
+            mixer.render(&mut out, 2);
+        }
+        let bend = mixer.decks[0].jog_bend;
+        let expected =
+            5.0 / (256.0 / 48_000.0) / DEFAULT_JOG_STEPS_PER_TURN * BEND_PER_TURN_PER_SECOND;
+        assert!((bend - expected).abs() < 0.04, "bend {bend}, expected {expected}");
+        assert!(shared.decks[0].bending.load(Ordering::Relaxed));
+        // Within ~60 ms of the wheel stopping, the bend is gone.
+        for _ in 0..12 {
+            mixer.render(&mut out, 2);
+        }
+        assert_eq!(mixer.decks[0].jog_bend, 0.0);
+    }
+
+    #[test]
+    fn released_record_follows_the_coasting_platter() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, shared) = mixer(rate);
+        let (jog_tx, jog_rx) = rtrb::RingBuffer::new(256);
+        mixer.jog = Some(jog_rx);
+        let mut jog = JogSender(jog_tx);
+        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        tx.push(Command::Hold { deck: 0, held: true }).unwrap();
+        let mut out = vec![0f32; 256 * 2];
+        mixer.render(&mut out, 2);
+        let held_at = position(&shared, 0);
+        // Let go while the platter spins on: its movement still moves the record.
+        tx.push(Command::Hold { deck: 0, held: false }).unwrap();
+        for _ in 0..20 {
+            jog.send(0, -4);
+            mixer.render(&mut out, 2);
+        }
+        assert!(mixer.decks[0].coasting);
+        assert!(position(&shared, 0) < held_at, "follows the platter backwards");
+        assert_eq!(mixer.decks[0].jog_bend, 0.0, "not a pitch bend");
+        // The platter stops: playback carries on forwards.
+        for _ in 0..40 {
+            mixer.render(&mut out, 2);
+        }
+        assert!(!mixer.decks[0].coasting);
+        let before = position(&shared, 0);
+        mixer.render(&mut out, 2);
+        assert!(position(&shared, 0) > before);
+    }
+
+    #[test]
+    fn publishes_how_fast_the_record_moves() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, shared) = mixer(rate);
+        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        let mut out = vec![0f32; 256 * 2];
+        let speed = |shared: &Shared| f64::from_bits(shared.decks[0].speed.load(Ordering::Relaxed));
+        mixer.render(&mut out, 2);
+        assert_eq!(speed(&shared), 0.0, "paused");
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        mixer.render(&mut out, 2);
+        mixer.render(&mut out, 2);
+        assert!((speed(&shared) - 1.0).abs() < 1e-6, "speed {}", speed(&shared));
+        // A jump is not movement to carry on with.
+        tx.push(Command::Seek { deck: 0, seconds: 5.0 }).unwrap();
+        mixer.render(&mut out, 2);
+        assert_eq!(speed(&shared), 0.0);
+    }
+
+    #[test]
+    fn record_stops_with_a_wheel_spun_faster_than_it_can_play() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, shared) = mixer(rate);
+        let (jog_tx, jog_rx) = rtrb::RingBuffer::new(256);
+        mixer.jog = Some(jog_rx);
+        let mut jog = JogSender(jog_tx);
+        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 4_800_000 * 2] });
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        tx.push(Command::SetJogResolution(6480.0)).unwrap();
+        tx.push(Command::Hold { deck: 0, held: true }).unwrap();
+        let mut out = vec![0f32; 256 * 2];
+        // Ten turns a second for a quarter second: 18 s of record a second,
+        // far beyond the fastest scratch.
+        for _ in 0..47 {
+            jog.send(0, 64 * 54 / 25);
+            mixer.render(&mut out, 2);
+        }
+        let wheel = 47.0 * f64::from(64 * 54 / 25) * 1.8 / 6480.0;
+        // Shortly after the wheel stops, so does the record, where the wheel left it.
+        for _ in 0..10 {
+            mixer.render(&mut out, 2);
+        }
+        let stopped = position(&shared, 0);
+        assert!((stopped - wheel).abs() < 0.01, "at {stopped}, wheel at {wheel}");
+        for _ in 0..40 {
+            mixer.render(&mut out, 2);
+        }
+        let settled = position(&shared, 0);
+        assert!((settled - wheel).abs() < 1e-4, "settled at {settled}, wheel at {wheel}");
+        for _ in 0..40 {
+            mixer.render(&mut out, 2);
+        }
+        let after = position(&shared, 0);
+        assert!((after - settled).abs() < 1e-6, "moved on from {settled} to {after}");
     }
 }

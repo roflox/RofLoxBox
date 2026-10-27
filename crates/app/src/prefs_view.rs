@@ -55,7 +55,24 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
         });
         section(ui, "Memory Cue Call Lock", |ui| {
             lock(ui, &mut p.memory_call_lock);
-            ui.label(RichText::new("Locked: memory cues are not called on a playing deck (loops still halve/double).").small().weak());
+            ui.label(RichText::new("Locked: memory cues are not called on a playing deck.").small().weak());
+        });
+        section(ui, "CALL ◀ ▶ during loop playback", |ui| {
+            ui.radio_value(&mut p.call_resizes_loop, false, "Moves between memory cues and loops");
+            ui.radio_value(&mut p.call_resizes_loop, true, "Halves / doubles the loop (Pioneer)");
+            ui.label(
+                RichText::new("Loop ½ / ×2 can also get buttons of their own: map loop_resize_half / loop_resize_double in the Controller window.")
+                    .small()
+                    .weak(),
+            );
+        });
+        section(ui, "Hot Cue Gate", |ui| {
+            ui.checkbox(&mut p.gate_while_playing, "Gate also while playing");
+            ui.label(
+                RichText::new("With GATE on, a hot cue pressed on a paused deck plays while held, then returns and pauses. Off (like rekordbox): on a playing deck it just jumps and keeps playing. On: it stops on release there too.")
+                    .small()
+                    .weak(),
+            );
         });
         section(ui, "Load", |ui| {
             ui.checkbox(&mut p.start_at_first_cue, "Playback starts at Memory/Hot Cue nearest to the beginning of the track");
@@ -86,7 +103,10 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             ui.label(RichText::new("0 s starts and stops instantly; longer feels like a turntable motor.").small().weak());
         });
         section(ui, "Jog", |ui| {
-            ui.add(egui::Slider::new(&mut p.scratch_sensitivity, 0.25..=3.0).text("Scratch sensitivity"));
+            ui.add(egui::Slider::new(&mut p.scratch_sensitivity, 0.25..=3.0).text("Scratch sensitivity"))
+                .on_hover_text("Touching the top with VINYL on");
+            ui.add(egui::Slider::new(&mut p.bend_sensitivity, 0.25..=4.0).text("Pitch bend sensitivity"))
+                .on_hover_text("Spinning the side (or the top with VINYL off): faster spin, bigger bend");
         });
         ui.add_space(8.0);
         if ui.button("Reset to defaults").clicked() {
@@ -94,6 +114,8 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.load_lock = defaults.load_lock;
             p.needle_lock = defaults.needle_lock;
             p.memory_call_lock = defaults.memory_call_lock;
+            p.call_resizes_loop = defaults.call_resizes_loop;
+            p.gate_while_playing = defaults.gate_while_playing;
             p.start_at_first_cue = defaults.start_at_first_cue;
             p.instant_doubles = defaults.instant_doubles;
             p.auto_cue = defaults.auto_cue;
@@ -101,6 +123,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.vinyl_start = defaults.vinyl_start;
             p.vinyl_brake = defaults.vinyl_brake;
             p.scratch_sensitivity = defaults.scratch_sensitivity;
+            p.bend_sensitivity = defaults.bend_sensitivity;
         }
     });
     *p != before
@@ -119,9 +142,34 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             ui.radio_value(&mut p.fader_curve, curve, curve.label());
         }
     });
-    section(ui, "EQ", |ui| {
-        ui.radio_value(&mut p.isolator, true, "Isolator (knob fully left cuts the band)");
-        ui.radio_value(&mut p.isolator, false, "EQ (down to −26 dB)");
+    section(ui, "EQ Type", |ui| {
+        ui.radio_value(
+            &mut p.isolator,
+            true,
+            "Isolator: splits into 3 bands, fully left removes a band (+6 dB … −∞)",
+        );
+        ui.radio_value(&mut p.isolator, false, "EQ: shelf / peak filters (+6 dB … −26 dB)");
+        let hz =
+            |ui: &mut Ui, value: &mut f32, label: &str, range: std::ops::RangeInclusive<f32>| {
+                ui.add(egui::Slider::new(value, range).logarithmic(true).suffix(" Hz").text(label));
+            };
+        if p.isolator {
+            hz(ui, &mut p.iso_low_hz, "LOW / MID split", 80.0..=800.0);
+            hz(ui, &mut p.iso_high_hz, "MID / HI split", 1_500.0..=10_000.0);
+        } else {
+            hz(ui, &mut p.eq_low_hz, "LOW", 30.0..=300.0);
+            hz(ui, &mut p.eq_mid_hz, "MID", 300.0..=4_000.0);
+            hz(ui, &mut p.eq_high_hz, "HI", 3_000.0..=16_000.0);
+        }
+        ui.label(
+            RichText::new("Defaults: EQ 70 Hz / 1 kHz / 13 kHz like Pioneer's DJM-900NXS2; isolator split 250 Hz / 4 kHz.")
+                .small()
+                .weak(),
+        );
+    });
+    section(ui, "Waveform", |ui| {
+        ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
+            .on_hover_text("Bands turned down with the EQ knobs shrink in the waveforms");
     });
     section(ui, "Master Limiter", |ui| {
         ui.checkbox(&mut p.limiter, "Soften peaks before they clip");
@@ -132,7 +180,13 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
         p.crossfader_curve = defaults.crossfader_curve;
         p.fader_curve = defaults.fader_curve;
         p.isolator = defaults.isolator;
+        p.eq_low_hz = defaults.eq_low_hz;
+        p.eq_mid_hz = defaults.eq_mid_hz;
+        p.eq_high_hz = defaults.eq_high_hz;
+        p.iso_low_hz = defaults.iso_low_hz;
+        p.iso_high_hz = defaults.iso_high_hz;
         p.limiter = defaults.limiter;
+        p.eq_waveforms = defaults.eq_waveforms;
     }
     *p != before
 }

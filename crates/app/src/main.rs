@@ -19,11 +19,19 @@ mod waveform;
 mod widgets;
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 920.0])
-            .with_title(APP_NAME),
-        ..Default::default()
-    };
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1440.0, 920.0])
+        .with_title(APP_NAME);
+    // Test aid: open the window at "x,y" (for example on another monitor).
+    if let Some((x, y)) = std::env::var("DECKHAND_WINDOW_POS")
+        .ok()
+        .and_then(|p| {
+            p.split_once(',').map(|(x, y)| (x.trim().parse::<f32>(), y.trim().parse::<f32>()))
+        })
+        .and_then(|(x, y)| Some((x.ok()?, y.ok()?)))
+    {
+        viewport = viewport.with_position([x, y]);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(app::DeckhandApp::new(cc)))))
 }
