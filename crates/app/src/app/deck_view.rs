@@ -26,7 +26,7 @@ struct DeckOut {
     play: bool,
     eject: bool,
     toggle_sync: bool,
-    toggle_master: bool,
+    make_master_pressed: bool,
     key_sync: bool,
     pad_events: Vec<(DeckAction, bool)>,
     status: Option<String>,
@@ -162,8 +162,8 @@ impl DeckhandApp {
         if out.toggle_sync {
             self.toggle_sync(index);
         }
-        if out.toggle_master {
-            self.master = if self.master == Some(index) { None } else { Some(index) };
+        if out.make_master_pressed {
+            self.make_master(index);
         }
         if out.key_sync {
             self.key_sync(index);
@@ -410,7 +410,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             }
         }
         E::Sync => p.out.toggle_sync = toggle(ui, deck.sync, "BEAT SYNC").clicked(),
-        E::Master => p.out.toggle_master = toggle_in(ui, p.is_master, "MASTER", CUE_COLOR).clicked(),
+        E::Master => p.out.make_master_pressed = toggle_in(ui, p.is_master, "MASTER", CUE_COLOR).clicked(),
         E::Quantize => {
             if toggle_in(ui, deck.quantize, "Q", RED)
                 .on_hover_text("Quantize: snap cues and loops to the beat")
