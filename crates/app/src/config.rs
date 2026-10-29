@@ -193,6 +193,9 @@ pub struct Preferences {
     /// MASTER passes to another playing deck when the master leaves the mix
     /// (paused, ejected, or faded out with its channel fader or crossfader).
     pub auto_master: bool,
+    /// The tempo ranges TEMPO RANGE steps through and the decks offer, in
+    /// order (at least one).
+    pub tempo_ranges: Vec<crate::deck::TempoRange>,
     /// Auto Cue per deck: the cue goes to the first sound louder than the level.
     pub auto_cue: [bool; 4],
     pub auto_cue_level_db: f32,
@@ -245,6 +248,7 @@ impl Default for Preferences {
             gate_while_playing: false,
             start_at_first_cue: true,
             auto_master: true,
+            tempo_ranges: crate::deck::TempoRange::DEFAULTS.to_vec(),
             instant_doubles: false,
             auto_cue: [false; 4],
             auto_cue_level_db: -60.0,

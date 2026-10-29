@@ -45,6 +45,7 @@ struct Parts<'a> {
     needle_lock: bool,
     /// Eject/Load Lock: a playing deck keeps its track.
     load_lock: bool,
+    tempo_ranges: Vec<TempoRange>,
     out: DeckOut,
 }
 
@@ -85,6 +86,7 @@ impl DeckhandApp {
             is_master: self.master == Some(index),
             needle_lock: self.config.prefs.needle_lock,
             load_lock: self.config.prefs.load_lock,
+            tempo_ranges: self.config.prefs.tempo_ranges.clone(),
             out: DeckOut::default(),
         };
         let area = ui.horizontal_top(|ui| {
@@ -613,7 +615,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                     .selected_text(range.label())
                     .width(64.0)
                     .show_ui(ui, |ui| {
-                        for option in TempoRange::ALL {
+                        for &option in &p.tempo_ranges {
                             ui.selectable_value(&mut range, option, option.label());
                         }
                     });
