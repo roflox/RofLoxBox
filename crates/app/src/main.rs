@@ -6,6 +6,7 @@
 /// The name shown to users (the code and settings folder keep "deckhand").
 pub const APP_NAME: &str = "RofLoxBox";
 
+mod analyze;
 mod app;
 mod browser;
 mod config;

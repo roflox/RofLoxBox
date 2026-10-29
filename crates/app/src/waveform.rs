@@ -313,6 +313,21 @@ fn draw_beat_grid(
     }
 }
 
+/// The track time under `pointer` in a detail waveform drawn by
+/// [`draw_detail`] at `position` (the playhead, in the middle).
+pub fn detail_time(
+    rect: Rect,
+    vertical: bool,
+    pointer: Pos2,
+    position: f64,
+    seconds_visible: f64,
+) -> f64 {
+    let axes = Axes { rect, vertical };
+    let along = if vertical { rect.bottom() - pointer.y } else { pointer.x - rect.left() };
+    let from_centre = f64::from(along - axes.length() / 2.0);
+    position + from_centre / f64::from(axes.length()) * seconds_visible
+}
+
 /// The scrolling waveform around `position` (seconds), `seconds_visible`
 /// long, horizontal or `vertical`, with EQ `gains` (low, mid, high; 1.0 =
 /// flat, 0.0 = killed).
@@ -544,6 +559,18 @@ pub fn overview_time(rect: Rect, pointer: Pos2, duration: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clicks_map_to_track_time() {
+        // 800 points showing 8 s around 60 s: 100 points a second.
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 100.0));
+        assert!((detail_time(rect, false, pos2(400.0, 50.0), 60.0, 8.0) - 60.0).abs() < 1e-9);
+        assert!((detail_time(rect, false, pos2(500.0, 50.0), 60.0, 8.0) - 61.0).abs() < 1e-9);
+        assert!((detail_time(rect, false, pos2(0.0, 50.0), 60.0, 8.0) - 56.0).abs() < 1e-9);
+        // Vertical: upcoming music is above the middle.
+        let tall = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 800.0));
+        assert!((detail_time(tall, true, pos2(50.0, 300.0), 60.0, 8.0) - 61.0).abs() < 1e-9);
+    }
 
     #[test]
     fn eq_scales_rgb_channels() {

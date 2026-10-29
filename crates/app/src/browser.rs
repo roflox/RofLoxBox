@@ -208,11 +208,26 @@ pub fn sort_rows(rows: &mut [Row], sort: Option<Sort>) {
     });
 }
 
+/// Tracks being dragged out of a list: onto a playlist or a deck.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrackDrag {
+    /// Collection tracks, by id.
+    Collection(Vec<u32>),
+    /// Audio files (from the explorer).
+    Files(Vec<std::path::PathBuf>),
+    /// Tracks of an opened export (its root), by id.
+    Usb(std::path::PathBuf, Vec<u32>),
+}
+
 /// What happened in the list this frame.
 #[derive(Default)]
 pub struct TableOutput {
     /// (track, position in the list).
     pub clicked: Option<(u32, usize)>,
+    /// The keys held for that click (Shift, Cmd/Ctrl).
+    pub modifiers: egui::Modifiers,
+    /// A row started being dragged.
+    pub drag_started: Option<(u32, usize)>,
     pub double_clicked: Option<u32>,
     /// (track, stars) set by clicking the rating.
     pub rated: Option<(u32, u8)>,
@@ -228,8 +243,12 @@ pub struct TableOptions<'a> {
     pub reveal_selected: bool,
     /// Track loaded on each deck, for the `[1]` markers.
     pub loaded: &'a [Option<u32>],
-    /// Rows can be dragged (onto playlists); the payload is the track id.
+    /// Rows can be dragged; the list sets what they carry when
+    /// [`TableOutput::drag_started`] says so.
     pub draggable: bool,
+    /// Tracks selected together with `selected` (Cmd/Shift-click, select
+    /// all); when not empty, these are the highlighted ones.
+    pub marked: &'a std::collections::HashSet<u32>,
     pub editable_rating: bool,
 }
 
@@ -340,7 +359,12 @@ pub fn track_table(
         .body(|body| {
             body.rows(20.0, rows.len(), |mut table_row| {
                 let row = &rows[table_row.index()];
-                table_row.set_selected(selected_row == Some(table_row.index()));
+                let highlighted = if options.marked.is_empty() {
+                    selected_row == Some(table_row.index())
+                } else {
+                    options.marked.contains(&row.id)
+                };
+                table_row.set_selected(highlighted);
                 for &column in &shown {
                     table_row.col(|ui| {
                         if column == TrackColumn::Rating {
@@ -361,11 +385,12 @@ pub fn track_table(
                     });
                 }
                 let response = table_row.response();
-                if options.draggable {
-                    response.dnd_set_drag_payload(row.id);
+                if options.draggable && response.drag_started() {
+                    output.drag_started = Some((row.id, row.position));
                 }
-                if response.clicked() || response.drag_started() {
+                if response.clicked() {
                     output.clicked = Some((row.id, row.position));
+                    output.modifiers = response.ctx.input(|i| i.modifiers);
                 }
                 if response.double_clicked() {
                     output.double_clicked = Some(row.id);

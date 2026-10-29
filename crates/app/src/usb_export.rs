@@ -26,7 +26,7 @@ use deckhand_formats::pdb::{
 };
 use deckhand_library::{CueKind, Track as CollectionTrack};
 
-use crate::deck::{KeyNotation, format_key, parse_key};
+use crate::deck::{AnalysisMethod, KeyNotation, format_key, parse_key};
 
 /// A playlist to put on a stick.
 pub struct ExportRequest {
@@ -37,6 +37,8 @@ pub struct ExportRequest {
     pub tracks: Vec<CollectionTrack>,
     /// For key names the stick does not have yet.
     pub key_notation: KeyNotation,
+    /// How tracks without rekordbox's analysis are analysed.
+    pub analysis: AnalysisMethod,
 }
 
 /// An export running in the background.
@@ -222,7 +224,7 @@ fn put_track(
     let destination = below(&request.root, &file_path);
     copy_file(&track.path, &destination)?;
     let analyze_path = unused_analysis_path(&file_path, &rows.tracks);
-    write_analysis(&request.root, &analyze_path, &file_path, track)?;
+    write_analysis(&request.root, &analyze_path, &file_path, track, request.analysis)?;
 
     let id = rows.tracks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
     let artist_id = name_row(&mut rows.artists, &track.artist, |id, name| Artist { id, name });
@@ -385,6 +387,7 @@ fn write_analysis(
     analyze_path: &str,
     file_path: &str,
     track: &CollectionTrack,
+    method: AnalysisMethod,
 ) -> Result<()> {
     let dat_path = below(root, analyze_path);
     if let Some(parent) = dat_path.parent() {
@@ -401,7 +404,7 @@ fn write_analysis(
         None => {
             let audio = deckhand_audio::decode_file(&track.path)
                 .with_context(|| format!("reading {}", track.path.display()))?;
-            let (dat, ext) = own_analysis(&audio, file_path, track);
+            let (dat, ext) = own_analysis(&audio, file_path, track, method);
             (dat, Some(ext), None)
         }
     };
@@ -572,6 +575,7 @@ fn own_analysis(
     audio: &deckhand_audio::TrackAudio,
     file_path: &str,
     track: &CollectionTrack,
+    method: AnalysisMethod,
 ) -> (AnlzFile, AnlzFile) {
     let peaks = deckhand_audio::peak_waveform(audio);
     let bands = deckhand_audio::band_waveform(audio);
@@ -597,21 +601,45 @@ fn own_analysis(
             })
             .collect()
     };
-    let preview: Vec<u8> = squeeze(400).into_iter().map(|(h, w)| mono(h, w)).collect();
-    let tiny: Vec<u8> =
-        squeeze(100).into_iter().map(|(h, _)| (h.clamp(0.0, 1.0) * 15.0).round() as u8).collect();
-    let detail: Vec<u8> = (0..peaks.len()).map(|i| mono(level(i), highs(i))).collect();
+    // The 400-column preview and 100 dots: rekordbox's, or squeezed from
+    // the peaks.
+    let (preview, tiny): (Vec<u8>, Vec<u8>) = match method {
+        AnalysisMethod::Rekordbox => {
+            deckhand_analysis::preview::preview(&audio.samples, audio.sample_rate)
+        }
+        AnalysisMethod::Deckhand => (
+            squeeze(400).into_iter().map(|(h, w)| mono(h, w)).collect(),
+            squeeze(100)
+                .into_iter()
+                .map(|(h, _)| (h.clamp(0.0, 1.0) * 15.0).round() as u8)
+                .collect(),
+        ),
+    };
     // Two bytes: 3 bits each of red (lows), green (mids) and blue (highs),
-    // then 5 bits of height.
-    let color: Vec<u8> = (0..peaks.len())
-        .flat_map(|i| {
-            let [low, mid, high] = bands.get(i).copied().unwrap_or([0.0; 3]);
-            let channel = |v: f32| u16::from((v.clamp(0.0, 1.0) * 7.0).round() as u8);
-            let height = u16::from((level(i).clamp(0.0, 1.0) * 31.0).round() as u8);
-            let v = channel(low) << 13 | channel(mid) << 10 | channel(high) << 7 | height << 2;
-            v.to_be_bytes()
-        })
-        .collect();
+    // then 5 bits of height — matching rekordbox's own files, or simply
+    // from the bands.
+    let color: Vec<u16> = match method {
+        AnalysisMethod::Rekordbox => {
+            deckhand_analysis::waveform::color_detail(&audio.samples, audio.sample_rate)
+        }
+        AnalysisMethod::Deckhand => (0..peaks.len())
+            .map(|i| {
+                let [low, mid, high] = bands.get(i).copied().unwrap_or([0.0; 3]);
+                let channel = |v: f32| u16::from((v.clamp(0.0, 1.0) * 7.0).round() as u8);
+                let height = u16::from((level(i).clamp(0.0, 1.0) * 31.0).round() as u8);
+                channel(low) << 13 | channel(mid) << 10 | channel(high) << 7 | height << 2
+            })
+            .collect(),
+    };
+    // The mono detail: rekordbox's, or simply from the peaks with as many
+    // columns as the colour one.
+    let detail: Vec<u8> = match method {
+        AnalysisMethod::Rekordbox => {
+            deckhand_analysis::waveform::mono_detail(&audio.samples, audio.sample_rate)
+        }
+        AnalysisMethod::Deckhand => (0..color.len()).map(|i| mono(level(i), highs(i))).collect(),
+    };
+    let color: Vec<u8> = color.iter().flat_map(|v| v.to_be_bytes()).collect();
     let waveform = |kind, entry_len, data| Section::Waveform(Waveform { kind, entry_len, data });
     let (hot, memory) = collection_cues(track, &[]);
     let empty = |kind| {
@@ -629,7 +657,7 @@ fn own_analysis(
         empty(CueListKind::Hot),
         empty(CueListKind::Memory),
     ]);
-    let ext = vec![
+    let mut ext = vec![
         Section::Path(file_path.to_owned()),
         waveform(WaveformKind::Detail, 1, detail),
         empty(CueListKind::Hot),
@@ -638,6 +666,13 @@ fn own_analysis(
         Section::Cues(memory),
         waveform(WaveformKind::ColorDetail, 2, color),
     ];
+    // The colour overview, which only the rekordbox-compatible analysis has.
+    if method == AnalysisMethod::Rekordbox {
+        let overview =
+            deckhand_analysis::waveform::color_overview(&audio.samples, audio.sample_rate);
+        let data = overview.iter().flatten().map(|&b| b as u8).collect();
+        ext.push(waveform(WaveformKind::ColorPreview, 6, data));
+    }
     (AnlzFile { sections: dat }, AnlzFile { sections: ext })
 }
 
@@ -702,6 +737,7 @@ mod export_tests {
             playlist: "Exported".into(),
             tracks: vec![tracks[0].clone(), tracks[1].clone(), tracks[0].clone()],
             key_notation: KeyNotation::Alphanumeric,
+            analysis: AnalysisMethod::Rekordbox,
         };
         let result = run(&request, &AtomicUsize::new(0), &AtomicBool::new(false)).unwrap();
         assert_eq!((result.added, result.missing, result.replaced), (2, 0, false));
@@ -718,6 +754,7 @@ mod export_tests {
                 .unwrap();
             assert_eq!(dat.path(), Some(t.track.file_path.as_str()));
             assert!(dat.waveform(WaveformKind::Preview).is_some());
+            assert!(dat.waveform(WaveformKind::TinyPreview).is_some());
             assert!(ext.waveform(WaveformKind::Detail).is_some());
             assert!(ext.waveform(WaveformKind::ColorDetail).is_some());
             let hot: Vec<_> = ext
