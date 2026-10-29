@@ -2,9 +2,11 @@
 
 mod collection_view;
 mod deck_view;
+mod explorer_view;
 mod hotplug;
 mod library_tree;
 mod recording;
+mod selection;
 mod session;
 mod status_bar;
 
@@ -41,8 +43,12 @@ enum Source {
     Collection,
     /// An opened rekordbox export, by its root.
     Usb(PathBuf),
+    /// A folder of the computer (the explorer).
+    Explorer,
 }
-use crate::waveform::{HotCueMark, Markers, WaveformStyle, draw_detail, overview_time};
+use crate::waveform::{
+    HotCueMark, Markers, WaveformStyle, detail_time, draw_detail, overview_time,
+};
 use crate::widgets::{crossfader, fader, knob, meter};
 
 const DECK_COLORS: [Color32; DECKS] = [
@@ -105,8 +111,11 @@ pub struct DeckhandApp {
     source: Source,
     collection: Collection,
     collection_view: CollectionView,
+    explorer: explorer_view::ExplorerView,
     search: String,
     selected: Option<u32>,
+    /// More tracks selected along with `selected` (see `selection`).
+    marked: std::collections::HashSet<u32>,
     focus: Focus,
     controller: Controller,
     show_controller: bool,
@@ -213,8 +222,10 @@ impl DeckhandApp {
             source: Source::Collection,
             collection: Collection::default(),
             collection_view: CollectionView::default(),
+            explorer: Default::default(),
             search: String::new(),
             selected: None,
+            marked: Default::default(),
             focus: Focus::Tracks,
             controller: Controller::default(),
             show_controller: std::env::var_os("DECKHAND_SHOW_CONTROLLER").is_some(),
@@ -270,6 +281,14 @@ impl DeckhandApp {
             app.config.recordings_dir = Some(dir.clone());
         }
         app.effects.load_samples(&crate::config::samples_dir());
+        // Test aid: analyze tracks without a grid or key from the start.
+        if std::env::var_os("DECKHAND_ANALYZE").is_some() {
+            app.analyze_missing();
+        }
+        // Test aid: the beat-grid edit controls open.
+        if std::env::var_os("DECKHAND_GRID_EDIT").is_some() {
+            app.decks.iter_mut().for_each(|d| d.grid_edit = true);
+        }
         if let Some(mode) = pad_mode {
             for deck in &mut app.decks {
                 deck.set_pad_mode(mode);
@@ -326,6 +345,11 @@ impl DeckhandApp {
         }
         if record_to.is_some() {
             app.toggle_recording();
+        }
+        // Test aid: this folder shown in the explorer.
+        if let Some(folder) = std::env::var_os("DECKHAND_EXPLORER") {
+            app.explorer.open = true;
+            app.open_explorer_folder(folder.into());
         }
         if app.screenshot.is_some() || app.autoplay {
             let ids = app.visible_track_ids();
@@ -402,6 +426,7 @@ impl DeckhandApp {
             return;
         }
         self.selected = None;
+        self.marked.clear();
         self.config.use_collection = source == Source::Collection;
         if let Source::Usb(root) = &source {
             self.config.library_root = Some(root.clone());
@@ -414,6 +439,12 @@ impl DeckhandApp {
         if self.source == Source::Collection {
             if let Some(id) = self.selected {
                 self.load_from_collection(id, deck, ctx);
+            }
+            return;
+        }
+        if self.source == Source::Explorer {
+            if let Some(index) = self.selected {
+                self.load_from_explorer(index, deck, ctx);
             }
             return;
         }
@@ -528,6 +559,8 @@ impl DeckhandApp {
                 bend_sensitivity: f64::from(p.bend_sensitivity),
                 vinyl_start: f64::from(p.vinyl_start),
                 vinyl_brake: f64::from(p.vinyl_brake),
+                analysis: p.analysis,
+                analyze_on_load: p.analyze_on_load,
             };
         }
         let Some(engine) = self.engine.as_mut() else { return };
@@ -614,6 +647,7 @@ impl DeckhandApp {
         let rows = match self.source {
             Source::Collection => self.collection_rows(),
             Source::Usb(_) => self.usb_rows(),
+            Source::Explorer => self.explorer_rows(),
         };
         rows.into_iter().map(|r| (r.id, r.position)).collect()
     }
@@ -945,6 +979,10 @@ impl DeckhandApp {
                 let Some(track) = library.library.track(id) else { return };
                 (library.resolve(&track.track.file_path), track.track.title.clone())
             }
+            Source::Explorer => {
+                let Some(file) = self.explorer.files_get(id) else { return };
+                (file.path.clone(), file.title.clone())
+            }
         };
         self.effects.load_into(slot, path);
         self.status = Some(format!("Loading {title} into sampler slot {}", slot + 1));
@@ -1078,6 +1116,7 @@ impl DeckhandApp {
 
     /// The browse knob moves through playlists or tracks, whichever has focus.
     fn browse(&mut self, steps: i32) {
+        self.marked.clear();
         self.reveal_selected = true;
         self.reveal_playlist = true;
         let step = |current: Option<usize>, len: usize| -> Option<usize> {
@@ -1202,6 +1241,8 @@ impl DeckhandApp {
 
 impl eframe::App for DeckhandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Before anything is drawn, so focused widgets don't take the arrows.
+        self.library_keys(ctx);
         // winit's window teardown can trip an AppKit exception on recent macOS;
         // nothing needs cleaning up, so leave directly.
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1234,6 +1275,7 @@ impl eframe::App for DeckhandApp {
         }
         self.save_track_edits();
         self.poll_collection(ctx);
+        self.poll_explorer(ctx);
         self.poll_usb(ctx);
         self.check_controllers(ctx);
         self.save_session(false);
@@ -1272,6 +1314,7 @@ impl eframe::App for DeckhandApp {
             egui::TopBottomPanel::top("fx").show(ctx, |ui| self.fx_panel(ui));
         }
         self.update_status();
+        self.drag_hint(ctx);
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
             self.show_diagnostics = !self.show_diagnostics;
         }
@@ -1504,15 +1547,17 @@ impl DeckhandApp {
         }
     }
 
-    /// One deck's scrolling waveform; dragging it moves through the track.
+    /// One deck's scrolling waveform; dragging it moves through the track,
+    /// clicking jumps there (not on a playing deck with Needle Lock on).
     fn deck_waveform(&mut self, ui: &mut Ui, index: usize, size: egui::Vec2, vertical: bool) {
         // The zoom is real time: a deck playing faster shows more of its
         // track, so beats of synced decks line up across the whole width.
         let visible = self.seconds_visible * self.decks[index].tempo_ratio().max(0.05);
         let Some(engine) = self.engine.as_mut() else { return };
         let deck = &self.decks[index];
-        let (rect, response) = ui.allocate_exact_size(size, Sense::drag());
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
+        let mut jump = None;
         match &deck.track {
             Some(track) => {
                 let position = engine.display_position_secs(index);
@@ -1546,9 +1591,25 @@ impl DeckhandApp {
                     let seconds = f64::from(moved) / f64::from(length) * visible;
                     engine.send(Command::Shift { deck: index, seconds });
                 }
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let seconds = detail_time(rect, vertical, pointer, position, visible);
+                    jump = Some(seconds.clamp(0.0, track.duration));
+                }
             }
             None => {
                 painter.rect_filled(rect, 0.0, Color32::from_gray(12));
+            }
+        }
+        if let Some(seconds) = jump {
+            if self.config.prefs.needle_lock && engine.is_playing(index) {
+                self.status = Some(format!(
+                    "Deck {}: Needle Lock — pause to jump, or turn it off in Preferences",
+                    index + 1
+                ));
+            } else {
+                self.decks[index].seek(seconds, engine);
             }
         }
         painter.text(
@@ -2315,6 +2376,10 @@ impl DeckhandApp {
                     collection_load = self.collection_tracks(ui, stroke);
                 }
                 Source::Usb(_) => self.usb_list(ui, ctx),
+                Source::Explorer => {
+                    let stroke = focus_stroke(self.focus == Focus::Tracks);
+                    self.explorer_list(ui, stroke, ctx);
+                }
             });
         });
         if let Some((id, deck)) = collection_load {
@@ -2374,9 +2439,12 @@ impl DeckhandApp {
             selected_position: self.selected_position,
             reveal_selected: std::mem::take(&mut self.reveal_selected),
             loaded: &loaded,
-            draggable: false,
+            draggable: true,
+            marked: &self.marked,
             editable_rating: false,
         };
+        let selection = self.selected_ids();
+        let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };
         let mut context_load = None;
         let output = egui::Frame::new()
             .stroke(focus_stroke(self.focus == Focus::Tracks))
@@ -2396,10 +2464,16 @@ impl DeckhandApp {
                             }
                         }
                         ui.separator();
-                        ui.menu_button("Add to playlist", |ui| {
+                        let ids = group(row.id);
+                        let many = if ids.len() > 1 {
+                            format!(" ({} tracks)", ids.len())
+                        } else {
+                            String::new()
+                        };
+                        ui.menu_button(format!("Add to playlist{many}"), |ui| {
                             for (id, name) in &stick_playlists {
                                 if ui.button(name).clicked() {
-                                    usb_edit = Some(UsbEdit::AddTracks(*id, vec![row.id]));
+                                    usb_edit = Some(UsbEdit::AddTracks(*id, ids.clone()));
                                     ui.close();
                                 }
                             }
@@ -2418,8 +2492,10 @@ impl DeckhandApp {
             self.config.save();
         }
         if let Some((id, position)) = output.clicked {
-            (self.selected, self.selected_position) = (Some(id), Some(position));
-            self.focus = Focus::Tracks;
+            self.click_track(id, position, output.modifiers);
+        }
+        if let Some((id, position)) = output.drag_started {
+            self.start_track_drag(ui.ctx(), id, position);
         }
         if let Some(id) = output.double_clicked {
             double_clicked = Some(id);

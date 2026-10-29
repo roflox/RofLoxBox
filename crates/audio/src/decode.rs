@@ -82,7 +82,7 @@ pub fn decode_file(path: &Path) -> Result<TrackAudio> {
         return Err(anyhow!("no audio codec parameters in {}", path.display()));
     };
     let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .make_audio_decoder(&params, &decoder_options())
         .context("no decoder for this codec")?;
 
     let mut sample_rate = params.sample_rate.unwrap_or(44_100);
@@ -213,4 +213,13 @@ mod tests {
         assert_eq!(loudest_band(&tone(9_000.0)), 2);
         assert_eq!(band_waveform(&tone(60.0)).len(), 150);
     }
+}
+
+/// Encoder delay and padding stay in, as rekordbox decodes: its cue points,
+/// beat grids and waveforms count from the untrimmed start, and the length
+/// (which sets how the waveform columns line up) includes the padding.
+fn decoder_options() -> AudioDecoderOptions {
+    let mut options = AudioDecoderOptions::default();
+    options.gapless = false;
+    options
 }

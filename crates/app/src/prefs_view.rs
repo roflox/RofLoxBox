@@ -59,6 +59,29 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
             ui.label(RichText::new("On the decks and in the track lists, whatever the tags say.").small().weak());
         });
+        section(ui, "Analysis", |ui| {
+            use crate::deck::AnalysisMethod;
+            ui.radio_value(&mut p.analysis, AnalysisMethod::Rekordbox, "rekordbox-compatible");
+            ui.radio_value(&mut p.analysis, AnalysisMethod::Deckhand, "RofLoxBox (quicker)");
+            ui.label(
+                RichText::new(
+                    "Waveforms for tracks rekordbox has not analysed, on the decks and on exported \
+                     sticks. rekordbox-compatible ones are identical to rekordbox's.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.checkbox(&mut p.analyze_on_load, "Analyze BPM, beat grid and key on load");
+            ui.label(
+                RichText::new(
+                    "A loaded track without a beat grid or key gets them detected in the \
+                     background (RofLoxBox's own detection; rekordbox's grids and keys and \
+                     ones you edited are kept). Collection tracks keep the result.",
+                )
+                .small()
+                .weak(),
+            );
+        });
         section(ui, "Memory Cue Call Lock", |ui| {
             lock(ui, &mut p.memory_call_lock);
             ui.label(RichText::new("Locked: memory cues are not called on a playing deck.").small().weak());
@@ -121,6 +144,8 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.needle_lock = defaults.needle_lock;
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
+            p.analysis = defaults.analysis;
+            p.analyze_on_load = defaults.analyze_on_load;
             p.call_resizes_loop = defaults.call_resizes_loop;
             p.gate_while_playing = defaults.gate_while_playing;
             p.start_at_first_cue = defaults.start_at_first_cue;

@@ -171,6 +171,10 @@ pub struct FxSession {
 pub struct Preferences {
     /// How keys are written on the decks and in the lists.
     pub key_notation: crate::deck::KeyNotation,
+    /// How tracks without rekordbox's analysis are analysed.
+    pub analysis: crate::deck::AnalysisMethod,
+    /// A loaded track without a beat grid or key gets them detected.
+    pub analyze_on_load: bool,
     /// No loading onto a playing deck.
     pub load_lock: bool,
     /// No jumping by clicking the overview of a playing deck.
@@ -232,6 +236,8 @@ impl Default for Preferences {
             needle_lock: true,
             memory_call_lock: true,
             key_notation: Default::default(),
+            analysis: Default::default(),
+            analyze_on_load: true,
             call_resizes_loop: false,
             gate_while_playing: false,
             start_at_first_cue: true,

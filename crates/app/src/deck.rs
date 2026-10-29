@@ -10,7 +10,9 @@ use deckhand_audio::{
     Command, CrossfaderSide, Engine, TrackAudio, band_waveform, decode_file, peak_waveform,
 };
 use deckhand_control::PadMode;
-use deckhand_formats::anlz::{AnlzFile, CueKind, CueListKind, CueStatus};
+use deckhand_formats::anlz::{
+    AnlzFile, CueKind, CueListKind, CueStatus, Section, Waveform, WaveformKind,
+};
 use deckhand_formats::pdb::LibraryTrack;
 use eframe::egui::{self, Color32};
 
@@ -170,6 +172,59 @@ impl LoadedTrack {
             .map(|t| (self.beat_at(t) - now).ceil() as i64)
             .min()
     }
+
+    /// Whether the grid keeps one tempo (every beat within 5 ms of a
+    /// straight line), which the grid edits need. No grid counts as one.
+    pub fn grid_is_straight(&self) -> bool {
+        let n = self.beats.len();
+        if n < 3 {
+            return true;
+        }
+        // Least-squares line through (index, time).
+        let mean_i = (n - 1) as f64 / 2.0;
+        let mean_t = self.beats.iter().map(|b| b.0).sum::<f64>() / n as f64;
+        let (mut num, mut den) = (0.0, 0.0);
+        for (i, b) in self.beats.iter().enumerate() {
+            num += (i as f64 - mean_i) * (b.0 - mean_t);
+            den += (i as f64 - mean_i).powi(2);
+        }
+        let slope = num / den;
+        self.beats
+            .iter()
+            .enumerate()
+            .all(|(i, b)| (mean_t + (i as f64 - mean_i) * slope - b.0).abs() < 0.005)
+    }
+
+    /// The grid's tempo: the track's BPM, or when it has none (0), the
+    /// average beat length of the grid.
+    pub fn grid_bpm(&self) -> f64 {
+        match (self.bpm > 0.0, self.beats.first(), self.beats.last()) {
+            (false, Some(a), Some(b)) if self.beats.len() >= 2 && b.0 > a.0 => {
+                60.0 * (self.beats.len() - 1) as f64 / (b.0 - a.0)
+            }
+            _ => self.bpm,
+        }
+    }
+
+    /// The first beat and its number in the bar; without a grid, the start.
+    fn grid_anchor(&self) -> (f64, u16) {
+        self.beats.first().map_or((0.0, 1), |&(t, n)| (t, n.clamp(1, 4)))
+    }
+
+    /// Replaces the grid with a straight one at `bpm` that has beat
+    /// `number` (1–4) at `anchor`, from the start of the track to its end.
+    fn set_straight_grid(&mut self, anchor: f64, number: u16, bpm: f64) {
+        let beat = 60.0 / bpm;
+        // Beats before the anchor, back to the start.
+        let before = (anchor / beat + 1e-9).floor() as i64;
+        let start = anchor - before as f64 * beat;
+        let first = i64::from(number.clamp(1, 4)) - 1 - before;
+        self.beats = (0..)
+            .map(|i: i64| (start + i as f64 * beat, ((first + i).rem_euclid(4) + 1) as u16))
+            .take_while(|b| b.0 < self.duration)
+            .collect();
+        self.bpm = bpm;
+    }
 }
 
 /// Beats as rekordbox counts them down: `bars.beats`, e.g. 9 beats = "2.1".
@@ -185,6 +240,10 @@ pub struct Deck {
     /// The decoded audio, kept to reload it when the audio output restarts.
     audio: Option<Arc<TrackAudio>>,
     loading: Option<(String, Receiver<LoadResult>)>,
+    /// Beat grid and key being detected for the loaded track.
+    analysing: Option<Receiver<Detected>>,
+    /// Detection filled in the grid or key; the collection should keep it.
+    pub analysed: bool,
     pub error: Option<String>,
     pub cue_point: f64,
     previewing: bool,
@@ -240,6 +299,10 @@ pub struct Deck {
     pub pad_mode: PadMode,
     /// The loaded track's cues or beat grid changed and should be saved.
     pub edited: bool,
+    /// The beat grid itself changed (saved as one tempo marker).
+    pub grid_edited: bool,
+    /// The beat-grid edit controls are open.
+    pub grid_edit: bool,
     pub prefs: DeckPrefs,
     /// Jog steps the controller sends per turn of a wheel.
     pub jog_steps_per_turn: f64,
@@ -267,6 +330,8 @@ impl Deck {
             track: None,
             audio: None,
             loading: None,
+            analysing: None,
+            analysed: false,
             error: None,
             cue_point: 0.0,
             previewing: false,
@@ -304,6 +369,8 @@ impl Deck {
             key_synced: false,
             pad_mode: PadMode::HotCue,
             edited: false,
+            grid_edited: false,
+            grid_edit: false,
             prefs: DeckPrefs::default(),
             jog_steps_per_turn: 720.0,
             double_of: None,
@@ -341,14 +408,21 @@ impl Deck {
         self.jog_touched && self.vinyl
     }
 
+    /// Beat grid and key detection is running for the loaded track.
+    pub fn is_analysing(&self) -> bool {
+        self.analysing.is_some()
+    }
+
     /// Takes the track off the deck. Settings like tempo range or SYNC stay.
     pub fn eject(&mut self, engine: &mut Engine) {
         engine.send(Command::Unload { deck: self.index });
         self.track = None;
         self.audio = None;
         self.loading = None;
+        (self.analysing, self.analysed) = (None, false);
         self.error = None;
         self.edited = false;
+        self.grid_edited = false;
         self.double_of = None;
         self.cue_point = 0.0;
         (self.loop_in, self.loop_region, self.loop_active) = (None, None, false);
@@ -370,6 +444,7 @@ impl Deck {
                 .then(|| library.resolve(&track.track.analyze_path)),
             known: None,
             auto_cue_db: self.prefs.auto_cue_db,
+            analysis: self.prefs.analysis,
         };
         self.start_request(request, ctx);
     }
@@ -383,11 +458,43 @@ impl Deck {
             title: track.title.clone(),
             artist: track.artist.clone(),
             key: track.key.clone(),
-            bpm: track.bpm.unwrap_or(0.0),
+            // Imported tracks can have tempo markers without a BPM of their own.
+            bpm: track.bpm.or_else(|| track.tempo.first().map(|m| m.bpm)).unwrap_or(0.0),
             audio_path: track.path.clone(),
             analysis_path: track.analysis.clone(),
             known: Some(Known::from_track(track)),
             auto_cue_db: self.prefs.auto_cue_db,
+            analysis: self.prefs.analysis,
+        };
+        self.start_request(request, ctx);
+    }
+
+    /// Loads an audio file that is in no library (from the explorer); `id`
+    /// tells it apart on the decks.
+    pub fn start_load_path(
+        &mut self,
+        id: u32,
+        file: &deckhand_library::ScannedFile,
+        ctx: &egui::Context,
+    ) {
+        let title = if file.title.is_empty() {
+            file.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        } else {
+            file.title.clone()
+        };
+        let request = LoadRequest {
+            id,
+            from_collection: false,
+            usb_root: None,
+            title,
+            artist: file.artist.clone(),
+            key: file.key.clone(),
+            bpm: file.bpm.unwrap_or(0.0),
+            audio_path: file.path.clone(),
+            analysis_path: None,
+            known: None,
+            auto_cue_db: self.prefs.auto_cue_db,
+            analysis: self.prefs.analysis,
         };
         self.start_request(request, ctx);
     }
@@ -395,6 +502,7 @@ impl Deck {
     fn start_request(&mut self, request: LoadRequest, ctx: &egui::Context) {
         let (tx, rx) = channel();
         self.loading = Some((request.title.clone(), rx));
+        (self.analysing, self.analysed) = (None, false);
         self.error = None;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -433,12 +541,37 @@ impl Deck {
                         self.loop_active = true;
                         engine.send(Command::SetLoop { deck: self.index, start, end });
                     }
+                    if self.prefs.analyze_on_load
+                        && let Some(audio) = &self.audio
+                    {
+                        self.analysing = detect_missing(&track, audio.clone());
+                    }
                     self.track = Some(track);
-                    self.edited = false;
+                    (self.edited, self.grid_edited) = (false, false);
                     self.phase_offset = 0.0;
                     self.apply_tempo(engine);
                 }
                 Err(err) => self.error = Some(format!("{err:#}")),
+            }
+        }
+        if let Some(rx) = &self.analysing
+            && let Ok(found) = rx.try_recv()
+        {
+            self.analysing = None;
+            if let Some(track) = self.track.as_mut() {
+                // Only what is still missing: a grid edited meanwhile stays.
+                if let Some(grid) = found.grid.filter(|_| track.beats.is_empty()) {
+                    track.set_straight_grid(
+                        grid.first_beat,
+                        u16::from(grid.first_number),
+                        grid.bpm,
+                    );
+                    self.analysed = true;
+                }
+                if let Some(key) = found.key.filter(|_| track.key.is_none()) {
+                    track.key = Some(key.camelot());
+                    self.analysed = true;
+                }
             }
         }
         // Pitch bend follows how fast the jog spins, smoothed over frames.
@@ -988,16 +1121,53 @@ impl Deck {
         // Taps run at the deck's current speed; store the track's own BPM.
         let bpm = 60.0 * (self.taps.len() - 1) as f64 / span / self.tempo_ratio();
         let track = self.track.as_mut()?;
-        let first = track.beats.first().map_or(0.0, |b| b.0);
-        let beat = 60.0 / bpm;
-        let start = first - (first / beat).floor() * beat;
-        track.beats = (0..)
-            .map(|i| (start + i as f64 * beat, (i % 4) as u16 + 1))
-            .take_while(|b| b.0 < track.duration)
-            .collect();
-        track.bpm = bpm;
-        self.edited = true;
+        let (anchor, number) = track.grid_anchor();
+        track.set_straight_grid(anchor, number, bpm);
+        (self.edited, self.grid_edited) = (true, true);
         Some(bpm)
+    }
+
+    /// Applies a grid edit to a straight grid: `edit` gives the new anchor
+    /// time, its beat number and the BPM. Returns false (and changes
+    /// nothing) without a track or when the grid changes tempo.
+    fn edit_grid(&mut self, edit: impl FnOnce(&LoadedTrack) -> Option<(f64, u16, f64)>) -> bool {
+        let Some(track) = self.track.as_mut().filter(|t| t.grid_is_straight()) else {
+            return false;
+        };
+        let Some((anchor, number, bpm)) = edit(track).filter(|e| e.2.is_finite() && e.2 > 0.0)
+        else {
+            return false;
+        };
+        track.set_straight_grid(anchor, number, bpm.clamp(20.0, 999.0));
+        (self.edited, self.grid_edited) = (true, true);
+        true
+    }
+
+    /// Moves the beat grid later (positive) or earlier by `seconds`.
+    pub fn shift_grid(&mut self, seconds: f64) -> bool {
+        self.edit_grid(|t| {
+            let (anchor, number) = t.grid_anchor();
+            let bpm = t.grid_bpm();
+            (bpm > 0.0).then_some((anchor + seconds, number, bpm))
+        })
+    }
+
+    /// Sets the track's BPM, keeping the first beat where it is.
+    pub fn set_grid_bpm(&mut self, bpm: f64) -> bool {
+        self.edit_grid(|t| {
+            let (anchor, number) = t.grid_anchor();
+            Some((anchor, number, bpm))
+        })
+    }
+
+    /// Puts a downbeat (beat 1 of a bar) exactly at `position`.
+    pub fn downbeat_here(&mut self, position: f64) -> bool {
+        self.edit_grid(|t| Some((position, 1, t.grid_bpm())))
+    }
+
+    /// Makes the beat nearest `position` beat 1 of its bar; no beat moves.
+    pub fn renumber_here(&mut self, position: f64) -> bool {
+        self.edit_grid(|t| Some((t.nearest_beat_time(position), 1, t.grid_bpm())))
     }
 
     /// Fader start: the channel fader opened (play) or closed (back to cue).
@@ -1230,6 +1400,20 @@ pub struct DeckPrefs {
     /// Vinyl Speed Adjust, seconds.
     pub vinyl_start: f64,
     pub vinyl_brake: f64,
+    pub analysis: AnalysisMethod,
+    /// Detect a missing beat grid or key once a track is loaded.
+    pub analyze_on_load: bool,
+}
+
+/// How tracks without rekordbox's analysis are analysed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnalysisMethod {
+    /// The way rekordbox works it out (waveforms identical to rekordbox's).
+    #[default]
+    Rekordbox,
+    /// deckhand's own, quicker method.
+    Deckhand,
 }
 
 impl Default for DeckPrefs {
@@ -1246,8 +1430,39 @@ impl Default for DeckPrefs {
             bend_sensitivity: 1.0,
             vinyl_start: 0.0,
             vinyl_brake: 0.0,
+            analysis: AnalysisMethod::default(),
+            analyze_on_load: true,
         }
     }
+}
+
+/// What detection found for a loaded track.
+struct Detected {
+    grid: Option<deckhand_analysis::beats::Grid>,
+    key: Option<deckhand_analysis::key::Key>,
+}
+
+/// Detects the beat grid and/or key `track` lacks, in the background;
+/// `None` when it has both.
+fn detect_missing(track: &LoadedTrack, audio: Arc<TrackAudio>) -> Option<Receiver<Detected>> {
+    let (grid, key) = (track.beats.is_empty(), track.key.is_none());
+    if !grid && !key {
+        return None;
+    }
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        use deckhand_analysis::beats::{DEFAULT_RANGE, beat_grid};
+        let found = Detected {
+            grid: grid
+                .then(|| beat_grid(&audio.samples, audio.sample_rate, DEFAULT_RANGE))
+                .flatten(),
+            key: key
+                .then(|| deckhand_analysis::key::detect_key(&audio.samples, audio.sample_rate))
+                .flatten(),
+        };
+        let _ = tx.send(found);
+    });
+    Some(rx)
 }
 
 /// When the first sound louder than `db` starts, in seconds.
@@ -1304,6 +1519,7 @@ struct LoadRequest {
     bpm: f64,
     audio_path: PathBuf,
     analysis_path: Option<PathBuf>,
+    analysis: AnalysisMethod,
 }
 
 impl LoadRequest {
@@ -1323,7 +1539,21 @@ impl LoadRequest {
 
         let two_ex =
             self.analysis_path.as_ref().and_then(|p| AnlzFile::open(p.with_extension("2EX")).ok());
+        // Without rekordbox's analysis: worked out the way rekordbox does it,
+        // or deckhand's quicker way.
+        let worked_out = || match self.analysis {
+            AnalysisMethod::Rekordbox => {
+                let columns =
+                    deckhand_analysis::waveform::color_detail(&audio.samples, audio.sample_rate);
+                let data = columns.iter().flat_map(|c| c.to_be_bytes()).collect();
+                let waveform = Waveform { kind: WaveformKind::ColorDetail, entry_len: 2, data };
+                let ext = AnlzFile { sections: vec![Section::Waveform(waveform)] };
+                WaveformData::from_analysis(Some(&ext), None)
+            }
+            AnalysisMethod::Deckhand => None,
+        };
         let mut waveform = WaveformData::from_analysis(ext.as_ref(), two_ex.as_ref())
+            .or_else(worked_out)
             .unwrap_or_else(|| WaveformData::from_peaks(&peak_waveform(&audio), Vec::new()));
         if !waveform.has_bands() {
             waveform.bands = band_waveform(&audio);
@@ -1491,6 +1721,97 @@ mod tests {
         // Jumps off either end of the track are refused.
         assert!(plan_beat_jump(&t, 1.0, None, -8.0).is_none());
         assert!(plan_beat_jump(&t, 299.0, None, 8.0).is_none());
+    }
+
+    /// A deck holding a 120 BPM track (beats every 0.5 s from 0.1 s, the
+    /// first one beat 1).
+    fn grid_deck() -> Deck {
+        let grid = (0..600).map(|i| (0.1 + f64::from(i) * 0.5, (i % 4 + 1) as u16)).collect();
+        let mut deck = Deck::new(0);
+        deck.track = Some(track(grid, 120.0));
+        deck
+    }
+
+    fn first_beats(deck: &Deck) -> Vec<(f64, u16)> {
+        let beats = &deck.track.as_ref().unwrap().beats;
+        beats[..3].iter().map(|&(t, n)| ((t * 1e6).round() / 1e6, n)).collect()
+    }
+
+    #[test]
+    fn grid_shift_keeps_bars_and_fills_the_start() {
+        let mut deck = grid_deck();
+        assert!(deck.shift_grid(0.010));
+        assert_eq!(first_beats(&deck), [(0.11, 1), (0.61, 2), (1.11, 3)]);
+        assert!(deck.grid_edited && deck.edited);
+        // Earlier: the downbeat goes before the start, the track starts on 2.
+        assert!(deck.shift_grid(-0.2));
+        assert_eq!(first_beats(&deck), [(0.41, 2), (0.91, 3), (1.41, 4)]);
+        // Later by more than the gap at the start: a beat 4 comes in before.
+        assert!(deck.shift_grid(0.14));
+        assert_eq!(first_beats(&deck), [(0.05, 1), (0.55, 2), (1.05, 3)]);
+        assert!(deck.shift_grid(0.45));
+        assert_eq!(first_beats(&deck), [(0.0, 4), (0.5, 1), (1.0, 2)]);
+        assert!(deck.track.as_ref().unwrap().beats.last().unwrap().0 < 300.0);
+    }
+
+    #[test]
+    fn grid_bpm_keeps_the_first_beat() {
+        let mut deck = grid_deck();
+        assert!(deck.set_grid_bpm(60.0));
+        let track = deck.track.as_ref().unwrap();
+        assert_eq!(track.bpm, 60.0);
+        assert_eq!(first_beats(&deck), [(0.1, 1), (1.1, 2), (2.1, 3)]);
+        assert!(deck.set_grid_bpm(240.0));
+        assert_eq!(first_beats(&deck), [(0.1, 1), (0.35, 2), (0.6, 3)]);
+    }
+
+    #[test]
+    fn downbeat_and_renumbering() {
+        let mut deck = grid_deck();
+        // A downbeat exactly at 10.3 s: beats move, 10.3 is beat 1.
+        assert!(deck.downbeat_here(10.3));
+        let track = deck.track.as_ref().unwrap();
+        assert_eq!(track.bar_and_beat(10.3).1, 1);
+        assert_eq!(first_beats(&deck), [(0.3, 1), (0.8, 2), (1.3, 3)]);
+        // Renumbering: the beat nearest 1.75 s (1.8) becomes 1; none move.
+        assert!(deck.renumber_here(1.75));
+        assert_eq!(first_beats(&deck), [(0.3, 2), (0.8, 3), (1.3, 4)]);
+        assert_eq!(deck.track.as_ref().unwrap().bar_and_beat(1.85).1, 1);
+    }
+
+    #[test]
+    fn grid_edits_use_the_grid_tempo_without_a_bpm() {
+        // Collection tracks can have tempo markers but no BPM of their own.
+        let mut deck = grid_deck();
+        deck.track.as_mut().unwrap().bpm = 0.0;
+        assert!((deck.track.as_ref().unwrap().grid_bpm() - 120.0).abs() < 1e-9);
+        assert!(deck.shift_grid(0.01));
+        assert_eq!(deck.track.as_ref().unwrap().bpm, 120.0);
+        assert_eq!(first_beats(&deck), [(0.11, 1), (0.61, 2), (1.11, 3)]);
+    }
+
+    #[test]
+    fn grids_that_change_tempo_are_left_alone() {
+        let mut deck = grid_deck();
+        let track = deck.track.as_mut().unwrap();
+        // From beat 300 on, 1% slower.
+        let from = track.beats[300].0;
+        for beat in &mut track.beats[300..] {
+            beat.0 += (beat.0 - from) * 0.01;
+        }
+        assert!(!track.grid_is_straight());
+        let before = track.beats.clone();
+        assert!(!deck.shift_grid(0.01));
+        assert!(!deck.downbeat_here(5.0));
+        assert_eq!(deck.track.as_ref().unwrap().beats, before);
+        assert!(!deck.grid_edited);
+        // Rounded (ms) beat times still count as one tempo.
+        let mut deck = grid_deck();
+        let track = deck.track.as_mut().unwrap();
+        for beat in &mut track.beats {
+            beat.0 = (beat.0 * 1000.0 + 0.4).round() / 1000.0;
+        }
+        assert!(track.grid_is_straight());
     }
 
     #[test]

@@ -25,6 +25,12 @@ pub struct CollectionView {
     pending_duplicate: Option<(u32, u32)>,
     /// A rekordbox XML file being read.
     xml: Option<std::sync::mpsc::Receiver<anyhow::Result<deckhand_library::XmlLibrary>>>,
+    /// BPM, beat grid and key analysis running, with (tracks given a grid
+    /// or key, files that could not be read) so far.
+    analysis: Option<(crate::analyze::Analysis, usize, usize)>,
+    /// Files dropped on a playlist that go into it once the scan reading
+    /// them is done: (playlist, files).
+    pending_adds: Vec<(u32, Vec<PathBuf>)>,
 }
 
 impl DeckhandApp {
@@ -97,10 +103,123 @@ impl DeckhandApp {
         self.collection_view.scan = Some(Scan::start(paths, self.collection.known_files()));
     }
 
+    /// Adds files to a playlist; files not in the collection yet are read
+    /// in first and added when that is done.
+    pub(super) fn add_files_to_playlist(&mut self, paths: Vec<PathBuf>, playlist: u32) {
+        let (known, new): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| self.collection.tracks.iter().any(|t| &t.path == p));
+        let ids: Vec<u32> = known
+            .iter()
+            .filter_map(|p| self.collection.tracks.iter().find(|t| &t.path == p).map(|t| t.id))
+            .collect();
+        if !ids.is_empty() {
+            self.add_many(&ids, playlist);
+        }
+        if !new.is_empty() {
+            self.collection_view.pending_adds.push((playlist, new.clone()));
+            self.add_music(new);
+        }
+    }
+
     /// Rescans every added folder for new and changed files.
     fn rescan(&mut self) {
         let folders = self.collection.folders.clone();
         self.add_music(folders);
+    }
+
+    /// Analyzes the tracks that have no beat grid or no key.
+    pub(super) fn analyze_missing(&mut self) {
+        let ids: Vec<u32> = self
+            .collection
+            .tracks
+            .iter()
+            .filter(|t| t.tempo.is_empty() || t.key.is_none())
+            .map(|t| t.id)
+            .collect();
+        self.analyze(ids, false);
+    }
+
+    /// Analyzes tracks (BPM, beat grid, key) in the background; `overwrite`
+    /// replaces what they have instead of only filling in what is missing.
+    fn analyze(&mut self, ids: Vec<u32>, overwrite: bool) {
+        if self.collection_view.analysis.is_some() {
+            self.status = Some("An analysis is already running".into());
+            return;
+        }
+        let tracks: Vec<(u32, PathBuf)> = ids
+            .into_iter()
+            .filter_map(|id| self.collection.track(id))
+            .filter(|t| t.path.is_file())
+            .map(|t| (t.id, t.path.clone()))
+            .collect();
+        if tracks.is_empty() {
+            self.status = Some("Nothing to analyze (or the files are missing)".into());
+            return;
+        }
+        self.collection_view.analysis =
+            Some((crate::analyze::Analysis::start(tracks, overwrite), 0, 0));
+    }
+
+    /// Stores finished analyses in the collection and on decks holding
+    /// the track.
+    fn poll_analysis(&mut self, ctx: &egui::Context) {
+        use deckhand_library::TempoMarker;
+        let Some((analysis, found, failed)) = self.collection_view.analysis.as_mut() else {
+            return;
+        };
+        while let Ok(r) = analysis.results.try_recv() {
+            if r.failed {
+                *failed += 1;
+                continue;
+            }
+            let mut changed = false;
+            self.collection.update_track(r.id, |t| {
+                if let Some(g) = r.grid
+                    && (r.overwrite || t.tempo.is_empty())
+                {
+                    t.bpm = Some(g.bpm);
+                    t.tempo =
+                        vec![TempoMarker { start: g.first_beat, bpm: g.bpm, beat: g.first_number }];
+                    changed = true;
+                }
+                if let Some(k) = r.key
+                    && (r.overwrite || t.key.is_none())
+                {
+                    t.key = Some(k.camelot());
+                    changed = true;
+                }
+            });
+            if !changed {
+                continue;
+            }
+            *found += 1;
+            let Some(stored) = self.collection.track(r.id) else { continue };
+            for deck in &mut self.decks {
+                if let Some(loaded) =
+                    deck.track.as_mut().filter(|t| t.from_collection && t.id == r.id)
+                {
+                    loaded.beats = stored.beats(loaded.duration);
+                    loaded.bpm = stored.bpm.unwrap_or(loaded.bpm);
+                    loaded.key = stored.key.clone();
+                }
+            }
+        }
+        if analysis.is_finished() {
+            let (done, total) =
+                (analysis.done.load(std::sync::atomic::Ordering::Relaxed), analysis.total);
+            let unread = if *failed > 0 {
+                format!(", {failed} file(s) could not be read")
+            } else {
+                String::new()
+            };
+            self.status = Some(format!(
+                "Analysis: {found} of {total} track(s) got a grid or key{unread}{}",
+                if done < total { " (cancelled)" } else { "" }
+            ));
+            self.collection_view.analysis = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Reads a rekordbox XML export in the background.
@@ -114,6 +233,7 @@ impl DeckhandApp {
 
     /// Merges a finished scan or import and saves. Call every frame.
     pub(super) fn poll_collection(&mut self, ctx: &egui::Context) {
+        self.poll_analysis(ctx);
         if let Some(result) = self.collection_view.xml.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.collection_view.xml = None;
             match result {
@@ -142,6 +262,16 @@ impl DeckhandApp {
                     self.status =
                         Some(format!("Collection: {added} track(s) added, {updated} updated"));
                     view.scan = None;
+                    // Dropped files now in the collection go into their playlist.
+                    for (playlist, paths) in std::mem::take(&mut view.pending_adds) {
+                        let ids: Vec<u32> = paths
+                            .iter()
+                            .filter_map(|p| {
+                                self.collection.tracks.iter().find(|t| &t.path == p).map(|t| t.id)
+                            })
+                            .collect();
+                        self.add_many(&ids, playlist);
+                    }
                 }
                 None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
             }
@@ -208,7 +338,7 @@ impl DeckhandApp {
         if ui
             .button("Import rekordbox XML…")
             .on_hover_text(
-                "In rekordbox: File → Export Collection in xml format. Brings tracks,                  playlists, beat grids, hot cues, memory cues, ratings and colours.",
+                "In rekordbox: File → Export Collection in xml format. Brings tracks, playlists, beat grids, hot cues, memory cues, ratings and colours.",
             )
             .clicked()
         {
@@ -220,6 +350,17 @@ impl DeckhandApp {
             {
                 self.import_xml(file);
             }
+        }
+        if ui
+            .button("Analyze tracks without a grid or key")
+            .on_hover_text(
+                "Works out BPM, beat grid and key where a track has none. Grids from rekordbox \
+                 and ones you edited are kept; right-click a track to analyze it again.",
+            )
+            .clicked()
+        {
+            ui.close();
+            self.analyze_missing();
         }
         ui.separator();
         let parent = self.selected_folder();
@@ -256,6 +397,16 @@ impl DeckhandApp {
                 }
             });
         }
+        if let Some((analysis, _, _)) = &self.collection_view.analysis {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                let done = analysis.done.load(std::sync::atomic::Ordering::Relaxed);
+                ui.label(RichText::new(format!("Analyzing {done}/{}…", analysis.total)).small());
+                if ui.small_button("Cancel").clicked() {
+                    analysis.cancel();
+                }
+            });
+        }
         if let Some(err) = &self.collection_view.error {
             ui.colored_label(WARN, err);
         }
@@ -283,14 +434,32 @@ impl DeckhandApp {
         }
     }
 
-    /// Writes hot cues, memory cues/loops and a tapped beat grid of loaded
-    /// collection tracks into the collection. Call every frame.
+    /// Writes hot cues, memory cues/loops and an edited (tapped, shifted…)
+    /// beat grid of loaded collection tracks into the collection. Call
+    /// every frame.
     pub(super) fn save_track_edits(&mut self) {
         use deckhand_library::{Cue, CueKind, TempoMarker};
         for deck in &mut self.decks {
+            // Detected on load: fills in only what the collection lacks.
+            if std::mem::take(&mut deck.analysed)
+                && let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection)
+            {
+                let first = loaded.beats.first().copied();
+                let (bpm, key) = (loaded.bpm, loaded.key.clone());
+                self.collection.update_track(loaded.id, |t| {
+                    if let Some((start, beat)) = first.filter(|_| t.tempo.is_empty() && bpm > 0.0) {
+                        t.bpm = Some(bpm);
+                        t.tempo = vec![TempoMarker { start, bpm, beat: beat.clamp(1, 4) as u8 }];
+                    }
+                    if t.key.is_none() {
+                        t.key = key;
+                    }
+                });
+            }
             if !std::mem::take(&mut deck.edited) {
                 continue;
             }
+            let grid_edited = std::mem::take(&mut deck.grid_edited);
             let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection) else { continue };
             let Some(stored) = self.collection.track(loaded.id) else { continue };
             // Names, colours and hot-loop ends the deck does not track are kept.
@@ -326,8 +495,8 @@ impl DeckhandApp {
                     name: old.map(|c| c.name).unwrap_or_default(),
                 });
             }
-            // A changed BPM means the grid was tapped: one straight grid.
-            let tapped = (stored.bpm != Some(loaded.bpm) && loaded.bpm > 0.0)
+            // Grid edits always leave one straight grid: one marker.
+            let tapped = (grid_edited && loaded.bpm > 0.0)
                 .then(|| loaded.beats.first().map(|&(start, beat)| (start, beat)))
                 .flatten();
             let bpm = loaded.bpm;
@@ -342,7 +511,7 @@ impl DeckhandApp {
     }
 
     /// Adds a track to a playlist, asking first if it is already in it.
-    fn request_add(&mut self, track: u32, playlist: u32) {
+    pub(super) fn request_add(&mut self, track: u32, playlist: u32) {
         let already = self.collection.node(playlist).is_some_and(|n| n.tracks.contains(&track));
         if already {
             self.collection_view.pending_duplicate = Some((track, playlist));
@@ -535,9 +704,9 @@ impl DeckhandApp {
             }
             // Tracks dropped on a playlist are added to it.
             if kind == NodeKind::Playlist
-                && let Some(track) = response.dnd_release_payload::<u32>()
+                && let Some(drag) = response.dnd_release_payload::<crate::browser::TrackDrag>()
             {
-                self.request_add(*track, id);
+                self.drop_on_playlist(&drag, id);
             }
             response.context_menu(|ui| {
                 if kind == NodeKind::Playlist {
@@ -634,7 +803,7 @@ impl DeckhandApp {
                 album: t.album.clone(),
                 genre: t.genre.clone(),
                 label: t.label.clone(),
-                bpm: t.bpm,
+                bpm: t.bpm.or_else(|| t.tempo.first().map(|m| m.bpm)),
                 key: t
                     .key
                     .as_deref()
@@ -703,12 +872,17 @@ impl DeckhandApp {
             .map(|d| d.track.as_ref().filter(|t| t.from_collection).map(|t| t.id))
             .collect();
         let free = self.free_deck(&loaded);
+        // Right-clicking a selected track acts on the whole selection.
+        let selection = self.selected_ids();
+        let marked = self.marked.clone();
+        let group = |id: u32| if marked.contains(&id) { selection.clone() } else { vec![id] };
         let options = TableOptions {
             selected: self.selected,
             selected_position: self.selected_position,
             reveal_selected: std::mem::take(&mut self.reveal_selected),
             loaded: &loaded,
             draggable: true,
+            marked: &self.marked,
             editable_rating: true,
         };
         let mut actions: Vec<TrackAction> = Vec::new();
@@ -730,13 +904,19 @@ impl DeckhandApp {
                             }
                         }
                         ui.separator();
-                        ui.menu_button("Add to playlist", |ui| {
+                        let ids = group(id);
+                        let many = if ids.len() > 1 {
+                            format!(" ({} tracks)", ids.len())
+                        } else {
+                            String::new()
+                        };
+                        ui.menu_button(format!("Add to playlist{many}"), |ui| {
                             if playlists.is_empty() {
                                 ui.label("No playlists yet");
                             }
                             for (playlist, name) in &playlists {
                                 if ui.button(name).clicked() {
-                                    actions.push(TrackAction::AddTo(id, *playlist));
+                                    actions.push(TrackAction::AddTo(ids.clone(), *playlist));
                                     ui.close();
                                 }
                             }
@@ -757,6 +937,16 @@ impl DeckhandApp {
                             actions.push(TrackAction::Edit(id));
                             ui.close();
                         }
+                        if ui
+                            .button(format!("Analyze BPM, grid and key{many}"))
+                            .on_hover_text(
+                                "Replaces the track's beat grid and key with newly detected ones",
+                            )
+                            .clicked()
+                        {
+                            actions.push(TrackAction::Analyze(ids.clone()));
+                            ui.close();
+                        }
                         if ui.button("Remove from collection").clicked() {
                             actions.push(TrackAction::Forget(id));
                             ui.close();
@@ -769,8 +959,10 @@ impl DeckhandApp {
             self.config.save();
         }
         if let Some((id, position)) = output.clicked {
-            (self.selected, self.selected_position) = (Some(id), Some(position));
-            self.focus = Focus::Tracks;
+            self.click_track(id, position, output.modifiers);
+        }
+        if let Some((id, position)) = output.drag_started {
+            self.start_track_drag(ui.ctx(), id, position);
         }
         if let (Some(id), Some(deck)) = (output.double_clicked, free) {
             load = Some((id, deck));
@@ -781,13 +973,17 @@ impl DeckhandApp {
         for action in actions {
             match action {
                 TrackAction::Load(id, deck) => load = Some((id, deck)),
-                TrackAction::AddTo(id, playlist) => self.request_add(id, playlist),
+                TrackAction::AddTo(ids, playlist) if ids.len() == 1 => {
+                    self.request_add(ids[0], playlist)
+                }
+                TrackAction::AddTo(ids, playlist) => self.add_many(&ids, playlist),
                 TrackAction::RemoveFrom(entry, playlist) => {
                     if let Some(entry) = entry {
                         self.collection.remove_playlist_entry(playlist, entry);
                     }
                 }
                 TrackAction::Forget(id) => self.collection.remove_tracks(&[id]),
+                TrackAction::Analyze(ids) => self.analyze(ids, true),
                 TrackAction::Edit(id) => {
                     if let Some(t) = self.collection.track(id) {
                         let fields =
@@ -803,11 +999,12 @@ impl DeckhandApp {
 
 enum TrackAction {
     Load(u32, usize),
-    AddTo(u32, u32),
+    AddTo(Vec<u32>, u32),
     /// (playlist position, playlist).
     RemoveFrom(Option<usize>, u32),
     Forget(u32),
     Edit(u32),
+    Analyze(Vec<u32>),
 }
 
 /// Unix seconds → `YYYY-MM-DD` (UTC).

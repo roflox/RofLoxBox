@@ -24,6 +24,8 @@ pub(super) enum TreeEntry {
     Collection(Option<u32>),
     /// An export: all its tracks (`None`) or a playlist (index).
     Usb(PathBuf, Option<usize>),
+    /// A folder in the explorer.
+    Folder(PathBuf),
 }
 
 /// A drive being ejected in the background.
@@ -108,7 +110,7 @@ impl DeckhandApp {
     pub(super) fn usb(&self) -> Option<&UsbLibrary> {
         match &self.source {
             Source::Usb(root) => self.libraries.iter().find(|l| &l.root == root),
-            Source::Collection => None,
+            Source::Collection | Source::Explorer => None,
         }
     }
 
@@ -241,6 +243,7 @@ impl DeckhandApp {
             playlist: node.name.clone(),
             tracks,
             key_notation: self.config.prefs.key_notation,
+            analysis: self.config.prefs.analysis,
         };
         let name = node.name.clone();
         self.status = Some(format!("Exporting {name} to {}…", volume_name(&root)));
@@ -285,7 +288,7 @@ impl DeckhandApp {
                     cleanup.bytes as f64 / 1e9
                 ));
                 ui.label(
-                    "Their music and analysis files are deleted from the stick. This cannot be                      undone; the stick's database is backed up first.",
+                    "Their music and analysis files are deleted from the stick. This cannot be undone; the stick's database is backed up first.",
                 );
                 ui.horizontal(|ui| {
                     let delete = egui::Button::new(RichText::new("Delete").color(egui::Color32::WHITE))
@@ -514,6 +517,7 @@ impl DeckhandApp {
                 }
             }
         }
+        entries.extend(self.explorer_folders().into_iter().map(TreeEntry::Folder));
         entries
     }
 
@@ -522,10 +526,14 @@ impl DeckhandApp {
         match &self.source {
             Source::Collection => TreeEntry::Collection(self.collection_view.node),
             Source::Usb(root) => TreeEntry::Usb(root.clone(), self.usb().and_then(|l| l.playlist)),
+            Source::Explorer => {
+                self.explorer.folder.clone().map_or(TreeEntry::Collection(None), TreeEntry::Folder)
+            }
         }
     }
 
     pub(super) fn select_entry(&mut self, entry: TreeEntry) {
+        self.marked.clear();
         match entry {
             TreeEntry::Collection(node) => {
                 self.set_source(Source::Collection);
@@ -537,6 +545,7 @@ impl DeckhandApp {
                 }
                 self.set_source(Source::Usb(root));
             }
+            TreeEntry::Folder(folder) => self.open_explorer_folder(folder),
         }
     }
 
@@ -553,6 +562,8 @@ impl DeckhandApp {
                 ui.add_space(4.0);
                 self.usb_section(ui, &root);
             }
+            ui.add_space(4.0);
+            self.explorer_section(ui);
             ui.add_space(6.0);
             if ui
                 .small_button("Open export folder…")
@@ -800,6 +811,23 @@ impl DeckhandApp {
                         ui.close();
                     }
                 });
+                // Tracks of this stick dropped on one of its playlists.
+                if !folder
+                    && let Some(drag) = response.dnd_release_payload::<crate::browser::TrackDrag>()
+                {
+                    match &*drag {
+                        crate::browser::TrackDrag::Usb(from, ids) if from.as_path() == root => {
+                            edit = Some(UsbEdit::AddTracks(row.id, ids.clone()));
+                        }
+                        _ => {
+                            self.status = Some(
+                                "Only tracks of this stick can be dropped on its playlists \
+                                 (export a collection playlist to put tracks on it)"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
                 if selected && self.reveal_playlist {
                     response.scroll_to_me(Some(egui::Align::Center));
                 }
@@ -938,6 +966,7 @@ mod tests {
             playlist: "Gone".into(),
             tracks,
             key_notation: crate::deck::KeyNotation::Alphanumeric,
+            analysis: crate::deck::AnalysisMethod::Rekordbox,
         })
         .unwrap();
         let pdb = stick.join("PIONEER/rekordbox/export.pdb");

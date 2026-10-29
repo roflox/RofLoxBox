@@ -87,7 +87,7 @@ impl DeckhandApp {
             load_lock: self.config.prefs.load_lock,
             out: DeckOut::default(),
         };
-        ui.horizontal_top(|ui| {
+        let area = ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
                 vec2(main_width, 0.0),
                 egui::Layout::top_down(egui::Align::Min),
@@ -136,6 +136,20 @@ impl DeckhandApp {
 
         let out = parts.out;
         let ctx = ui.ctx().clone();
+        // Tracks dragged from a list load onto the deck they are dropped on.
+        let target =
+            ui.interact(area.response.rect, ui.id().with(("track drop", index)), Sense::hover());
+        if target.dnd_hover_payload::<crate::browser::TrackDrag>().is_some() {
+            ui.painter().rect_stroke(
+                area.response.rect,
+                4.0,
+                egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(drag) = target.dnd_release_payload::<crate::browser::TrackDrag>() {
+            self.drop_on_deck(&drag, index, &ctx);
+        }
         for (action, pressed) in out.pad_events {
             self.apply_deck_event(index, action, Value::Pressed(pressed), &ctx);
         }
@@ -297,6 +311,9 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                     .monospace(),
             );
             ui.label("BPM");
+            if deck.is_analysing() {
+                ui.spinner().on_hover_text("Detecting the beat grid and key");
+            }
             ui.separator();
             ui.label(
                 RichText::new(format!("{:+.2}%", (deck.tempo_ratio() - 1.0) * 100.0)).monospace(),
@@ -642,6 +659,78 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 {
                     p.out.status = Some(format!("Deck {}: BPM set to {bpm:.2} by tapping", index + 1));
                 }
+            });
+        }
+        E::GridEdit => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if toggle(ui, deck.grid_edit, "GRID")
+                    .on_hover_text("Edit the beat grid: move it, set the BPM, set the downbeat")
+                    .clicked()
+                {
+                    deck.grid_edit = !deck.grid_edit;
+                }
+                if !deck.grid_edit {
+                    return;
+                }
+                let Some(track) = &deck.track else { return };
+                let (straight, old_bpm) = (track.grid_is_straight(), track.grid_bpm());
+                let mut bpm = old_bpm;
+                ui.add_enabled_ui(straight, |ui| {
+                    // Shift-click for bigger steps.
+                    let step = if ui.input(|i| i.modifiers.shift) { 0.010 } else { 0.001 };
+                    let mut edited = false;
+                    if ui.small_button("◀").on_hover_text("Move the grid 1 ms earlier (Shift: 10 ms)").clicked() {
+                        edited |= deck.shift_grid(-step);
+                    }
+                    if ui.small_button("▶").on_hover_text("Move the grid 1 ms later (Shift: 10 ms)").clicked() {
+                        edited |= deck.shift_grid(step);
+                    }
+                    ui.separator();
+                    let mut changed = false;
+                    if ui.small_button("−").on_hover_text("BPM −0.01").clicked() {
+                        (bpm, changed) = (bpm - 0.01, true);
+                    }
+                    // Only a drag or typing counts: a BPM the field merely
+                    // shows (even one outside its range) is no edit.
+                    let field = ui
+                        .add(
+                            egui::DragValue::new(&mut bpm)
+                                .speed(0.01)
+                                .fixed_decimals(2)
+                                .range(20.0..=999.0)
+                                .clamp_existing_to_range(false),
+                        )
+                        .on_hover_text("The track's BPM: drag, or click and type");
+                    changed |= field.changed()
+                        && (field.dragged() || field.has_focus() || field.lost_focus());
+                    if ui.small_button("+").on_hover_text("BPM +0.01").clicked() {
+                        (bpm, changed) = (bpm + 0.01, true);
+                    }
+                    if ui.small_button("÷2").on_hover_text("Halve the BPM").clicked() {
+                        (bpm, changed) = (bpm / 2.0, true);
+                    }
+                    if ui.small_button("×2").on_hover_text("Double the BPM").clicked() {
+                        (bpm, changed) = (bpm * 2.0, true);
+                    }
+                    // Kept to two decimals, like the display.
+                    if changed && (bpm - old_bpm).abs() > 1e-9 {
+                        edited |= deck.set_grid_bpm((bpm * 100.0).round() / 100.0);
+                    }
+                    ui.separator();
+                    if ui.small_button("1.1 here").on_hover_text("Put a downbeat exactly at the playhead").clicked() {
+                        edited |= deck.downbeat_here(position);
+                    }
+                    if ui.small_button("1 ↻").on_hover_text("Make the beat nearest the playhead beat 1 of its bar (no beat moves)").clicked() {
+                        edited |= deck.renumber_here(position);
+                    }
+                    if edited {
+                        let bpm = deck.track.as_ref().map_or(0.0, |t| t.bpm);
+                        p.out.status = Some(format!("Deck {}: beat grid edited ({bpm:.2} BPM)", index + 1));
+                    }
+                })
+                .response
+                .on_disabled_hover_text("This track's grid changes tempo; only one-tempo grids can be edited for now");
             });
         }
         E::TempoFader => {

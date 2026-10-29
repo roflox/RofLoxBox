@@ -35,10 +35,11 @@ pub enum DeckElement {
     TempoFader,
     TempoReset,
     Nudge,
+    GridEdit,
 }
 
 impl DeckElement {
-    pub const ALL: [DeckElement; 28] = [
+    pub const ALL: [DeckElement; 29] = [
         Self::Header,
         Self::Title,
         Self::Info,
@@ -67,6 +68,7 @@ impl DeckElement {
         Self::TempoFader,
         Self::TempoReset,
         Self::Nudge,
+        Self::GridEdit,
     ];
 
     /// Groups for the View menu: (name, elements).
@@ -89,7 +91,14 @@ impl DeckElement {
         ("Pads", &[Self::PadModes, Self::PadShift, Self::Pads]),
         (
             "Tempo",
-            &[Self::TempoRange, Self::MasterTempo, Self::TempoFader, Self::TempoReset, Self::Nudge],
+            &[
+                Self::TempoRange,
+                Self::MasterTempo,
+                Self::TempoFader,
+                Self::TempoReset,
+                Self::Nudge,
+                Self::GridEdit,
+            ],
         ),
         ("Key", &[Self::KeyShift, Self::KeySyncTap]),
     ];
@@ -124,6 +133,7 @@ impl DeckElement {
             Self::TempoFader => "Tempo fader",
             Self::TempoReset => "Tempo reset",
             Self::Nudge => "Nudge − +",
+            Self::GridEdit => "Beat grid edit",
         }
     }
 }
@@ -272,7 +282,7 @@ impl DeckLayout {
             main: vec![
                 vec![E::Header],
                 vec![E::Title],
-                vec![E::Info],
+                vec![E::Info, E::GridEdit],
                 vec![E::Overview],
                 vec![E::Cue, E::Play, E::Sync, E::Master, E::Quantize, E::Vinyl, E::Slip],
                 vec![E::LoopInOut, E::LoopResize, E::BeatLoops, E::BeatJump],

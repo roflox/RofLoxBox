@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 deckhand-audio = { version = "0.1.0", path = "../audio" }
 deckhand-control = { version = "0.1.0", path = "../control" }
+deckhand-analysis = { version = "0.1.0", path = "../analysis" }
 deckhand-formats = { version = "0.1.0", path = "../formats" }
 deckhand-library = { version = "0.1.0", path = "../library" }
 eframe = "0.33.3"
