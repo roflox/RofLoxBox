@@ -41,39 +41,91 @@ pub const BEAT_JUMPS: [f64; 8] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0];
 /// Beat-loop pad lengths in beats.
 pub const BEAT_LOOPS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TempoRange {
-    Six,
-    Ten,
-    Sixteen,
-    Wide,
-}
+/// A tempo fader range: ±`percent` %, where 100 is WIDE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TempoRange(pub u8);
 
 impl TempoRange {
-    pub const ALL: [TempoRange; 4] =
-        [TempoRange::Six, TempoRange::Ten, TempoRange::Sixteen, TempoRange::Wide];
+    pub const SIX: TempoRange = TempoRange(6);
+    pub const TEN: TempoRange = TempoRange(10);
+    pub const SIXTEEN: TempoRange = TempoRange(16);
+    pub const WIDE: TempoRange = TempoRange(100);
+    /// The ranges TEMPO RANGE steps through unless Preferences say otherwise.
+    pub const DEFAULTS: [TempoRange; 4] = [Self::SIX, Self::TEN, Self::SIXTEEN, Self::WIDE];
+    /// Ranges offered in Preferences (others can be typed in).
+    pub const PRESETS: [TempoRange; 8] = [
+        TempoRange(4),
+        Self::SIX,
+        TempoRange(8),
+        Self::TEN,
+        Self::SIXTEEN,
+        TempoRange(25),
+        TempoRange(50),
+        Self::WIDE,
+    ];
+
+    /// A range of ±`percent` % (1–100).
+    pub fn percent(percent: u8) -> Self {
+        Self(percent.clamp(1, 100))
+    }
 
     pub fn fraction(self) -> f64 {
-        match self {
-            TempoRange::Six => 0.06,
-            TempoRange::Ten => 0.10,
-            TempoRange::Sixteen => 0.16,
-            TempoRange::Wide => 1.0,
+        f64::from(self.0.clamp(1, 100)) / 100.0
+    }
+
+    pub fn label(self) -> String {
+        if self.0 >= 100 { "WIDE".to_owned() } else { format!("±{}%", self.0) }
+    }
+
+    /// The next of `ranges` (in order, back to the first); a range not in
+    /// the list goes to the first one above it.
+    pub fn next(self, ranges: &[TempoRange]) -> Self {
+        match ranges.iter().position(|&r| r == self) {
+            Some(i) => ranges[(i + 1) % ranges.len()],
+            None => ranges
+                .iter()
+                .copied()
+                .find(|&r| r > self)
+                .or(ranges.first().copied())
+                .unwrap_or(self),
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            TempoRange::Six => "±6%",
-            TempoRange::Ten => "±10%",
-            TempoRange::Sixteen => "±16%",
-            TempoRange::Wide => "WIDE",
-        }
+    /// The one of `ranges` closest to this one.
+    pub fn nearest(self, ranges: &[TempoRange]) -> Self {
+        ranges
+            .iter()
+            .copied()
+            .min_by_key(|r| (i16::from(r.0) - i16::from(self.0)).abs())
+            .unwrap_or(self)
     }
+}
 
-    pub fn next(self) -> Self {
-        let i = Self::ALL.iter().position(|&r| r == self).unwrap_or(0);
-        Self::ALL[(i + 1) % Self::ALL.len()]
+/// Saved as the percentage; older settings wrote the names Six, Ten,
+/// Sixteen and Wide.
+impl serde::Serialize for TempoRange {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TempoRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Percent(u8),
+            Name(String),
+        }
+        Ok(match Saved::deserialize(deserializer)? {
+            Saved::Percent(p) => Self::percent(p),
+            Saved::Name(name) => match name.as_str() {
+                "Six" => Self::SIX,
+                "Sixteen" => Self::SIXTEEN,
+                "Wide" => Self::WIDE,
+                _ => Self::TEN,
+            },
+        })
     }
 }
 
@@ -339,7 +391,7 @@ impl Deck {
             cue_point: 0.0,
             previewing: false,
             tempo_fader: 0.0,
-            tempo_range: TempoRange::Ten,
+            tempo_range: TempoRange::TEN,
             sync_ratio: None,
             is_master: false,
             sync: false,
@@ -1847,11 +1899,11 @@ mod tests {
     fn a_taken_over_tempo_moves_with_the_fader() {
         // Playing at +3 % from sync; the fader moves up a tenth of its
         // travel on ±10 %: +1 % more, no jump to the fader's own position.
-        let ratio = moved_ratio(Some(1.03), 0.1, TempoRange::Ten).unwrap();
+        let ratio = moved_ratio(Some(1.03), 0.1, TempoRange::TEN).unwrap();
         assert!((ratio - 1.04).abs() < 1e-6, "{ratio}");
-        assert_eq!(moved_ratio(None, 0.5, TempoRange::Ten), None);
+        assert_eq!(moved_ratio(None, 0.5, TempoRange::TEN), None);
         // Never stopped or reversed by the fader.
-        assert_eq!(moved_ratio(Some(0.1), -1.0, TempoRange::Wide), Some(0.05));
+        assert_eq!(moved_ratio(Some(0.1), -1.0, TempoRange::WIDE), Some(0.05));
     }
 
     #[test]
@@ -1866,8 +1918,32 @@ mod tests {
 
     #[test]
     fn tempo_ranges_cycle() {
-        assert_eq!(TempoRange::Wide.next(), TempoRange::Six);
-        assert_eq!(TempoRange::Six.next(), TempoRange::Ten);
+        let ranges = TempoRange::DEFAULTS;
+        assert_eq!(TempoRange::WIDE.next(&ranges), TempoRange::SIX);
+        assert_eq!(TempoRange::SIX.next(&ranges), TempoRange::TEN);
+        // Not in the list: on to the next one above it.
+        assert_eq!(TempoRange::percent(8).next(&ranges), TempoRange::TEN);
+        // Just one range: it stays.
+        assert_eq!(TempoRange::WIDE.next(&[TempoRange::WIDE]), TempoRange::WIDE);
+        assert_eq!(TempoRange::percent(8).nearest(&ranges), TempoRange::SIX);
+        assert_eq!(TempoRange::WIDE.label(), "WIDE");
+        assert_eq!(TempoRange::percent(25).label(), "±25%");
+        assert_eq!(TempoRange::percent(0).fraction(), 0.01);
+    }
+
+    #[test]
+    fn tempo_ranges_load_old_names_and_percentages() {
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            a: TempoRange,
+            b: TempoRange,
+            c: TempoRange,
+        }
+        let saved: Saved = toml::from_str("a = \"Wide\"\nb = \"Six\"\nc = 25").unwrap();
+        assert_eq!(
+            (saved.a, saved.b, saved.c),
+            (TempoRange::WIDE, TempoRange::SIX, TempoRange::percent(25))
+        );
     }
 
     #[test]

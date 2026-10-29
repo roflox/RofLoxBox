@@ -556,7 +556,20 @@ impl DeckhandApp {
     }
 
     fn apply_preferences(&mut self) {
+        if self.config.prefs.tempo_ranges.is_empty() {
+            self.config.prefs.tempo_ranges = crate::deck::TempoRange::DEFAULTS.to_vec();
+        }
         let p = self.config.prefs.clone();
+        // A range taken off the list: stopped decks move to the nearest one;
+        // a playing deck keeps its range (and tempo) until changed.
+        if let Some(engine) = self.engine.as_mut() {
+            for (index, deck) in self.decks.iter_mut().enumerate() {
+                if !p.tempo_ranges.contains(&deck.tempo_range) && !engine.is_playing(index) {
+                    let nearest = deck.tempo_range.nearest(&p.tempo_ranges);
+                    deck.set_tempo_range(nearest, engine);
+                }
+            }
+        }
         for (index, deck) in self.decks.iter_mut().enumerate() {
             deck.prefs = DeckPrefs {
                 memory_call_lock: p.memory_call_lock,
@@ -974,7 +987,7 @@ impl DeckhandApp {
             }
             (A::TempoFader, Value::Absolute(v)) => deck.set_tempo_fader(v * 2.0 - 1.0, engine),
             (A::TempoRangeCycle, _) if pressed => {
-                let next = deck.tempo_range.next();
+                let next = deck.tempo_range.next(&self.config.prefs.tempo_ranges);
                 deck.set_tempo_range(next, engine);
             }
             (A::Quantize, _) if pressed => deck.quantize = !deck.quantize,

@@ -3,6 +3,7 @@
 use eframe::egui::{self, RichText, Ui};
 
 use crate::config::{CrossfaderCurveSetting, FaderCurveSetting, Preferences};
+use crate::deck::TempoRange;
 
 /// Pages of the Preferences window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,6 +83,9 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
                 .weak(),
             );
         });
+        section(ui, "Tempo ranges", |ui| {
+            tempo_ranges(ui, &mut p.tempo_ranges);
+        });
         section(ui, "Beat Sync master", |ui| {
             ui.checkbox(&mut p.auto_master, "Pass MASTER on when the master deck leaves the mix");
             ui.label(
@@ -158,6 +162,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.key_notation = defaults.key_notation;
             p.analysis = defaults.analysis;
             p.auto_master = defaults.auto_master;
+            p.tempo_ranges = defaults.tempo_ranges.clone();
             p.analyze_on_load = defaults.analyze_on_load;
             p.call_resizes_loop = defaults.call_resizes_loop;
             p.gate_while_playing = defaults.gate_while_playing;
@@ -234,4 +239,47 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
         p.eq_waveforms = defaults.eq_waveforms;
     }
     *p != before
+}
+
+/// The tempo ranges to step through: common ones to tick, others to add;
+/// the last one left cannot be taken away.
+fn tempo_ranges(ui: &mut Ui, ranges: &mut Vec<TempoRange>) {
+    ui.horizontal_wrapped(|ui| {
+        let extra: Vec<TempoRange> =
+            ranges.iter().copied().filter(|r| !TempoRange::PRESETS.contains(r)).collect();
+        for range in TempoRange::PRESETS.into_iter().chain(extra) {
+            let mut on = ranges.contains(&range);
+            let last = on && ranges.len() == 1;
+            let response = ui.add_enabled(!last, egui::Checkbox::new(&mut on, range.label()));
+            if response.changed() {
+                if on {
+                    ranges.push(range);
+                    ranges.sort();
+                } else {
+                    ranges.retain(|r| *r != range);
+                }
+            }
+            response.on_disabled_hover_text("At least one range stays");
+        }
+    });
+    ui.horizontal(|ui| {
+        let id = ui.id().with("new tempo range");
+        let mut percent: u8 = ui.data(|d| d.get_temp(id)).unwrap_or(12);
+        ui.label("Add ±");
+        ui.add(egui::DragValue::new(&mut percent).range(1..=99).suffix(" %"));
+        ui.data_mut(|d| d.insert_temp(id, percent));
+        let range = TempoRange::percent(percent);
+        if ui.add_enabled(!ranges.contains(&range), egui::Button::new("Add")).clicked() {
+            ranges.push(range);
+            ranges.sort();
+        }
+    });
+    ui.label(
+        RichText::new(
+            "TEMPO RANGE steps through these, and each deck's range menu offers them. Untick \
+             all but one to stay on it. WIDE is ±100 %.",
+        )
+        .small()
+        .weak(),
+    );
 }
