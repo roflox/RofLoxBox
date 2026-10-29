@@ -190,6 +190,9 @@ pub struct Preferences {
     pub start_at_first_cue: bool,
     /// Loading a track that plays on another deck picks it up there, in time.
     pub instant_doubles: bool,
+    /// MASTER passes to another playing deck when the master leaves the mix
+    /// (paused, ejected, or faded out with its channel fader or crossfader).
+    pub auto_master: bool,
     /// Auto Cue per deck: the cue goes to the first sound louder than the level.
     pub auto_cue: [bool; 4],
     pub auto_cue_level_db: f32,
@@ -241,6 +244,7 @@ impl Default for Preferences {
             call_resizes_loop: false,
             gate_while_playing: false,
             start_at_first_cue: true,
+            auto_master: true,
             instant_doubles: false,
             auto_cue: [false; 4],
             auto_cue_level_db: -60.0,

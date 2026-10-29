@@ -77,6 +77,11 @@ const MIXER_MASTER_PARTS: [crate::parts::MixerPart; 4] = [
 const DRIFT_CHECK: Duration = Duration::from_millis(500);
 /// Phase error (in beats) that sync corrects.
 const DRIFT_LIMIT: f64 = 0.02;
+/// Auto master: below this gain (about −30 dB) the master has left the mix…
+const OUT_OF_MIX: f32 = 0.03;
+/// …and a deck must be above this one (about −20 dB) to take over, so a
+/// fade halfway does not pass MASTER back and forth.
+const IN_MIX: f32 = 0.1;
 
 /// A screen block dropped on an edge of another.
 type ScreenMove = (
@@ -99,6 +104,9 @@ pub struct DeckhandApp {
     jog_resolution: Option<u32>,
     decks: Vec<Deck>,
     master: Option<usize>,
+    /// The master deck has been heard in the mix since it became master;
+    /// only then does leaving the mix pass MASTER on.
+    master_heard: Option<usize>,
     last_drift_check: Instant,
     crossfader: f32,
     master_volume: f32,
@@ -211,6 +219,7 @@ impl DeckhandApp {
             jog_resolution: None,
             decks: (0..DECKS).map(Deck::new).collect(),
             master: None,
+            master_heard: None,
             last_drift_check: Instant::now(),
             crossfader: 0.0,
             master_volume: 0.8,
@@ -468,7 +477,9 @@ impl DeckhandApp {
         self.save_track_edits();
         let Some(engine) = self.engine.as_mut() else { return };
         self.decks[index].eject(engine);
-        if self.master == Some(index) {
+        if self.master == Some(index)
+            && !(self.config.prefs.auto_master && self.hand_over_master(index))
+        {
             self.master = None;
         }
     }
@@ -655,14 +666,79 @@ impl DeckhandApp {
     // Sync
 
     /// The deck others follow: the chosen master if loaded, otherwise a
-    /// playing deck that is not itself synced.
+    /// playing deck that is not itself synced (an audible one first).
     fn master_deck(&self) -> Option<usize> {
         let engine = self.engine.as_ref()?;
         self.master.filter(|&m| self.decks[m].track.is_some()).or_else(|| {
-            (0..self.deck_count()).find(|&d| {
-                self.decks[d].track.is_some() && !self.decks[d].sync && engine.is_playing(d)
-            })
+            let free = |d: &usize| {
+                self.decks[*d].track.is_some() && !self.decks[*d].sync && engine.is_playing(*d)
+            };
+            let decks = 0..self.deck_count();
+            decks
+                .clone()
+                .filter(free)
+                .find(|&d| self.mix_gain(d) > IN_MIX)
+                .or_else(|| decks.clone().find(free))
         })
+    }
+
+    /// How loud a deck reaches the mix through its channel fader and the
+    /// crossfader (0–1).
+    fn mix_gain(&self, deck: usize) -> f32 {
+        let d = &self.decks[deck];
+        let p = &self.config.prefs;
+        deckhand_audio::channel_gain(
+            d.volume,
+            d.side,
+            self.crossfader,
+            p.crossfader_curve.engine(),
+            p.fader_curve.engine(),
+        )
+    }
+
+    /// Whether a deck is loaded, playing and louder than `threshold` in the mix.
+    fn in_mix(&self, deck: usize, threshold: f32) -> bool {
+        self.decks[deck].track.is_some()
+            && self.engine.as_ref().is_some_and(|e| e.is_playing(deck))
+            && self.mix_gain(deck) > threshold
+    }
+
+    /// Auto master: when the master deck leaves the mix (paused, or faded
+    /// out with its fader or the crossfader), the loudest other deck in the
+    /// mix takes over. Without another one, the master stays. Call every
+    /// frame.
+    fn update_master(&mut self) {
+        if !self.config.prefs.auto_master {
+            return;
+        }
+        let Some(current) = self.master else { return };
+        let gains = self.playing_gains();
+        // A master chosen while silent (a track being prepared) keeps it
+        // until it has been heard.
+        if gains[current].is_some_and(|g| g > IN_MIX) {
+            self.master_heard = Some(current);
+        }
+        if let Some(next) = next_master(&gains, current, self.master_heard == Some(current)) {
+            self.set_master_from(current, next);
+        }
+    }
+
+    /// Each deck's gain in the mix while it plays a track (`None` otherwise).
+    fn playing_gains(&self) -> Vec<Option<f32>> {
+        (0..self.deck_count()).map(|d| self.in_mix(d, -1.0).then(|| self.mix_gain(d))).collect()
+    }
+
+    /// Makes the loudest deck in the mix (other than `from`) the master.
+    fn hand_over_master(&mut self, from: usize) -> bool {
+        let Some(next) = loudest_in_mix(&self.playing_gains(), from) else { return false };
+        self.set_master_from(from, next);
+        true
+    }
+
+    fn set_master_from(&mut self, from: usize, next: usize) {
+        self.master = Some(next);
+        self.status =
+            Some(format!("Deck {} is now the master (deck {} left the mix)", next + 1, from + 1));
     }
 
     fn toggle_sync(&mut self, deck: usize) {
@@ -730,6 +806,11 @@ impl DeckhandApp {
     }
 
     fn update_sync(&mut self) {
+        self.update_master();
+        let master = self.master_deck();
+        for (d, deck) in self.decks.iter_mut().enumerate() {
+            deck.is_master = master == Some(d);
+        }
         // A jog bend (handled in the audio engine) that just ended leaves
         // the phase where the DJ put it.
         if let Some(engine) = &self.engine {
@@ -2932,6 +3013,28 @@ impl DeckhandApp {
     }
 }
 
+/// Auto master's choice: the deck to pass MASTER to, if any. `gains` holds
+/// each deck's gain in the mix while it plays (`None`: paused or empty);
+/// `heard`: the master has been heard since it became master.
+fn next_master(gains: &[Option<f32>], current: usize, heard: bool) -> Option<usize> {
+    let left = gains.get(current).copied().flatten().is_none_or(|g| g <= OUT_OF_MIX);
+    if !heard || !left {
+        return None;
+    }
+    loudest_in_mix(gains, current)
+}
+
+/// The loudest deck clearly in the mix, other than `except` (the lower
+/// number on a tie).
+fn loudest_in_mix(gains: &[Option<f32>], except: usize) -> Option<usize> {
+    gains
+        .iter()
+        .enumerate()
+        .filter_map(|(d, g)| g.filter(|&g| d != except && g > IN_MIX).map(|g| (d, g)))
+        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map(|(d, _)| d)
+}
+
 /// A beat count as shown on jump buttons: 1/4, 1/2, 1, 2, ….
 fn beats_label(beats: f64) -> String {
     if beats >= 1.0 { format!("{beats}") } else { format!("1/{}", (1.0 / beats).round()) }
@@ -3141,4 +3244,34 @@ fn toggle(ui: &mut Ui, on: bool, label: &str) -> egui::Response {
 /// A button lit in its own colour while `on`.
 fn toggle_in(ui: &mut Ui, on: bool, label: &str, accent: Color32) -> egui::Response {
     crate::widgets::lit_button(ui, label, on, accent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn master_passes_to_the_loudest_deck_in_the_mix() {
+        // Deck 0 is master and faded out; 1 plays full, 2 plays quietly, 3 is paused.
+        let gains = [Some(0.0), Some(1.0), Some(0.5), None];
+        assert_eq!(next_master(&gains, 0, true), Some(1));
+        // Paused or ejected counts as out of the mix too.
+        assert_eq!(next_master(&[None, Some(0.2)], 0, true), Some(1));
+    }
+
+    #[test]
+    fn master_stays_while_heard_or_without_a_successor() {
+        // Still audible (a fade in progress): no change.
+        assert_eq!(next_master(&[Some(0.05), Some(1.0)], 0, true), None);
+        // Out of the mix, but nobody else is clearly in it.
+        assert_eq!(next_master(&[Some(0.0), Some(0.08), None], 0, true), None);
+        // Chosen while silent (a track being prepared): kept until heard.
+        assert_eq!(next_master(&[Some(0.0), Some(1.0)], 0, false), None);
+    }
+
+    #[test]
+    fn ties_go_to_the_lower_deck() {
+        assert_eq!(loudest_in_mix(&[None, Some(1.0), Some(1.0)], 0), Some(1));
+        assert_eq!(loudest_in_mix(&[Some(1.0), Some(1.0)], 0), Some(1));
+    }
 }

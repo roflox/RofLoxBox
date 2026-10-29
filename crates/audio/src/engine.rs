@@ -627,6 +627,24 @@ pub enum FaderCurve {
     Fast,
 }
 
+/// How loud a channel reaches the mix from its fader and crossfader
+/// (0 = silent, 1 = full), as the engine applies them; trim and EQ aside.
+pub fn channel_gain(
+    volume: f32,
+    side: CrossfaderSide,
+    crossfader: f32,
+    crossfader_curve: CrossfaderCurve,
+    fader_curve: FaderCurve,
+) -> f32 {
+    let [a, b] = crossfader_gains(crossfader, crossfader_curve);
+    let side_gain = match side {
+        CrossfaderSide::A => a,
+        CrossfaderSide::B => b,
+        CrossfaderSide::Thru => 1.0,
+    };
+    fader_curve_gain(volume, fader_curve) * side_gain
+}
+
 /// Gains of the A and B sides.
 fn crossfader_gains(position: f32, curve: CrossfaderCurve) -> [f32; 2] {
     let x = position.clamp(-1.0, 1.0);
@@ -1127,6 +1145,21 @@ impl Mixer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn channel_gain_follows_fader_and_crossfader() {
+        use CrossfaderCurve as X;
+        use FaderCurve as F;
+        assert_eq!(channel_gain(1.0, CrossfaderSide::Thru, 1.0, X::Standard, F::Standard), 1.0);
+        assert_eq!(channel_gain(0.0, CrossfaderSide::A, 0.0, X::Standard, F::Standard), 0.0);
+        // Side A with the crossfader all the way to B is cut.
+        assert!(channel_gain(1.0, CrossfaderSide::A, 1.0, X::Standard, F::Standard) < 1e-6);
+        // Half fader on the standard curve is a quarter.
+        assert!(
+            (channel_gain(0.5, CrossfaderSide::B, 1.0, X::Standard, F::Standard) - 0.25).abs()
+                < 1e-6
+        );
+    }
+
     use super::*;
 
     fn mixer(rate: u32) -> (Mixer, rtrb::Producer<Command>, Arc<Shared>) {
