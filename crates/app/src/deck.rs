@@ -252,6 +252,9 @@ pub struct Deck {
     pub tempo_range: TempoRange,
     /// Tempo set by sync, overriding the fader.
     pub sync_ratio: Option<f64>,
+    /// This deck is the master the synced decks follow (kept up to date by
+    /// the app): its own tempo fader stays in charge, SYNC or not.
+    pub is_master: bool,
     pub sync: bool,
     pub quantize: bool,
     pub vinyl: bool,
@@ -338,6 +341,7 @@ impl Deck {
             tempo_fader: 0.0,
             tempo_range: TempoRange::Ten,
             sync_ratio: None,
+            is_master: false,
             sync: false,
             quantize: true,
             vinyl: true,
@@ -1021,10 +1025,29 @@ impl Deck {
     // Tempo
 
     pub fn set_tempo_fader(&mut self, value: f32, engine: &mut Engine) {
-        self.tempo_fader = value.clamp(-1.0, 1.0);
-        if !self.sync {
-            self.apply_tempo(engine);
+        let moved = value.clamp(-1.0, 1.0) - self.tempo_fader;
+        self.tempo_fader += moved;
+        if self.sync && !self.is_master {
+            // A follower's tempo comes from the master.
+            return;
         }
+        // A master still playing at the tempo sync gave it (it took over
+        // from another deck) moves from there, so taking over never jumps.
+        self.sync_ratio = moved_ratio(self.sync_ratio, moved, self.tempo_range);
+        self.apply_tempo(engine);
+    }
+
+    /// Tempo back to ±0 (the master's too, with the synced decks following).
+    pub fn reset_tempo(&mut self, engine: &mut Engine) {
+        if self.is_master || !self.sync {
+            self.sync_ratio = None;
+        }
+        self.set_tempo_fader(0.0, engine);
+    }
+
+    /// Whether the tempo fader does anything now (SYNC on a follower: no).
+    pub fn tempo_fader_active(&self) -> bool {
+        !self.sync || self.is_master
     }
 
     pub fn toggle_slip(&mut self, engine: &mut Engine) {
@@ -1214,7 +1237,7 @@ impl Deck {
 
     pub fn set_tempo_range(&mut self, range: TempoRange, engine: &mut Engine) {
         self.tempo_range = range;
-        if !self.sync {
+        if self.tempo_fader_active() && self.sync_ratio.is_none() {
             self.apply_tempo(engine);
         }
     }
@@ -1434,6 +1457,12 @@ impl Default for DeckPrefs {
             analyze_on_load: true,
         }
     }
+}
+
+/// A taken-over tempo (`ratio`, from sync) after the fader moved by
+/// `moved`: shifted by as much as the fader would shift its own tempo.
+fn moved_ratio(ratio: Option<f64>, moved: f32, range: TempoRange) -> Option<f64> {
+    ratio.map(|r| (r + f64::from(moved) * range.fraction()).max(0.05))
 }
 
 /// What detection found for a loaded track.
@@ -1812,6 +1841,27 @@ mod tests {
             beat.0 = (beat.0 * 1000.0 + 0.4).round() / 1000.0;
         }
         assert!(track.grid_is_straight());
+    }
+
+    #[test]
+    fn a_taken_over_tempo_moves_with_the_fader() {
+        // Playing at +3 % from sync; the fader moves up a tenth of its
+        // travel on ±10 %: +1 % more, no jump to the fader's own position.
+        let ratio = moved_ratio(Some(1.03), 0.1, TempoRange::Ten).unwrap();
+        assert!((ratio - 1.04).abs() < 1e-6, "{ratio}");
+        assert_eq!(moved_ratio(None, 0.5, TempoRange::Ten), None);
+        // Never stopped or reversed by the fader.
+        assert_eq!(moved_ratio(Some(0.1), -1.0, TempoRange::Wide), Some(0.05));
+    }
+
+    #[test]
+    fn only_a_followers_fader_is_inactive() {
+        let mut deck = Deck::new(0);
+        assert!(deck.tempo_fader_active());
+        deck.sync = true;
+        assert!(!deck.tempo_fader_active());
+        deck.is_master = true;
+        assert!(deck.tempo_fader_active());
     }
 
     #[test]

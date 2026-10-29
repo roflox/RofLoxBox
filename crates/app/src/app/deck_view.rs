@@ -737,8 +737,10 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             // Like on a CDJ, pulling the fader down makes the track faster.
             let mut fader = -deck.tempo_fader;
             ui.spacing_mut().slider_width = if compact { 110.0 } else { 220.0 };
-            let slider =
-                ui.add_enabled(!deck.sync, Slider::new(&mut fader, -1.0..=1.0).vertical().show_value(false));
+            let slider = ui.add_enabled(
+                deck.tempo_fader_active(),
+                Slider::new(&mut fader, -1.0..=1.0).vertical().show_value(false),
+            );
             if slider.changed() {
                 deck.set_tempo_fader(-fader, engine);
             }
@@ -746,7 +748,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::TempoReset => {
             if ui.button("Reset").on_hover_text("Tempo back to ±0").clicked() {
-                deck.set_tempo_fader(0.0, engine);
+                deck.reset_tempo(engine);
             }
         }
         E::Nudge => {

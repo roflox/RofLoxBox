@@ -82,6 +82,18 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
                 .weak(),
             );
         });
+        section(ui, "Beat Sync master", |ui| {
+            ui.checkbox(&mut p.auto_master, "Pass MASTER on when the master deck leaves the mix");
+            ui.label(
+                RichText::new(
+                    "When the master is paused, ejected or faded out (channel fader or \
+                     crossfader), the loudest other playing deck becomes the master; synced \
+                     decks then follow it.",
+                )
+                .small()
+                .weak(),
+            );
+        });
         section(ui, "Memory Cue Call Lock", |ui| {
             lock(ui, &mut p.memory_call_lock);
             ui.label(RichText::new("Locked: memory cues are not called on a playing deck.").small().weak());
@@ -145,6 +157,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
             p.analysis = defaults.analysis;
+            p.auto_master = defaults.auto_master;
             p.analyze_on_load = defaults.analyze_on_load;
             p.call_resizes_loop = defaults.call_resizes_loop;
             p.gate_while_playing = defaults.gate_while_playing;
