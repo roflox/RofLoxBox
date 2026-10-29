@@ -64,6 +64,40 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_secs(seconds - seconds / 2));
         return Ok(());
     }
+    if mode == "master" {
+        // Decks 1 and 2 already playing (autoplay). Deck 1 loud, deck 2
+        // silent and synced; MASTER pressed on deck 1; then the faders swap.
+        let script: &[(&str, [u8; 3])] = &[
+            ("deck 1 fader up", [0xb0, 0x13, 0x7f]),
+            ("deck 1 fader LSB", [0xb0, 0x33, 0x7f]),
+            ("deck 2 fader down", [0xb1, 0x13, 0x00]),
+            ("deck 2 fader LSB", [0xb1, 0x33, 0x00]),
+            ("deck 2 SYNC", [0x91, 0x58, 0x7f]),
+            ("deck 2 SYNC release", [0x91, 0x58, 0x00]),
+            ("deck 1 MASTER (SHIFT+SYNC)", [0x90, 0x5c, 0x7f]),
+            ("deck 1 MASTER release", [0x90, 0x5c, 0x00]),
+        ];
+        let swap: &[(&str, [u8; 3])] = &[
+            ("deck 2 fader up", [0xb1, 0x13, 0x7f]),
+            ("deck 2 fader LSB", [0xb1, 0x33, 0x7f]),
+            ("deck 1 fader down", [0xb0, 0x13, 0x00]),
+            ("deck 1 fader LSB", [0xb0, 0x33, 0x00]),
+        ];
+        for (what, message) in script {
+            println!("SEND {what}: {message:02X?}");
+            device.send(message)?;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        println!("--- swapping faders");
+        for (what, message) in swap {
+            println!("SEND {what}: {message:02X?}");
+            device.send(message)?;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        std::thread::sleep(Duration::from_secs(seconds - seconds / 2));
+        return Ok(());
+    }
     if mode == "reloop" {
         // Deck 1: RELOOP/EXIT with no loop set (picks up the memory loop).
         for message in

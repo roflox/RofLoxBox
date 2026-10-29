@@ -708,6 +708,11 @@ impl DeckhandApp {
     /// mix takes over. Without another one, the master stays. Call every
     /// frame.
     fn update_master(&mut self) {
+        // The deck synced decks follow is the master, chosen or not (so it
+        // shows as master and can hand over).
+        if self.master.is_none() && self.decks.iter().any(|d| d.sync) {
+            self.master = self.master_deck();
+        }
         if !self.config.prefs.auto_master {
             return;
         }
@@ -733,6 +738,14 @@ impl DeckhandApp {
         let Some(next) = loudest_in_mix(&self.playing_gains(), from) else { return false };
         self.set_master_from(from, next);
         true
+    }
+
+    /// MASTER pressed: this deck leads from now on. Like on CDJs and in
+    /// rekordbox, pressing it on the master changes nothing.
+    fn make_master(&mut self, deck: usize) {
+        if self.decks[deck].track.is_some() {
+            self.master = Some(deck);
+        }
     }
 
     fn set_master_from(&mut self, from: usize, next: usize) {
@@ -899,10 +912,7 @@ impl DeckhandApp {
         match (action, value) {
             (A::PlayPause, _) if pressed => return self.play_pause(d),
             (A::Sync, _) if pressed => return self.toggle_sync(d),
-            (A::SyncMaster, _) if pressed => {
-                self.master = if self.master == Some(d) { None } else { Some(d) };
-                return;
-            }
+            (A::SyncMaster, _) if pressed => return self.make_master(d),
             (A::Load, _) if pressed => return self.load_selected(d, ctx),
             (A::KeySync, _) if pressed => return self.key_sync(d),
             (A::TapBpm, _) if pressed => {
