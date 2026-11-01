@@ -13,7 +13,6 @@ const BODY: Color32 = Color32::from_rgb(34, 34, 38);
 const RIM: Color32 = Color32::from_rgb(70, 70, 76);
 const TRACK: Color32 = Color32::from_rgb(55, 55, 60);
 const ARC: Color32 = Color32::from_rgb(90, 170, 255);
-const LABEL: Color32 = Color32::from_rgb(170, 170, 176);
 /// Knobs turn through 270°, from lower left to lower right.
 const SWEEP: f32 = 1.5 * PI;
 const START: f32 = 0.75 * PI;
@@ -80,7 +79,7 @@ pub fn knob(
         Align2::CENTER_BOTTOM,
         label,
         FontId::proportional(9.5),
-        LABEL,
+        ui.visuals().text_color(),
     );
     response
 }
@@ -212,26 +211,20 @@ pub fn lit_button_sized(
         let enabled = ui.is_enabled();
         let hovered = response.hovered() && enabled;
         let pressed = response.is_pointer_button_down_on() && enabled;
-        let gray = Color32::from_gray;
-        let fill = match (on, pressed, hovered) {
-            (true, _, _) => accent.gamma_multiply(0.25),
-            (false, true, _) => gray(58),
-            (false, false, true) => gray(44),
-            _ => gray(32),
+        let visuals = ui.visuals();
+        let state = match (pressed, hovered) {
+            (true, _) => &visuals.widgets.active,
+            (false, true) => &visuals.widgets.hovered,
+            _ => &visuals.widgets.inactive,
         };
-        let outline = if on {
-            accent
-        } else if hovered {
-            gray(100)
-        } else {
-            gray(62)
-        };
+        let fill = if on { accent.gamma_multiply(0.25) } else { state.bg_fill };
+        let outline = if on { accent } else { state.bg_stroke.color };
         let text = if !enabled {
-            gray(85)
+            visuals.weak_text_color()
         } else if on {
-            accent.lerp_to_gamma(Color32::WHITE, 0.35)
+            accent.lerp_to_gamma(visuals.strong_text_color(), 0.35)
         } else {
-            gray(190)
+            visuals.text_color()
         };
         let painter = ui.painter();
         painter.rect(
@@ -274,9 +267,9 @@ pub fn round_button(
         let fill = if lit {
             accent.gamma_multiply(0.55)
         } else if hovered {
-            Color32::from_gray(40)
+            ui.visuals().widgets.hovered.bg_fill
         } else {
-            Color32::from_gray(26)
+            ui.visuals().widgets.inactive.bg_fill
         };
         let ring = if !enabled {
             Color32::from_gray(70)
@@ -288,7 +281,7 @@ pub fn round_button(
         let mark = if !enabled {
             Color32::from_gray(90)
         } else if lit {
-            Color32::WHITE
+            ui.visuals().strong_text_color()
         } else {
             accent
         };
@@ -329,32 +322,52 @@ pub fn round_button(
 }
 
 /// Dark, flat look in the spirit of rekordbox's performance screen.
-pub fn apply_theme(ctx: &eframe::egui::Context) {
-    use eframe::egui::Visuals;
+pub fn apply_theme(ctx: &eframe::egui::Context, theme: crate::config::Theme) {
+    use crate::config::Theme;
+    use eframe::egui::{ThemePreference, Visuals};
     let gray = Color32::from_gray;
-    let mut v = Visuals::dark();
-    v.panel_fill = gray(20);
-    v.window_fill = gray(26);
-    v.extreme_bg_color = gray(12);
-    v.faint_bg_color = gray(27);
-    v.window_stroke = Stroke::new(1.0_f32, gray(55));
-    v.selection.bg_fill = Color32::from_rgb(28, 88, 168);
-    v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     let corner = CornerRadius::same(3);
-    for (widget, fill, outline) in [
-        (&mut v.widgets.inactive, 32, 60),
-        (&mut v.widgets.hovered, 44, 100),
-        (&mut v.widgets.active, 58, 120),
-        (&mut v.widgets.open, 40, 90),
-    ] {
+    let dark = theme == Theme::Dark;
+    // Fixed either way, so that the system's theme does not get a say.
+    ctx.set_theme(if dark { ThemePreference::Dark } else { ThemePreference::Light });
+    let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+    if dark {
+        v.panel_fill = gray(20);
+        v.window_fill = gray(26);
+        v.extreme_bg_color = gray(12);
+        v.faint_bg_color = gray(27);
+        v.window_stroke = Stroke::new(1.0_f32, gray(55));
+        v.selection.bg_fill = Color32::from_rgb(28, 88, 168);
+        v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    } else {
+        v.panel_fill = gray(236);
+        v.window_fill = gray(246);
+        v.extreme_bg_color = gray(252);
+        v.faint_bg_color = gray(226);
+        v.window_stroke = Stroke::new(1.0_f32, gray(180));
+        v.selection.bg_fill = Color32::from_rgb(120, 170, 240);
+        v.selection.stroke = Stroke::new(1.0_f32, Color32::BLACK);
+    }
+    let shades = if dark {
+        [(32, 60), (44, 100), (58, 120), (40, 90)]
+    } else {
+        [(222, 175), (208, 140), (192, 120), (214, 150)]
+    };
+    let widgets = [
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ];
+    for (widget, (fill, outline)) in widgets.into_iter().zip(shades) {
         widget.corner_radius = corner;
         widget.bg_fill = gray(fill);
         widget.weak_bg_fill = gray(fill);
         widget.bg_stroke = Stroke::new(1.0_f32, gray(outline));
         widget.expansion = 0.0;
     }
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, gray(195));
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, gray(45));
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, gray(if dark { 195 } else { 40 }));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, gray(if dark { 45 } else { 200 }));
     v.widgets.noninteractive.corner_radius = corner;
     ctx.set_visuals(v);
     ctx.style_mut(|style| {
@@ -375,7 +388,8 @@ pub fn disclosure(ui: &mut Ui, open: bool) -> Response {
     } else {
         vec![pos2(c.x - s * 0.6, c.y - s), pos2(c.x - s * 0.6, c.y + s), pos2(c.x + s * 0.8, c.y)]
     };
-    let color = if response.hovered() { Color32::WHITE } else { Color32::from_gray(170) };
+    let visuals = ui.visuals();
+    let color = if response.hovered() { visuals.strong_text_color() } else { visuals.text_color() };
     ui.painter().add(Shape::convex_polygon(points, color, Stroke::NONE));
     response
 }

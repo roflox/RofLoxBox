@@ -182,12 +182,15 @@ Done (milestone 2, 2026-10-25):
 - Verified end to end with a virtual GRV6 (`fake_grv6` example): import,
   input translation (incl. 14-bit faders) and LED output.
 
+- Keyboard mixing (`app/keyboard.rs`): rekordbox's Performance 1 keys, by
+  physical position, rebindable in Preferences. Not yet: Slip Reverse, next/previous track,
+  grid editing keys.
+
 Next:
-1. Keyboard shortcuts.
-2. Stems / Part Isolator / Drum Swap (need a separation model).
-3. Beat FX and the sampler; stems (needs separation models).
-4. Save hot cues / cue points set in deckhand.
-5. Tune jog scratch resolution on hardware (`SCRATCH_SECONDS_PER_STEP`).
+1. Stems / Part Isolator / Drum Swap (need a separation model).
+2. Beat FX and the sampler; stems (needs separation models).
+3. Save hot cues / cue points set in deckhand.
+4. Tune jog scratch resolution on hardware (`SCRATCH_SECONDS_PER_STEP`).
 
 ### Phase 5 — audio and analysis
 1. Decoding (`symphonia`), resampling, output (`cpal`).

@@ -4,6 +4,7 @@ mod collection_view;
 mod deck_view;
 mod explorer_view;
 mod hotplug;
+mod keyboard;
 mod library_tree;
 mod recording;
 mod selection;
@@ -32,7 +33,7 @@ use crate::controller::Controller;
 use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, display_key, key_sync_shift};
 use crate::effects::{Effects, pad_fx_label};
 use crate::library::find_exports;
-use crate::prefs_view::{PrefsTab, deck_prefs, mixer_prefs};
+use crate::prefs_view::{PrefsTab, appearance_prefs, deck_prefs, mixer_prefs};
 use collection_view::CollectionView;
 use deckhand_library::Collection;
 
@@ -145,6 +146,7 @@ pub struct DeckhandApp {
     recording: Option<deckhand_audio::Recording>,
     /// The deck each side of the controller drives (left 1/3, right 2/4).
     active_decks: [usize; 2],
+    keyboard: keyboard::KeyboardMixer,
     /// Position of the selected row in the list, telling duplicate tracks
     /// apart (`None`: the first copy).
     selected_position: Option<usize>,
@@ -183,8 +185,9 @@ struct Screenshot {
 
 impl DeckhandApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        crate::widgets::apply_theme(&cc.egui_ctx);
         let mut config = Config::load();
+        crate::widgets::apply_theme(&cc.egui_ctx, config.prefs.theme);
+        let keyboard = keyboard::KeyboardMixer::new(&config.prefs.key_bindings);
         if let Some(root) = std::env::var_os("DECKHAND_LIBRARY") {
             config.library_root = Some(root.into());
         }
@@ -242,6 +245,8 @@ impl DeckhandApp {
                 || std::env::var_os("DECKHAND_SHOW_PREFS").is_some(),
             prefs_tab: if std::env::var_os("DECKHAND_SHOW_MIXER_PREFS").is_some() {
                 PrefsTab::Mixer
+            } else if std::env::var_os("DECKHAND_SHOW_KEYBOARD_PREFS").is_some() {
+                PrefsTab::Keyboard
             } else if std::env::var_os("DECKHAND_SHOW_AUDIO").is_some() {
                 PrefsTab::Audio
             } else {
@@ -254,6 +259,7 @@ impl DeckhandApp {
             reveal_playlist: false,
             selected_position: None,
             active_decks: [0, 1],
+            keyboard,
             recording: None,
             moved_window: false,
             hotplug: Default::default(),
@@ -266,7 +272,7 @@ impl DeckhandApp {
             import_choice: None,
             cue_held: [false; DECKS],
             pad_held: [[None; HOT_CUES]; DECKS],
-            seconds_visible: 8.0,
+            seconds_visible: keyboard::DEFAULT_SECONDS_VISIBLE,
             status: None,
             screenshot: std::env::var_os("DECKHAND_SCREENSHOT").map(|p| {
                 let delay = std::env::var("DECKHAND_SCREENSHOT_DELAY")
@@ -1346,6 +1352,7 @@ impl DeckhandApp {
 impl eframe::App for DeckhandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Before anything is drawn, so focused widgets don't take the arrows.
+        self.mixing_keys(ctx);
         self.library_keys(ctx);
         // winit's window teardown can trip an AppKit exception on recent macOS;
         // nothing needs cleaning up, so leave directly.
@@ -1651,8 +1658,8 @@ impl DeckhandApp {
         }
     }
 
-    /// One deck's scrolling waveform; dragging it moves through the track,
-    /// clicking jumps there (not on a playing deck with Needle Lock on).
+    /// One deck's scrolling waveform; dragging it stops the deck and moves
+    /// through the track, clicking jumps there (not on a playing deck with Needle Lock on).
     fn deck_waveform(&mut self, ui: &mut Ui, index: usize, size: egui::Vec2, vertical: bool) {
         // The zoom is real time: a deck playing faster shows more of its
         // track, so beats of synced decks line up across the whole width.
@@ -1662,6 +1669,7 @@ impl DeckhandApp {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         let mut jump = None;
+        let mut drag = None;
         match &deck.track {
             Some(track) => {
                 let position = engine.display_position_secs(index);
@@ -1692,8 +1700,7 @@ impl DeckhandApp {
                     let delta = response.drag_delta();
                     let (moved, length) =
                         if vertical { (delta.y, rect.height()) } else { (-delta.x, rect.width()) };
-                    let seconds = f64::from(moved) / f64::from(length) * visible;
-                    engine.send(Command::Shift { deck: index, seconds });
+                    drag = Some(f64::from(moved) / f64::from(length) * visible);
                 }
                 if response.clicked()
                     && let Some(pointer) = response.interact_pointer_pos()
@@ -1705,6 +1712,16 @@ impl DeckhandApp {
             None => {
                 painter.rect_filled(rect, 0.0, Color32::from_gray(12));
             }
+        }
+        let deck = &mut self.decks[index];
+        if response.drag_started() {
+            deck.grab_waveform(engine);
+        }
+        if let Some(seconds) = drag {
+            deck.drag_waveform(seconds, engine);
+        }
+        if !response.dragged() {
+            deck.release_waveform(engine);
         }
         if let Some(seconds) = jump {
             if self.config.prefs.needle_lock && engine.is_playing(index) {
@@ -2054,7 +2071,11 @@ impl DeckhandApp {
         let fader_height =
             (ui.available_height() - knobs * (channel_knob + 16.0) - 125.0).clamp(60.0, 180.0);
         let panel = egui::Frame::new()
-            .fill(Color32::from_rgb(22, 22, 25))
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(22, 22, 25)
+            } else {
+                Color32::from_gray(226)
+            })
             .corner_radius(6)
             .inner_margin(6.0);
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
@@ -2147,7 +2168,7 @@ impl DeckhandApp {
                                 let cue_fill = if deck.headphone_cue {
                                     CUE_COLOR
                                 } else {
-                                    Color32::from_gray(48)
+                                    ui.visuals().widgets.inactive.bg_fill
                                 };
                                 let cue = egui::Button::new(RichText::new("CUE").small().strong())
                                     .fill(cue_fill)
@@ -2691,6 +2712,14 @@ impl DeckhandApp {
                         prefs_changed |= mixer_prefs(ui, &mut self.config.prefs);
                         return;
                     }
+                    PrefsTab::Keyboard => {
+                        prefs_changed |= self.keyboard.prefs_ui(ui, &mut self.config.prefs);
+                        return;
+                    }
+                    PrefsTab::Appearance => {
+                        prefs_changed |= appearance_prefs(ui, &mut self.config.prefs);
+                        return;
+                    }
                     PrefsTab::Audio => {}
                 }
                 egui::Grid::new("audio settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
@@ -2776,6 +2805,7 @@ impl DeckhandApp {
         );
         self.show_prefs = open;
         if prefs_changed {
+            crate::widgets::apply_theme(ctx, self.config.prefs.theme);
             self.config.save();
             self.apply_preferences();
         }
