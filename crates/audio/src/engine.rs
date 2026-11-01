@@ -1422,6 +1422,51 @@ mod tests {
     }
 
     #[test]
+    fn held_deck_stops_and_only_moves_with_the_drag() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, shared) = mixer(rate);
+        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        let mut out = vec![0f32; 256 * 2];
+        mixer.render(&mut out, 2);
+        let grabbed_at = position(&shared, 0);
+        tx.push(Command::Hold { deck: 0, held: true }).unwrap();
+        // Stops at once, a few milliseconds of braking from where it was held.
+        for _ in 0..40 {
+            mixer.render(&mut out, 2);
+        }
+        let held_at = position(&shared, 0);
+        assert!((held_at - grabbed_at).abs() < 0.03, "{held_at} from {grabbed_at}");
+        // And stays there, however long the hand does.
+        for _ in 0..200 {
+            mixer.render(&mut out, 2);
+        }
+        assert!((position(&shared, 0) - held_at).abs() < 0.001);
+        // Dragged back, it goes there and stays: nothing pulls it forward.
+        tx.push(Command::JogMove { deck: 0, seconds: -0.5 }).unwrap();
+        for _ in 0..400 {
+            mixer.render(&mut out, 2);
+        }
+        let dragged_to = position(&shared, 0);
+        assert!((dragged_to - (held_at - 0.5)).abs() < 0.01, "at {dragged_to}");
+        for _ in 0..200 {
+            mixer.render(&mut out, 2);
+        }
+        assert!((position(&shared, 0) - dragged_to).abs() < 0.001);
+        // Let go: it plays on from there.
+        tx.push(Command::Hold { deck: 0, held: false }).unwrap();
+        for _ in 0..40 {
+            mixer.render(&mut out, 2);
+        }
+        let before = position(&shared, 0);
+        assert!((before - dragged_to).abs() < 0.3);
+        mixer.render(&mut out, 2);
+        assert!(position(&shared, 0) > before);
+    }
+
+    #[test]
     fn released_record_follows_the_coasting_platter() {
         let rate = 48_000;
         let (mut mixer, mut tx, shared) = mixer(rate);

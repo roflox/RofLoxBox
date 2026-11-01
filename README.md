@@ -54,6 +54,15 @@ eight audio files in the `samples` folder next to the config. Decks have
 SLIP, key shift / key sync and TAP BPM; controller pads also cover Pad FX,
 Key Shift and Keyboard modes.
 
+The computer keyboard mixes too, with the keys of rekordbox's Performance 1
+preset: `Z`/`N` play, `A`/`H` cue, `Q`/`Y` sync, `W` `E`/`U` `I` pitch bend,
+`1`–`4`/`6`–`9` hot cues, `D` `F` `G`/`K` `L` `;` loops, Shift + arrows load.
+Preferences → Keyboard lists them all, lets you move any of them and turns
+them off.
+
+Dragging a running waveform stops the deck under the mouse, and it plays on
+from there when let go. Preferences → Appearance has dark and light themes.
+
 ### Windows
 
 `scripts/build-windows.sh` cross-compiles a self-contained 64-bit Windows

@@ -52,17 +52,6 @@ impl TempoRange {
     pub const WIDE: TempoRange = TempoRange(100);
     /// The ranges TEMPO RANGE steps through unless Preferences say otherwise.
     pub const DEFAULTS: [TempoRange; 4] = [Self::SIX, Self::TEN, Self::SIXTEEN, Self::WIDE];
-    /// Ranges offered in Preferences (others can be typed in).
-    pub const PRESETS: [TempoRange; 8] = [
-        TempoRange(4),
-        Self::SIX,
-        TempoRange(8),
-        Self::TEN,
-        Self::SIXTEEN,
-        TempoRange(25),
-        TempoRange(50),
-        Self::WIDE,
-    ];
 
     /// A range of ±`percent` % (1–100).
     pub fn percent(percent: u8) -> Self {
@@ -328,6 +317,8 @@ pub struct Deck {
     pub phase_offset: f64,
     /// A nudge or scratch just ended: take the current phase as the offset.
     pub rephase: bool,
+    /// The waveform is held by the mouse, stopping the deck.
+    grabbed: bool,
     pub volume: f32,
     pub trim: f32,
     /// Knob positions, 0.5 = flat.
@@ -409,6 +400,7 @@ impl Deck {
             last_poll: Instant::now(),
             phase_offset: 0.0,
             rephase: false,
+            grabbed: false,
             volume: 1.0,
             trim: 0.5,
             eq: [0.5; 3],
@@ -1061,7 +1053,33 @@ impl Deck {
     /// Touching the jog top in vinyl mode holds the record.
     /// The jog or nudge buttons are moving the deck right now.
     pub fn nudging(&self) -> bool {
-        self.nudge_until.is_some() || self.jog_touched
+        self.nudge_until.is_some() || self.jog_touched || self.grabbed
+    }
+
+    /// Taking hold of a running waveform stops the deck, like a hand on the
+    /// record; it plays on when let go. Paused decks just move.
+    pub fn grab_waveform(&mut self, engine: &mut Engine) {
+        if engine.is_playing(self.index) {
+            self.grabbed = true;
+            engine.send(Command::Hold { deck: self.index, held: true });
+        }
+    }
+
+    /// The waveform dragged by this many seconds of music.
+    pub fn drag_waveform(&mut self, seconds: f64, engine: &mut Engine) {
+        let deck = self.index;
+        engine.send(if self.grabbed {
+            Command::JogMove { deck, seconds }
+        } else {
+            Command::Shift { deck, seconds }
+        });
+    }
+
+    pub fn release_waveform(&mut self, engine: &mut Engine) {
+        if std::mem::take(&mut self.grabbed) {
+            self.rephase = true;
+            engine.send(Command::Hold { deck: self.index, held: false });
+        }
     }
 
     pub fn jog_touch(&mut self, touched: bool, engine: &mut Engine) {

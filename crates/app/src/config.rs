@@ -164,6 +164,13 @@ pub struct FxSession {
     pub color_on: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
 /// How decks and the mixer behave (Preferences window), like rekordbox's
 /// controller preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -171,6 +178,11 @@ pub struct FxSession {
 pub struct Preferences {
     /// How keys are written on the decks and in the lists.
     pub key_notation: crate::deck::KeyNotation,
+    pub theme: Theme,
+    /// The computer keyboard plays the decks.
+    pub keyboard_mixing: bool,
+    /// Keys moved from the defaults, by function; empty takes the key away.
+    pub key_bindings: std::collections::BTreeMap<String, String>,
     /// How tracks without rekordbox's analysis are analysed.
     pub analysis: crate::deck::AnalysisMethod,
     /// A loaded track without a beat grid or key gets them detected.
@@ -242,6 +254,9 @@ impl Default for Preferences {
             needle_lock: true,
             memory_call_lock: true,
             key_notation: Default::default(),
+            theme: Theme::Dark,
+            keyboard_mixing: true,
+            key_bindings: Default::default(),
             analysis: Default::default(),
             analyze_on_load: true,
             call_resizes_loop: false,
@@ -484,6 +499,15 @@ impl Config {
 mod tests {
     use super::*;
     use crate::layout::{DeckLayout, LayoutPreset};
+
+    #[test]
+    fn moved_keys_are_saved_and_read_back() {
+        let mut config = Config::default();
+        config.prefs.key_bindings.insert("left Cue".into(), "Shift+Z".into());
+        config.prefs.key_bindings.insert("Reset zoom".into(), String::new());
+        let read: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(read.prefs.key_bindings, config.prefs.key_bindings);
+    }
 
     #[test]
     fn layout_presets_are_saved_and_read_back() {

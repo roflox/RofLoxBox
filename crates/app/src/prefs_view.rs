@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, RichText, Ui};
 
-use crate::config::{CrossfaderCurveSetting, FaderCurveSetting, Preferences};
+use crate::config::{CrossfaderCurveSetting, FaderCurveSetting, Preferences, Theme};
 use crate::deck::TempoRange;
 
 /// Pages of the Preferences window.
@@ -11,16 +11,26 @@ pub enum PrefsTab {
     #[default]
     Deck,
     Mixer,
+    Keyboard,
+    Appearance,
     Audio,
 }
 
 impl PrefsTab {
-    pub const ALL: [PrefsTab; 3] = [PrefsTab::Deck, PrefsTab::Mixer, PrefsTab::Audio];
+    pub const ALL: [PrefsTab; 5] = [
+        PrefsTab::Deck,
+        PrefsTab::Mixer,
+        PrefsTab::Keyboard,
+        PrefsTab::Appearance,
+        PrefsTab::Audio,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             PrefsTab::Deck => "Deck",
             PrefsTab::Mixer => "Mixer",
+            PrefsTab::Keyboard => "Keyboard",
+            PrefsTab::Appearance => "Appearance",
             PrefsTab::Audio => "Audio",
         }
     }
@@ -40,6 +50,19 @@ fn lock(ui: &mut Ui, locked: &mut bool) -> bool {
         ui.radio_value(locked, false, "Unlock");
     });
     *locked != before
+}
+
+/// Dark or light; returns whether it changed.
+pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
+    let before = p.theme;
+    section(ui, "Theme", |ui| {
+        ui.radio_value(&mut p.theme, Theme::Dark, "Dark");
+        ui.radio_value(&mut p.theme, Theme::Light, "Light");
+        ui.label(
+            RichText::new("Waveforms stay dark, so their colors keep reading.").small().weak(),
+        );
+    });
+    p.theme != before
 }
 
 /// Deck settings; returns whether anything changed.
@@ -244,29 +267,29 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
 /// The tempo ranges to step through: common ones to tick, others to add;
 /// the last one left cannot be taken away.
 fn tempo_ranges(ui: &mut Ui, ranges: &mut Vec<TempoRange>) {
-    ui.horizontal_wrapped(|ui| {
-        let extra: Vec<TempoRange> =
-            ranges.iter().copied().filter(|r| !TempoRange::PRESETS.contains(r)).collect();
-        for range in TempoRange::PRESETS.into_iter().chain(extra) {
-            let mut on = ranges.contains(&range);
-            let last = on && ranges.len() == 1;
-            let response = ui.add_enabled(!last, egui::Checkbox::new(&mut on, range.label()));
-            if response.changed() {
-                if on {
-                    ranges.push(range);
-                    ranges.sort();
-                } else {
-                    ranges.retain(|r| *r != range);
+    let last = ranges.len() == 1;
+    let mut delete = None;
+    egui::Grid::new("tempo ranges").num_columns(2).striped(true).spacing([24.0, 3.0]).show(
+        ui,
+        |ui| {
+            for &range in ranges.iter() {
+                ui.label(range.label());
+                let button = ui.add_enabled(!last, egui::Button::new("Delete").small());
+                if button.on_disabled_hover_text("At least one range stays").clicked() {
+                    delete = Some(range);
                 }
+                ui.end_row();
             }
-            response.on_disabled_hover_text("At least one range stays");
-        }
-    });
+        },
+    );
+    if let Some(range) = delete {
+        ranges.retain(|r| *r != range);
+    }
     ui.horizontal(|ui| {
         let id = ui.id().with("new tempo range");
         let mut percent: u8 = ui.data(|d| d.get_temp(id)).unwrap_or(12);
         ui.label("Add ±");
-        ui.add(egui::DragValue::new(&mut percent).range(1..=99).suffix(" %"));
+        ui.add(egui::DragValue::new(&mut percent).range(1..=100).suffix(" %"));
         ui.data_mut(|d| d.insert_temp(id, percent));
         let range = TempoRange::percent(percent);
         if ui.add_enabled(!ranges.contains(&range), egui::Button::new("Add")).clicked() {
@@ -276,8 +299,8 @@ fn tempo_ranges(ui: &mut Ui, ranges: &mut Vec<TempoRange>) {
     });
     ui.label(
         RichText::new(
-            "TEMPO RANGE steps through these, and each deck's range menu offers them. Untick \
-             all but one to stay on it. WIDE is ±100 %.",
+            "TEMPO RANGE steps through these, and each deck's range menu offers them. WIDE is \
+             ±100 %.",
         )
         .small()
         .weak(),
