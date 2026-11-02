@@ -179,6 +179,10 @@ pub struct Preferences {
     /// How keys are written on the decks and in the lists.
     pub key_notation: crate::deck::KeyNotation,
     pub theme: Theme,
+    /// The stem separation model (its folder's name in `models/`).
+    pub stem_model: String,
+    /// Where tracks made from stems go; the default when unset.
+    pub stems_folder: Option<PathBuf>,
     /// The computer keyboard plays the decks.
     pub keyboard_mixing: bool,
     /// Keys moved from the defaults, by function; empty takes the key away.
@@ -255,6 +259,8 @@ impl Default for Preferences {
             memory_call_lock: true,
             key_notation: Default::default(),
             theme: Theme::Dark,
+            stem_model: String::new(),
+            stems_folder: None,
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),

@@ -69,6 +69,7 @@ impl ScannedFile {
             tempo: Vec::new(),
             edited: Vec::new(),
             analysis: None,
+            derived: None,
         };
         self.apply_to(&mut track);
         track

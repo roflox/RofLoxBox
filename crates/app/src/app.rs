@@ -10,6 +10,7 @@ mod recording;
 mod selection;
 mod session;
 mod status_bar;
+mod stems_view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -147,6 +148,10 @@ pub struct DeckhandApp {
     /// The deck each side of the controller drives (left 1/3, right 2/4).
     active_decks: [usize; 2],
     keyboard: keyboard::KeyboardMixer,
+    /// Separates tracks into stems in the background.
+    stems: crate::stems::Separator,
+    /// The models in the models folder, and the ones that could not be read.
+    stem_models: (Vec<crate::stems::StemModel>, Vec<String>),
     /// Position of the selected row in the list, telling duplicate tracks
     /// apart (`None`: the first copy).
     selected_position: Option<usize>,
@@ -247,6 +252,8 @@ impl DeckhandApp {
                 PrefsTab::Mixer
             } else if std::env::var_os("DECKHAND_SHOW_KEYBOARD_PREFS").is_some() {
                 PrefsTab::Keyboard
+            } else if std::env::var_os("DECKHAND_SHOW_STEMS_PREFS").is_some() {
+                PrefsTab::Stems
             } else if std::env::var_os("DECKHAND_SHOW_AUDIO").is_some() {
                 PrefsTab::Audio
             } else {
@@ -260,6 +267,8 @@ impl DeckhandApp {
             selected_position: None,
             active_decks: [0, 1],
             keyboard,
+            stems: Default::default(),
+            stem_models: crate::stems::load_models(&crate::stems::models_dir()),
             recording: None,
             moved_window: false,
             hotplug: Default::default(),
@@ -1386,6 +1395,7 @@ impl eframe::App for DeckhandApp {
         }
         self.save_track_edits();
         self.poll_collection(ctx);
+        self.poll_stems(ctx);
         self.poll_explorer(ctx);
         self.poll_usb(ctx);
         self.check_controllers(ctx);
@@ -2714,6 +2724,10 @@ impl DeckhandApp {
                     }
                     PrefsTab::Keyboard => {
                         prefs_changed |= self.keyboard.prefs_ui(ui, &mut self.config.prefs);
+                        return;
+                    }
+                    PrefsTab::Stems => {
+                        prefs_changed |= self.stems_prefs(ui);
                         return;
                     }
                     PrefsTab::Appearance => {

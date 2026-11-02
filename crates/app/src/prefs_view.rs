@@ -12,15 +12,17 @@ pub enum PrefsTab {
     Deck,
     Mixer,
     Keyboard,
+    Stems,
     Appearance,
     Audio,
 }
 
 impl PrefsTab {
-    pub const ALL: [PrefsTab; 5] = [
+    pub const ALL: [PrefsTab; 6] = [
         PrefsTab::Deck,
         PrefsTab::Mixer,
         PrefsTab::Keyboard,
+        PrefsTab::Stems,
         PrefsTab::Appearance,
         PrefsTab::Audio,
     ];
@@ -30,6 +32,7 @@ impl PrefsTab {
             PrefsTab::Deck => "Deck",
             PrefsTab::Mixer => "Mixer",
             PrefsTab::Keyboard => "Keyboard",
+            PrefsTab::Stems => "Stems",
             PrefsTab::Appearance => "Appearance",
             PrefsTab::Audio => "Audio",
         }

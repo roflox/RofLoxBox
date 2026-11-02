@@ -90,16 +90,24 @@ impl DeckhandApp {
             });
             if self.status_bar.open {
                 ui.separator();
-                ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
-                    for message in &self.status_bar.history {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(ago(message.at)).small().weak().monospace());
-                            let color =
-                                if message.error { WARN } else { ui.visuals().text_color() };
-                            ui.label(RichText::new(&message.text).color(color));
-                        });
-                    }
-                });
+                // Newest first; long messages scroll, and their text can be copied.
+                ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(
+                    ui,
+                    |ui| {
+                        for message in self.status_bar.history.iter().rev() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(ago(message.at)).small().weak().monospace());
+                                let color =
+                                    if message.error { WARN } else { ui.visuals().text_color() };
+                                ui.add(
+                                    egui::Label::new(RichText::new(&message.text).color(color))
+                                        .selectable(true),
+                                );
+                            });
+                            ui.separator();
+                        }
+                    },
+                );
             }
         });
         if toggle {
