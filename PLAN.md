@@ -186,8 +186,16 @@ Done (milestone 2, 2026-10-25):
   physical position, rebindable in Preferences. Not yet: Slip Reverse, next/previous track,
   grid editing keys.
 
+- Stems, part 1 (`stems.rs`): user-chosen separation models run as
+  external commands, cached per track; Make → acapella / instrumental /
+  without drums / single stems as new tracks with the original's cues and
+  grid. Demucs htdemucs: 60 s for a 4.6 min track on an M1 CPU, stems
+  sample-aligned with deckhand's decoding.
+
 Next:
-1. Stems / Part Isolator / Drum Swap (need a separation model).
+1. Stems part 2: live stems on the decks (Stems pads, Part Isolator, GRV6),
+   then a built-in ONNX runner. Demucs' stems sum ~11 dB off the original,
+   so live stems should rebuild "other" as the remainder.
 2. Beat FX and the sampler; stems (needs separation models).
 3. Save hot cues / cue points set in deckhand.
 4. Tune jog scratch resolution on hardware (`SCRATCH_SECONDS_PER_STEP`).

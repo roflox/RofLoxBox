@@ -60,6 +60,13 @@ preset: `Z`/`N` play, `A`/`H` cue, `Q`/`Y` sync, `W` `E`/`U` `I` pitch bend,
 Preferences → Keyboard lists them all, lets you move any of them and turns
 them off.
 
+Right-click tracks → Make: an acapella, an instrumental, the track without
+drums, or one stem alone, as a new 24-bit WAV track carrying the original's
+cues, memory cues, loops, beat grid and key, next to it in its playlists.
+Separation runs any model you add (Preferences → Stems: a folder with a
+`model.toml` naming its stems and the command that separates a track), with
+presets for Demucs and audio-separator; results are cached per track.
+
 Dragging a running waveform stops the deck under the mouse, and it plays on
 from there when let go. Preferences → Appearance has dark and light themes.
 

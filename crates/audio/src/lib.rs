@@ -14,5 +14,5 @@ pub use engine::{
 };
 pub use eq::{EQ_MAX_DB, EQ_MIN_DB, EqSettings, Equalizer, Filter};
 pub use fx::{BeatFx, BeatFxKind, BeatFxParams, ColorFx, ColorFxKind, FxTarget};
-pub use record::Recording;
+pub use record::{Recording, write_wav_file};
 pub use stretch::Stretcher;

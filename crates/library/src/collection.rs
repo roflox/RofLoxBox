@@ -77,6 +77,20 @@ pub struct Track {
     /// beside it), kept from a USB import: waveforms, grid and cues.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<PathBuf>,
+    /// Made from another track's stems (an acapella, an instrumental, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<Derived>,
+}
+
+/// Where a track made from stems came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Derived {
+    /// The original track's id.
+    pub original: u32,
+    /// The stems it keeps.
+    pub stems: Vec<String>,
+    /// The separation model's name.
+    pub model: String,
 }
 
 /// A track field that can be edited in deckhand.
@@ -188,6 +202,15 @@ pub struct Collection {
     path: PathBuf,
     #[serde(skip)]
     dirty: bool,
+}
+
+/// Cues, grid, BPM and key: a made track has the original's timing, as the
+/// files start on the same sample.
+fn copy_timing(source: &Track, track: &mut Track) {
+    track.cues = source.cues.clone();
+    track.tempo = source.tempo.clone();
+    track.bpm = source.bpm;
+    track.key = source.key.clone();
 }
 
 pub(crate) fn now() -> u64 {
@@ -316,6 +339,76 @@ impl Collection {
             self.dirty = true;
         }
         (added, updated)
+    }
+
+    /// Adds the file made from `original`'s stems as a track that carries
+    /// the original's cues, grid, key and tags, titled with `suffix`, right
+    /// after the original in each of its playlists. A track already at the
+    /// file's path is updated instead. Returns the track's id.
+    pub fn add_derived(
+        &mut self,
+        original: u32,
+        file: ScannedFile,
+        suffix: &str,
+        derived: Derived,
+    ) -> Option<u32> {
+        let source = self.track(original)?.clone();
+        let existing = self.tracks.iter().position(|t| t.path == file.path);
+        let id = match existing {
+            Some(i) => self.tracks[i].id,
+            None => {
+                let id = self.next_track;
+                self.next_track += 1;
+                id
+            }
+        };
+        let mut track = file.into_track(id);
+        track.title = format!("{} ({suffix})", source.title);
+        track.artist = source.artist.clone();
+        track.album = source.album.clone();
+        track.genre = source.genre.clone();
+        track.label = source.label.clone();
+        track.year = source.year;
+        track.rating = source.rating;
+        track.color = source.color;
+        track.comment = if source.comment.is_empty() {
+            format!("{suffix} of {}, {}", source.title, derived.model)
+        } else {
+            source.comment.clone()
+        };
+        track.derived = Some(derived);
+        copy_timing(&source, &mut track);
+        match existing {
+            Some(i) => {
+                // Keep what the made track gathered itself.
+                let old = &self.tracks[i];
+                (track.added, track.play_count, track.last_played) =
+                    (old.added, old.play_count, old.last_played);
+                self.tracks[i] = track;
+            }
+            None => {
+                self.tracks.push(track);
+                for node in &mut self.nodes {
+                    if let Some(at) = node.tracks.iter().position(|&t| t == original) {
+                        node.tracks.insert(at + 1, id);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+        Some(id)
+    }
+
+    /// Copies the cues, grid and key of a made track's original to it again.
+    /// Returns whether there was an original to copy from.
+    pub fn update_from_original(&mut self, id: u32) -> bool {
+        let Some(original) = self.track(id).and_then(|t| t.derived.as_ref()).map(|d| d.original)
+        else {
+            return false;
+        };
+        let Some(source) = self.track(original).cloned() else { return false };
+        self.update_track(id, |t| copy_timing(&source, t));
+        true
     }
 
     /// Tracks whose file is gone.
@@ -599,6 +692,56 @@ mod tests {
         let track = c.track(a).unwrap();
         assert_eq!((track.title.as_str(), track.rating), ("A (remaster)", 4));
         assert_ne!(c.tracks[1].id, a);
+    }
+
+    #[test]
+    fn made_tracks_carry_the_originals_timing_and_follow_it_in_playlists() {
+        let mut c = Collection::default();
+        c.merge(vec![scanned("/song.mp3", "Song"), scanned("/other.mp3", "Other")]);
+        let (song, other) = (c.tracks[0].id, c.tracks[1].id);
+        let cue = Cue {
+            kind: CueKind::Hot(2),
+            start: 12.5,
+            end: Some(16.5),
+            color: Some([1, 2, 3]),
+            name: "Drop".into(),
+        };
+        c.update_track(song, |t| {
+            t.cues = vec![cue.clone()];
+            t.tempo = vec![TempoMarker { start: 0.1, bpm: 124.0, beat: 1 }];
+            t.bpm = Some(124.0);
+            t.key = Some("8A".into());
+            t.artist = "Artist".into();
+            t.rating = 4;
+        });
+        let playlist = c.create("Set", NodeKind::Playlist, None);
+        c.add_to_playlist(playlist, &[song, other]);
+        let derived =
+            || Derived { original: song, stems: vec!["vocals".into()], model: "htdemucs".into() };
+        let made = c
+            .add_derived(song, scanned("/Song (Acapella).wav", ""), "Acapella", derived())
+            .unwrap();
+        let track = c.track(made).unwrap();
+        assert_eq!(track.title, "Song (Acapella)");
+        assert_eq!((track.artist.as_str(), track.rating), ("Artist", 4));
+        assert_eq!(track.cues, [cue]);
+        assert_eq!((track.bpm, track.key.as_deref()), (Some(124.0), Some("8A")));
+        assert_eq!(track.tempo.len(), 1);
+        assert_eq!(c.node(playlist).unwrap().tracks, [song, made, other]);
+        // Made again: the same track, no duplicate.
+        c.update_track(made, |t| t.play_count = 3);
+        let again = c
+            .add_derived(song, scanned("/Song (Acapella).wav", ""), "Acapella", derived())
+            .unwrap();
+        assert_eq!(again, made);
+        assert_eq!(c.tracks.len(), 3);
+        assert_eq!(c.track(made).unwrap().play_count, 3);
+        assert_eq!(c.node(playlist).unwrap().tracks, [song, made, other]);
+        // The original's cues move; the made track follows when asked.
+        c.update_track(song, |t| t.cues[0].start = 20.0);
+        assert!(c.update_from_original(made));
+        assert_eq!(c.track(made).unwrap().cues[0].start, 20.0);
+        assert!(!c.update_from_original(song));
     }
 
     #[test]

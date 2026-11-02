@@ -137,6 +137,19 @@ fn write_wav(
     Ok(())
 }
 
+/// Writes interleaved stereo `samples` to a 24-bit WAV file at `path`.
+pub fn write_wav_file(path: &Path, rate: u32, samples: &[f32]) -> Result<()> {
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut out = BufWriter::with_capacity(1 << 16, file);
+    write_header(&mut out, rate, samples.len() as u64 / 2)?;
+    for &s in &samples[..samples.len() - samples.len() % 2] {
+        let v = (s.clamp(-1.0, 1.0) * 8_388_607.0) as i32;
+        out.write_all(&v.to_le_bytes()[..3])?;
+    }
+    out.flush().with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 fn write_header(out: &mut impl Write, rate: u32, frames: u64) -> Result<()> {
     const CHANNELS: u16 = 2;
     const BYTES: u16 = 3;

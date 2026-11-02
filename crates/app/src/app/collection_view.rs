@@ -876,6 +876,11 @@ impl DeckhandApp {
         let selection = self.selected_ids();
         let marked = self.marked.clone();
         let group = |id: u32| if marked.contains(&id) { selection.clone() } else { vec![id] };
+        let stem_model = self.stem_model().cloned();
+        let stem_recipes = stem_model.as_ref().map(crate::stems::recipes).unwrap_or_default();
+        let separating = self.stems.pending();
+        let derived: std::collections::HashSet<u32> =
+            self.collection.tracks.iter().filter(|t| t.derived.is_some()).map(|t| t.id).collect();
         let options = TableOptions {
             selected: self.selected,
             selected_position: self.selected_position,
@@ -947,6 +952,44 @@ impl DeckhandApp {
                             actions.push(TrackAction::Analyze(ids.clone()));
                             ui.close();
                         }
+                        ui.menu_button(format!("Make{many}"), |ui| match &stem_model {
+                            None => {
+                                ui.label(
+                                    "No stem model yet: add one on the Stems page of Preferences",
+                                );
+                            }
+                            Some(model) => {
+                                ui.label(RichText::new(&model.name).small().weak());
+                                for recipe in &stem_recipes {
+                                    if ui.button(&recipe.label).clicked() {
+                                        actions
+                                            .push(TrackAction::Make(ids.clone(), recipe.clone()));
+                                        ui.close();
+                                    }
+                                }
+                                if separating > 0 {
+                                    ui.separator();
+                                    if ui
+                                        .button(format!("Cancel separating ({separating})"))
+                                        .clicked()
+                                    {
+                                        actions.push(TrackAction::CancelStems);
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        });
+                        if derived.contains(&id)
+                            && ui
+                                .button("Update cues from original")
+                                .on_hover_text(
+                                    "Copies the original's cues, grid and key to this track again",
+                                )
+                                .clicked()
+                        {
+                            actions.push(TrackAction::UpdateFromOriginal(id));
+                            ui.close();
+                        }
                         if ui.button("Remove from collection").clicked() {
                             actions.push(TrackAction::Forget(id));
                             ui.close();
@@ -984,6 +1027,19 @@ impl DeckhandApp {
                 }
                 TrackAction::Forget(id) => self.collection.remove_tracks(&[id]),
                 TrackAction::Analyze(ids) => self.analyze(ids, true),
+                TrackAction::Make(ids, recipe) => self.make_stems(&ids, &recipe),
+                TrackAction::CancelStems => {
+                    self.stems.cancel();
+                    self.status = Some("Stem separation cancelled".into());
+                }
+                TrackAction::UpdateFromOriginal(id) => {
+                    if self.collection.update_from_original(id) {
+                        self.status = Some("Cues, grid and key copied from the original".into());
+                    } else {
+                        self.collection_view.error =
+                            Some("The original track is no longer in the collection".into());
+                    }
+                }
                 TrackAction::Edit(id) => {
                     if let Some(t) = self.collection.track(id) {
                         let fields =
@@ -1005,6 +1061,9 @@ enum TrackAction {
     Forget(u32),
     Edit(u32),
     Analyze(Vec<u32>),
+    Make(Vec<u32>, crate::stems::Recipe),
+    CancelStems,
+    UpdateFromOriginal(u32),
 }
 
 /// Unix seconds → `YYYY-MM-DD` (UTC).
@@ -1034,7 +1093,7 @@ fn reveal_label() -> &'static str {
 }
 
 /// Opens the file manager with the file selected.
-fn reveal(path: &std::path::Path) {
+pub(super) fn reveal(path: &std::path::Path) {
     let _ = if cfg!(windows) {
         std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
     } else {
