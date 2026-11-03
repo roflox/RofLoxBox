@@ -22,8 +22,57 @@ pub const FX_BEATS: [f64; 11] =
 const FX_BEAT_INDICATOR: [u8; 11] = [1, 2, 3, 4, 33, 5, 6, 7, 8, 9, 10];
 const DEFAULT_BEAT: usize = 5;
 
-/// Pad FX slots 1–8 and, with Shift, 9–16: (effect, beats, depth).
-const PAD_FX: [(BeatFxKind, f64, f32); 16] = [
+/// Pad FX pads: A–H and, on the second page or with Shift, I–P.
+pub const PAD_FX_SLOTS: usize = 16;
+
+/// What one Pad FX pad runs while held (set in Preferences → Pad FX).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PadFxSlot {
+    #[serde(with = "fx_kind")]
+    pub effect: BeatFxKind,
+    /// Beats, one of [`FX_BEATS`].
+    pub beats: f64,
+    /// 0.0–1.0.
+    pub depth: f32,
+}
+
+impl PadFxSlot {
+    pub fn label(self) -> String {
+        format!("{} {}", self.effect.label(), beat_label(self.beats))
+    }
+
+    /// A short pad caption, like `ROLL 1/4`.
+    pub fn short(self) -> String {
+        let name = self.effect.label().split(' ').next_back().unwrap_or_default();
+        format!("{name}\n{}", beat_label(self.beats))
+    }
+
+    /// The factory pads.
+    pub fn defaults() -> Vec<PadFxSlot> {
+        PAD_FX.iter().map(|&(effect, beats, depth)| PadFxSlot { effect, beats, depth }).collect()
+    }
+}
+
+/// Effects saved by name in the settings.
+mod fx_kind {
+    use deckhand_audio::BeatFxKind;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(kind: &BeatFxKind, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(kind.label())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BeatFxKind, D::Error> {
+        let name = String::deserialize(d)?;
+        BeatFxKind::ALL
+            .into_iter()
+            .find(|k| k.label().eq_ignore_ascii_case(&name))
+            .ok_or_else(|| D::Error::custom(format!("unknown effect {name}")))
+    }
+}
+
+/// Factory Pad FX: (effect, beats, depth).
+const PAD_FX: [(BeatFxKind, f64, f32); PAD_FX_SLOTS] = [
     (BeatFxKind::Roll, 0.25, 1.0),
     (BeatFxKind::Roll, 0.125, 1.0),
     (BeatFxKind::Roll, 1.0 / 16.0, 1.0),
@@ -41,18 +90,6 @@ const PAD_FX: [(BeatFxKind, f64, f32); 16] = [
     (BeatFxKind::Flanger, 4.0, 0.8),
     (BeatFxKind::Phaser, 4.0, 0.8),
 ];
-
-pub fn pad_fx_label(slot: usize) -> String {
-    let (kind, beats, _) = PAD_FX[slot % PAD_FX.len()];
-    format!("{} {}", kind.label(), beat_label(beats))
-}
-
-/// A short pad caption, like `ROLL 1/4`.
-pub fn pad_fx_short(slot: usize) -> String {
-    let (kind, beats, _) = PAD_FX[slot % PAD_FX.len()];
-    let name = kind.label().split(' ').next_back().unwrap_or_default();
-    format!("{name}\n{}", beat_label(beats))
-}
 
 pub fn beat_label(beats: f64) -> String {
     match beats {
@@ -83,6 +120,8 @@ pub struct Effects {
     taps: Vec<Instant>,
     /// A held Pad FX pad: (deck, slot).
     pub pad: Option<(usize, u8)>,
+    /// What each Pad FX pad does.
+    pub pad_slots: [PadFxSlot; PAD_FX_SLOTS],
     pub color: ColorFxKind,
     pub color_on: bool,
     pub master_cue: bool,
@@ -105,6 +144,7 @@ impl Default for Effects {
             tapped_bpm: None,
             taps: Vec::new(),
             pad: None,
+            pad_slots: std::array::from_fn(|i| PadFxSlot::defaults()[i]),
             color: ColorFxKind::Filter,
             color_on: true,
             master_cue: false,
@@ -117,17 +157,27 @@ impl Default for Effects {
 }
 
 impl Effects {
+    pub fn pad_slot(&self, slot: usize) -> PadFxSlot {
+        self.pad_slots[slot % PAD_FX_SLOTS]
+    }
+
+    /// Takes the pads from the settings; missing ones stay as they come.
+    pub fn set_pad_slots(&mut self, slots: &[PadFxSlot]) {
+        let defaults = PadFxSlot::defaults();
+        self.pad_slots = std::array::from_fn(|i| slots.get(i).copied().unwrap_or(defaults[i]));
+    }
+
     /// What the engine should run at `bpm`: the Beat FX, or a held Pad FX.
     fn params(&self, bpm: f64) -> BeatFxParams {
         let bpm = self.tapped_bpm.unwrap_or(bpm);
         let beat = |beats: f64| (60.0 / bpm * beats) as f32;
         if let Some((deck, slot)) = self.pad {
-            let (kind, beats, depth) = PAD_FX[usize::from(slot) % PAD_FX.len()];
+            let pad = self.pad_slot(usize::from(slot));
             return BeatFxParams {
-                kind,
+                kind: pad.effect,
                 on: true,
-                depth,
-                beat_secs: beat(beats),
+                depth: pad.depth,
+                beat_secs: beat(pad.beats),
                 target: FxTarget::Channel(deck),
                 release: false,
             };

@@ -80,6 +80,10 @@ pub struct Track {
     /// Made from another track's stems (an acapella, an instrumental, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived: Option<Derived>,
+    /// Track gain in dB, like rekordbox's: worked out from the loudness
+    /// when the track is first loaded, then changed by hand on the deck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f32>,
 }
 
 /// Where a track made from stems came from.

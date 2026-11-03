@@ -147,6 +147,8 @@ pub struct LoadedTrack {
     pub memory_cues: Vec<f64>,
     /// Stored loops (start, end) from the memory cue list.
     pub memory_loops: Vec<(f64, f64)>,
+    /// Track gain in dB (Auto Gain), from the collection or the loudness.
+    pub gain_db: f32,
 }
 
 impl LoadedTrack {
@@ -358,6 +360,8 @@ pub struct Deck {
     pub screen_shift: bool,
     /// Pad FX pads show effects A–H (0) or I–P (1).
     pub pad_fx_page: u8,
+    /// The Pad FX pads' settings are open in place of the pads (the cog).
+    pub pad_fx_settings: bool,
     /// Beat-loop pad lengths are `BEAT_LOOPS` times this.
     pub loop_scale: f64,
     /// Keyboard mode: the hot cue the pads play, once picked.
@@ -424,6 +428,7 @@ impl Deck {
             double_of: None,
             screen_shift: false,
             pad_fx_page: 0,
+            pad_fx_settings: false,
             loop_scale: 1.0,
             keyboard_cue: None,
             keyboard_base: 0,
@@ -596,6 +601,7 @@ impl Deck {
                     }
                     self.track = Some(track);
                     (self.edited, self.grid_edited) = (false, false);
+                    self.apply_mixer(engine);
                     self.phase_offset = 0.0;
                     self.apply_tempo(engine);
                 }
@@ -1335,12 +1341,33 @@ impl Deck {
         engine.send(Command::SetPlaying { deck, playing });
     }
 
+    /// The loaded track's gain, when Auto Gain is on.
+    pub fn track_gain_db(&self) -> f32 {
+        match &self.track {
+            Some(track) if self.prefs.auto_gain => track.gain_db,
+            _ => 0.0,
+        }
+    }
+
+    /// Changes the loaded track's gain (dragged on the deck); collection
+    /// tracks keep it.
+    pub fn set_track_gain(&mut self, db: f32, engine: &mut Engine) {
+        let Some(track) = &mut self.track else { return };
+        track.gain_db = db.clamp(*TRACK_GAIN_DB.start(), *TRACK_GAIN_DB.end());
+        self.apply_mixer(engine);
+    }
+
+    /// The loaded track's gain worked out from its loudness.
+    pub fn measured_gain_db(&self) -> Option<f32> {
+        self.audio.as_deref().map(auto_gain_db)
+    }
+
     /// Sends all mixer settings of this channel.
     pub fn apply_mixer(&self, engine: &mut Engine) {
         let deck = self.index;
         engine.send(Command::SetVolume { deck, level: self.volume });
         // Trim knob: 0.5 = 0 dB, range ±12 dB.
-        let trim_db = (self.trim - 0.5) * 24.0;
+        let trim_db = (self.trim - 0.5) * 24.0 + self.track_gain_db();
         engine.send(Command::SetTrim { deck, gain: 10f32.powf(trim_db / 20.0) });
         for (band, &knob) in self.eq.iter().enumerate() {
             engine.send(Command::SetEq { deck, band, db: eq_db(knob, self.prefs.isolator) });
@@ -1496,6 +1523,8 @@ pub struct DeckPrefs {
     pub analysis: AnalysisMethod,
     /// Detect a missing beat grid or key once a track is loaded.
     pub analyze_on_load: bool,
+    /// Tracks play at their track gain.
+    pub auto_gain: bool,
 }
 
 /// How tracks without rekordbox's analysis are analysed.
@@ -1525,6 +1554,7 @@ impl Default for DeckPrefs {
             vinyl_brake: 0.0,
             analysis: AnalysisMethod::default(),
             analyze_on_load: true,
+            auto_gain: true,
         }
     }
 }
@@ -1571,8 +1601,38 @@ fn first_sound(audio: &TrackAudio, db: f32) -> Option<f64> {
     Some((index / 2) as f64 / f64::from(audio.sample_rate))
 }
 
+/// Loudness every track is brought to by Auto Gain, in dB of the gated
+/// mean square (about LUFS for full-range club music).
+const AUTO_GAIN_TARGET_DB: f32 = -9.0;
+/// Track gain range, as on rekordbox's decks.
+pub const TRACK_GAIN_DB: std::ops::RangeInclusive<f32> = -12.0..=12.0;
+
+/// The gain that brings a track to [`AUTO_GAIN_TARGET_DB`]: the mean square
+/// of 400 ms blocks, leaving out silence and blocks 10 dB below the average
+/// (the gating of EBU R 128, without its weighting filter).
+pub fn auto_gain_db(audio: &TrackAudio) -> f32 {
+    let block = (audio.sample_rate as usize * 2 * 2 / 5).max(2);
+    let powers: Vec<f64> = audio
+        .samples
+        .chunks(block)
+        .filter(|c| c.len() == block)
+        .map(|c| c.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / c.len() as f64)
+        .filter(|&p| p > 1e-7)
+        .collect();
+    if powers.is_empty() {
+        return 0.0;
+    }
+    let mean = powers.iter().sum::<f64>() / powers.len() as f64;
+    let loud: Vec<f64> = powers.iter().copied().filter(|&p| p >= mean * 0.1).collect();
+    let gated = loud.iter().sum::<f64>() / loud.len().max(1) as f64;
+    // The mean square of both channels together: +3 dB for a stereo sum.
+    let db = 10.0 * gated.log10() as f32 + 3.0;
+    (AUTO_GAIN_TARGET_DB - db).clamp(*TRACK_GAIN_DB.start(), *TRACK_GAIN_DB.end())
+}
+
 /// Grid and cues the collection already has (from a rekordbox import).
 struct Known {
+    gain_db: Option<f32>,
     beats: Vec<(f64, u16)>,
     hot_cues: [Option<HotCue>; HOT_CUES],
     memory_cues: Vec<f64>,
@@ -1582,6 +1642,7 @@ struct Known {
 impl Known {
     fn from_track(track: &deckhand_library::Track) -> Self {
         let mut known = Known {
+            gain_db: track.gain_db,
             beats: track.beats(track.duration.max(1.0) + 1.0),
             hot_cues: [None; HOT_CUES],
             memory_cues: Vec::new(),
@@ -1657,7 +1718,7 @@ impl LoadRequest {
         if !waveform.has_bands() {
             waveform.bands = band_waveform(&audio);
         }
-        waveform.color_from_bands();
+        waveform.shape_from_bands();
         let mut beats: Vec<(f64, u16)> = dat
             .as_ref()
             .and_then(AnlzFile::beat_grid)
@@ -1717,6 +1778,7 @@ impl LoadRequest {
                 c.loop_end_ms.map(|end| (f64::from(c.time_ms) / 1000.0, f64::from(end) / 1000.0))
             })
             .filter(|(start, end)| end > start);
+        let stored_gain = self.known.as_ref().and_then(|k| k.gain_db);
         if let Some(known) = self.known {
             // Collection tracks: the collection's grid and cues (edited in
             // deckhand) win over rekordbox's analysis, which then only gives
@@ -1752,6 +1814,7 @@ impl LoadRequest {
             hot_cues,
             memory_cues,
             memory_loops,
+            gain_db: stored_gain.unwrap_or_else(|| auto_gain_db(&audio)),
         };
         Ok((track, Arc::new(audio)))
     }
@@ -1760,6 +1823,28 @@ impl LoadRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_gain_follows_loudness() {
+        // A full-scale stereo 100 Hz sine is 0 dB here (as in LUFS), so it comes
+        // down to the target; silence and a quiet intro do not count.
+        let sine = |amp: f32| -> Vec<f32> {
+            (0..44_100 * 4)
+                .flat_map(|i| {
+                    let s = amp * ((i % 441) as f32 / 441.0 * std::f32::consts::TAU).sin();
+                    [s, s]
+                })
+                .collect()
+        };
+        let audio = TrackAudio { sample_rate: 44_100, samples: sine(1.0) };
+        assert!((auto_gain_db(&audio) - AUTO_GAIN_TARGET_DB).abs() < 0.1, "{}", auto_gain_db(&audio));
+        let mut samples = vec![0.0; 44_100 * 4];
+        samples.extend(sine(0.01));
+        samples.extend(sine(0.5));
+        let half = auto_gain_db(&TrackAudio { sample_rate: 44_100, samples });
+        assert!((half - (AUTO_GAIN_TARGET_DB + 6.0)).abs() < 0.2, "{half}");
+        assert_eq!(auto_gain_db(&TrackAudio { sample_rate: 44_100, samples: vec![0.0; 1000] }), 0.0);
+    }
 
     fn track(beats: Vec<(f64, u16)>, bpm: f64) -> LoadedTrack {
         LoadedTrack {
@@ -1778,6 +1863,7 @@ mod tests {
             hot_cues: [None; HOT_CUES],
             memory_cues: Vec::new(),
             memory_loops: Vec::new(),
+            gain_db: 0.0,
         }
     }
 

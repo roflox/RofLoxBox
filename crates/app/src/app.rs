@@ -32,7 +32,7 @@ use crate::browser::{Row, TableOptions, sort_rows, track_table};
 use crate::config::{AudioQuality, Config};
 use crate::controller::Controller;
 use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, display_key, key_sync_shift};
-use crate::effects::{Effects, pad_fx_label};
+use crate::effects::Effects;
 use crate::library::find_exports;
 use crate::prefs_view::{PrefsTab, appearance_prefs, deck_prefs, mixer_prefs};
 use collection_view::CollectionView;
@@ -570,11 +570,25 @@ impl DeckhandApp {
         }
     }
 
+    /// Sets what a Pad FX pad does and keeps it in the settings.
+    pub(super) fn set_pad_fx(&mut self, slot: usize, pad: crate::effects::PadFxSlot) {
+        let p = &mut self.config.prefs;
+        if p.pad_fx.len() < crate::effects::PAD_FX_SLOTS {
+            p.pad_fx = (0..crate::effects::PAD_FX_SLOTS)
+                .map(|i| self.effects.pad_slot(i))
+                .collect();
+        }
+        p.pad_fx[slot] = pad;
+        self.effects.set_pad_slots(&p.pad_fx);
+        self.config.save();
+    }
+
     fn apply_preferences(&mut self) {
         if self.config.prefs.tempo_ranges.is_empty() {
             self.config.prefs.tempo_ranges = crate::deck::TempoRange::DEFAULTS.to_vec();
         }
         let p = self.config.prefs.clone();
+        self.effects.set_pad_slots(&p.pad_fx);
         // A range taken off the list: stopped decks move to the nearest one;
         // a playing deck keeps its range (and tempo) until changed.
         if let Some(engine) = self.engine.as_mut() {
@@ -600,6 +614,7 @@ impl DeckhandApp {
                 vinyl_brake: f64::from(p.vinyl_brake),
                 analysis: p.analysis,
                 analyze_on_load: p.analyze_on_load,
+                auto_gain: p.auto_gain,
             };
         }
         let Some(engine) = self.engine.as_mut() else { return };
@@ -1529,6 +1544,8 @@ impl DeckhandApp {
                     ui.label(format!("{} Hz · {} ch", info.sample_rate, info.channels));
                 }
                 ui.toggle_value(&mut self.show_prefs, "⚙ Preferences");
+                ui.toggle_value(&mut self.status_bar.log_open, "📜 Log")
+                    .on_hover_text("Every message of this session, with its time");
                 ui.separator();
                 self.record_button(ui);
                 ui.separator();
@@ -1669,7 +1686,7 @@ impl DeckhandApp {
     }
 
     /// One deck's scrolling waveform; dragging it stops the deck and moves
-    /// through the track, clicking jumps there (not on a playing deck with Needle Lock on).
+    /// through the track, clicking jumps there.
     fn deck_waveform(&mut self, ui: &mut Ui, index: usize, size: egui::Vec2, vertical: bool) {
         // The zoom is real time: a deck playing faster shows more of its
         // track, so beats of synced decks line up across the whole width.
@@ -1734,14 +1751,7 @@ impl DeckhandApp {
             deck.release_waveform(engine);
         }
         if let Some(seconds) = jump {
-            if self.config.prefs.needle_lock && engine.is_playing(index) {
-                self.status = Some(format!(
-                    "Deck {}: Needle Lock — pause to jump, or turn it off in Preferences",
-                    index + 1
-                ));
-            } else {
-                self.decks[index].seek(seconds, engine);
-            }
+            self.decks[index].seek(seconds, engine);
         }
         painter.text(
             rect.left_top() + vec2(6.0, 4.0),
@@ -2056,7 +2066,7 @@ impl DeckhandApp {
         if !self.config.four_decks {
             return vec![0, 1];
         }
-        let order = self.controller.channel_order().unwrap_or(self.config.channel_order);
+        let order = self.config.channel_order;
         order.iter().map(|&ch| ch.clamp(1, DECKS) - 1).collect()
     }
 
@@ -2074,7 +2084,7 @@ impl DeckhandApp {
         const ORDERS: [[usize; 4]; 2] = [[1, 2, 3, 4], [3, 1, 2, 4]];
         let channels = self.mixer_channels();
         let four = self.config.four_decks;
-        let current_order = self.controller.channel_order().unwrap_or(self.config.channel_order);
+        let current_order = self.config.channel_order;
         let mut new_order = None;
         let Some(engine) = self.engine.as_mut() else { return };
         // Faders take whatever height the knobs, buttons and crossfader leave.
@@ -2316,13 +2326,10 @@ impl DeckhandApp {
                 });
             });
         });
+        // One order for the app, with or without a controller.
         if let Some(order) = new_order {
-            if self.controller.port().is_some() {
-                self.controller.set_channel_order(order);
-            } else {
-                self.config.channel_order = order;
-                self.config.save();
-            }
+            self.config.channel_order = order;
+            self.config.save();
         }
     }
 
@@ -2401,7 +2408,7 @@ impl DeckhandApp {
                 }
                 ui.label("?").on_hover_text(
                     (0..16)
-                        .map(|s| format!("Pad FX {}: {}", s + 1, pad_fx_label(s)))
+                        .map(|s| format!("Pad FX {}: {}", s + 1, fx.pad_slot(s).label()))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
@@ -3229,11 +3236,11 @@ fn pad_face(
             let slot = (pad + if shift { 8 } else { 0 } + 8 * usize::from(deck.pad_fx_page)) % 16;
             let held = fx.pad == Some((index, slot as u8));
             face(
-                crate::effects::pad_fx_short(slot),
+                fx.pad_slot(slot).short(),
                 if held { ACTIVE } else { Color32::from_rgb(70, 45, 95) },
                 &format!(
                     "Hold for {}; Shift for the second set",
-                    crate::effects::pad_fx_label(slot)
+                    fx.pad_slot(slot).label()
                 ),
             )
         }

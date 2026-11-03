@@ -70,6 +70,7 @@ impl ScannedFile {
             edited: Vec::new(),
             analysis: None,
             derived: None,
+            gain_db: None,
         };
         self.apply_to(&mut track);
         track

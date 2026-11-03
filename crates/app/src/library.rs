@@ -153,38 +153,100 @@ fn is_drive(path: &Path) -> bool {
 
 /// Safely removes a drive, like the Finder's or Explorer's Eject.
 pub fn eject(root: &Path) -> anyhow::Result<()> {
-    use std::process::Command;
-    let output = if cfg!(target_os = "macos") {
-        Command::new("diskutil").arg("eject").arg(root).output()
-    } else if cfg!(windows) {
-        // Explorer's Eject verb on the drive ("This PC" is namespace 17).
-        let drive = root.to_string_lossy().trim_end_matches('\\').to_owned();
-        let script = format!(
-            "(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{drive}').InvokeVerb('Eject')"
-        );
-        Command::new("powershell").args(["-NoProfile", "-Command", &script]).output()
-    } else {
-        Command::new("umount").arg(root).output()
+    #[cfg(windows)]
+    return windows_eject(root);
+    #[cfg(not(windows))]
+    {
+        use std::process::Command;
+        let output = if cfg!(target_os = "macos") {
+            Command::new("diskutil").arg("eject").arg(root).output()
+        } else {
+            Command::new("umount").arg(root).output()
+        }
+        .context("starting the eject command")?;
+        if !output.status.success() {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            anyhow::bail!(
+                "{}",
+                if message.is_empty() { "the drive is in use".to_owned() } else { message }
+            );
+        }
+        Ok(())
     }
-    .context("starting the eject command")?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        anyhow::bail!(
-            "{}",
-            if message.is_empty() { "the drive is in use".to_owned() } else { message }
+}
+
+/// Windows: locks and dismounts the volume, then lets it be removed and
+/// ejects it, the steps Microsoft gives for safe removal.
+#[cfg(windows)]
+fn windows_eject(root: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, IOCTL_STORAGE_EJECT_MEDIA,
+        IOCTL_STORAGE_MEDIA_REMOVAL, PREVENT_MEDIA_REMOVAL,
+    };
+
+    // `E:\` → `\\.\E:`
+    let letter = root.to_string_lossy().trim_end_matches('\\').to_owned();
+    let device: Vec<u16> =
+        std::ffi::OsStr::new(&format!(r"\\.\{letter}")).encode_wide().chain([0]).collect();
+    // SAFETY: plain Win32 calls on a handle this function opens and closes.
+    unsafe {
+        let handle = CreateFileW(
+            device.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
         );
-    }
-    if cfg!(windows) {
-        // The verb reports nothing; give Windows a moment, then check.
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!("could not open {letter}: {}", std::io::Error::last_os_error());
+        }
+        let control = |code: u32, input: *const std::ffi::c_void, size: u32| {
+            let mut returned = 0u32;
+            DeviceIoControl(
+                handle,
+                code,
+                input,
+                size,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            ) != 0
+        };
+        // Locking fails while a file on the drive is open; retry briefly.
+        let mut locked = false;
         for _ in 0..20 {
-            if !root.exists() {
-                return Ok(());
+            if control(FSCTL_LOCK_VOLUME, std::ptr::null(), 0) {
+                locked = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        anyhow::bail!("Windows did not eject the drive; is a file on it still open?");
+        let result = if !locked {
+            Err(anyhow::anyhow!("the drive is in use; is a file on it still open?"))
+        } else if !control(FSCTL_DISMOUNT_VOLUME, std::ptr::null(), 0) {
+            Err(anyhow::anyhow!("could not dismount {letter}: {}", std::io::Error::last_os_error()))
+        } else {
+            let allow = PREVENT_MEDIA_REMOVAL { PreventMediaRemoval: false };
+            let allow_ptr = (&raw const allow).cast();
+            control(IOCTL_STORAGE_MEDIA_REMOVAL, allow_ptr, size_of::<PREVENT_MEDIA_REMOVAL>() as u32);
+            if control(IOCTL_STORAGE_EJECT_MEDIA, std::ptr::null(), 0) {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("could not eject {letter}: {}", std::io::Error::last_os_error()))
+            }
+        };
+        CloseHandle(handle);
+        result
     }
-    Ok(())
 }
 
 /// `m:ss` for a duration in seconds.

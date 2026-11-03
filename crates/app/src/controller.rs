@@ -191,18 +191,6 @@ impl Controller {
         self.store(mapping);
     }
 
-    /// The connected controller's mixer channel order, if one was chosen.
-    pub fn channel_order(&self) -> Option<[usize; 4]> {
-        self.port().and(self.translator.mapping().channel_order)
-    }
-
-    /// Remembers the mixer channel order with the controller's mapping.
-    pub fn set_channel_order(&mut self, order: [usize; 4]) {
-        let mut mapping = self.translator.mapping().clone();
-        mapping.channel_order = Some(order);
-        self.store(mapping);
-    }
-
     pub fn set_inverted(&mut self, action: Action, invert: bool) {
         let mut mapping = self.translator.mapping().clone();
         for binding in mapping.bindings.iter_mut().filter(|b| b.action == action) {

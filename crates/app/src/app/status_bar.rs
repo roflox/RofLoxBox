@@ -1,19 +1,19 @@
 //! The status line at the bottom of the window: the latest message on one
-//! line, expandable to the full text and the recent history.
+//! line, cut short with "…". Every message, in full and with its time, is
+//! in the log window.
 
-use std::time::Instant;
-
-use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Sense};
+use chrono::{DateTime, Local};
+use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Sense, ViewportBuilder, ViewportId};
 
 use super::{DeckhandApp, WARN};
 
-/// Messages kept for the expanded view.
-const HISTORY: usize = 30;
+/// Messages kept for the log.
+const HISTORY: usize = 1000;
 
 struct Message {
     text: String,
     error: bool,
-    at: Instant,
+    at: DateTime<Local>,
 }
 
 #[derive(Default)]
@@ -21,8 +21,9 @@ pub struct StatusBar {
     history: Vec<Message>,
     /// Messages shown last frame, so each is recorded once.
     active: Vec<String>,
-    open: bool,
     dismissed: bool,
+    /// The log window is open.
+    pub log_open: bool,
 }
 
 impl DeckhandApp {
@@ -48,7 +49,7 @@ impl DeckhandApp {
         let bar = &mut self.status_bar;
         for (text, error) in &current {
             if !bar.active.contains(text) {
-                bar.history.push(Message { text: text.clone(), error: *error, at: Instant::now() });
+                bar.history.push(Message { text: text.clone(), error: *error, at: Local::now() });
                 bar.dismissed = false;
             }
         }
@@ -58,75 +59,103 @@ impl DeckhandApp {
     }
 
     pub(super) fn status_bar(&mut self, ctx: &egui::Context) {
+        if self.status_bar.log_open {
+            self.log_window(ctx);
+        }
         let bar = &self.status_bar;
         let Some(latest) = bar.history.last() else { return };
-        if bar.dismissed && !bar.open {
+        if bar.dismissed {
             return;
         }
         let (text, error) = (latest.text.clone(), latest.error);
-        let mut toggle = false;
+        let mut open_log = false;
         let mut dismiss = false;
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            let open = self.status_bar.open;
+        egui::TopBottomPanel::bottom("status").resizable(false).show(ctx, |ui| {
             // × on the right; the message fills the rest of the line, from the left.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 dismiss =
                     ui.small_button("×").on_hover_text("Hide until the next message").clicked();
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     let color = if error { WARN } else { ui.visuals().text_color() };
-                    let marker = if open { "−" } else { "+" };
-                    let line = text.lines().next().unwrap_or_default();
-                    let response = ui
+                    let first = text.lines().next().unwrap_or_default();
+                    let line = if text.lines().nth(1).is_some() {
+                        format!("{first} …")
+                    } else {
+                        first.to_owned()
+                    };
+                    open_log = ui
                         .add(
-                            egui::Label::new(
-                                RichText::new(format!("{marker} {line}")).color(color),
-                            )
-                            .truncate()
-                            .sense(Sense::click()),
+                            egui::Label::new(RichText::new(line).color(color))
+                                .truncate()
+                                .sense(Sense::click()),
                         )
-                        .on_hover_text("Click for the full message and earlier ones");
-                    toggle = response.clicked();
+                        .on_hover_text("Click for the log: every message in full")
+                        .clicked();
                 });
             });
-            if self.status_bar.open {
-                ui.separator();
-                // Newest first; long messages scroll, and their text can be copied.
-                ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(
-                    ui,
-                    |ui| {
-                        for message in self.status_bar.history.iter().rev() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(ago(message.at)).small().weak().monospace());
-                                let color =
-                                    if message.error { WARN } else { ui.visuals().text_color() };
-                                ui.add(
-                                    egui::Label::new(RichText::new(&message.text).color(color))
-                                        .selectable(true),
-                                );
-                            });
-                            ui.separator();
-                        }
-                    },
-                );
-            }
         });
-        if toggle {
-            self.status_bar.open = !self.status_bar.open;
+        if open_log {
+            self.status_bar.log_open = true;
         }
         if dismiss {
-            self.status_bar.open = false;
             self.status_bar.dismissed = true;
             self.status = None;
         }
     }
+
+    /// Every message of this session, newest first, in its own window.
+    fn log_window(&mut self, ctx: &egui::Context) {
+        let builder =
+            ViewportBuilder::default().with_title("RofLoxBox — Log").with_inner_size([640.0, 420.0]);
+        let bar = &mut self.status_bar;
+        ctx.show_viewport_immediate(ViewportId::from_hash_of("log"), builder, |ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                // No separate windows here: a window inside the app.
+                let mut open = true;
+                egui::Window::new("Log")
+                    .open(&mut open)
+                    .default_size([560.0, 360.0])
+                    .show(ctx, |ui| log_contents(ui, bar));
+                bar.log_open = open;
+            } else {
+                egui::CentralPanel::default().show(ctx, |ui| log_contents(ui, bar));
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    bar.log_open = false;
+                }
+            }
+        });
+    }
 }
 
-/// `12s`, `3m`, `2h` ago.
-fn ago(at: Instant) -> String {
-    let secs = at.elapsed().as_secs();
-    match secs {
-        0..60 => format!("{secs:>3}s"),
-        60..3600 => format!("{:>3}m", secs / 60),
-        _ => format!("{:>3}h", secs / 3600),
-    }
+fn log_contents(ui: &mut egui::Ui, bar: &mut StatusBar) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} messages", bar.history.len())).weak());
+        if ui.button("Copy all").clicked() {
+            let all: Vec<String> = bar
+                .history
+                .iter()
+                .map(|m| format!("{}  {}", m.at.format("%Y-%m-%d %H:%M:%S"), m.text))
+                .collect();
+            ui.ctx().copy_text(all.join("\n"));
+        }
+        if ui.button("Clear").clicked() {
+            bar.history.clear();
+        }
+    });
+    ui.separator();
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for message in bar.history.iter().rev() {
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new(message.at.format("%H:%M:%S").to_string()).weak().monospace())
+                    .on_hover_text(message.at.format("%Y-%m-%d %H:%M:%S").to_string());
+                let color = if message.error { WARN } else { ui.visuals().text_color() };
+                ui.add(
+                    egui::Label::new(RichText::new(&message.text).color(color))
+                        .wrap()
+                        .selectable(true),
+                );
+            });
+            ui.separator();
+        }
+    });
 }
