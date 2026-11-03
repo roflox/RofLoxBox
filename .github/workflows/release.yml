@@ -1,0 +1,147 @@
+# Builds the installers for macOS, Windows and Linux, on each system, for a
+# version tag (v0.1.0, …) or by hand (Actions → Release → Run workflow).
+# A tag also makes a draft GitHub release with them and their SHA-256 sums.
+#
+# Signing uses these repository secrets when present (Settings → Secrets
+# and variables → Actions); without them the builds are unsigned (macOS:
+# ad hoc).
+#   macOS (Apple Developer Program):
+#     MACOS_CERTIFICATE           Developer ID Application certificate, .p12, base64
+#     MACOS_CERTIFICATE_PASSWORD  its password
+#     MACOS_SIGN_IDENTITY         "Developer ID Application: Name (TEAMID)"
+#     APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD  for notarization
+#                                 (an app-specific password from appleid.apple.com)
+#   Windows (a code-signing certificate):
+#     WINDOWS_CERTIFICATE           .pfx, base64
+#     WINDOWS_CERTIFICATE_PASSWORD  its password
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Signing certificate
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICATE" ]; then echo "No certificate: ad hoc signing"; exit 0; fi
+          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k ci "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          echo "MACOS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ]; then
+            xcrun notarytool store-credentials rofloxbox --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --keychain "$KEYCHAIN"
+            echo "MACOS_NOTARY_PROFILE=rofloxbox" >> "$GITHUB_ENV"
+          fi
+      - run: ./scripts/build-macos.sh --universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            target/dist/*.dmg
+            target/dist/*.zip
+
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    env:
+      # A static C runtime: no Visual C++ Redistributable needed.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p deckhand-app
+      - name: Installer
+        env:
+          CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -1)
+          mkdir -p target/dist
+          EXE=$(pwd -W)/target/dist/RofLoxBox.exe
+          cp target/release/deckhand-app.exe target/dist/RofLoxBox.exe
+          SIGNTOOL=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe | tail -1)
+          sign() {
+            if [ -z "$CERTIFICATE" ]; then return; fi
+            "$SIGNTOOL" sign -f "$RUNNER_TEMP/cert.pfx" -p "$PASSWORD" -fd sha256 \
+              -tr http://timestamp.digicert.com -td sha256 "$1"
+          }
+          if [ -n "$CERTIFICATE" ]; then
+            echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.pfx"
+          else
+            echo "No certificate: not signing"
+          fi
+          sign target/dist/RofLoxBox.exe
+          command -v makensis || choco install nsis -y --no-progress
+          MAKENSIS=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
+          SETUP=$(pwd -W)/target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe
+          "$MAKENSIS" -V2 -DVERSION="$VERSION" -DEXE="$EXE" -DOUT="$SETUP" packaging/windows/RofLoxBox.nsi
+          sign "target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe"
+          (cd target/dist && 7z a -bd "RofLoxBox-$VERSION-windows-x64.zip" RofLoxBox.exe >/dev/null && rm RofLoxBox.exe)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            target/dist/*.exe
+            target/dist/*.zip
+
+  linux:
+    # The oldest supported Ubuntu: the AppImage then runs on newer systems too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config libfuse2
+      - name: appimagetool
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+      - run: ./scripts/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            target/dist/*.AppImage
+            target/dist/*.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*

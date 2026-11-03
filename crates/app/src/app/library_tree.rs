@@ -812,6 +812,14 @@ impl DeckhandApp {
                     }
                 });
                 // Tracks of this stick dropped on one of its playlists.
+                if !folder && response.dnd_hover_payload::<crate::browser::TrackDrag>().is_some() {
+                    ui.painter().rect_stroke(
+                        response.rect,
+                        3.0,
+                        egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 if !folder
                     && let Some(drag) = response.dnd_release_payload::<crate::browser::TrackDrag>()
                 {

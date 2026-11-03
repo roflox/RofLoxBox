@@ -88,8 +88,11 @@ impl DeckhandApp {
     }
 
     /// While tracks are dragged: how many, next to the pointer.
-    pub(super) fn drag_hint(&self, ctx: &egui::Context) {
-        let Some(drag) = egui::DragAndDrop::payload::<TrackDrag>(ctx) else { return };
+    pub(super) fn drag_hint(&mut self, ctx: &egui::Context) {
+        let Some(drag) = egui::DragAndDrop::payload::<TrackDrag>(ctx) else {
+            self.deck_drag = None;
+            return;
+        };
         let Some(pointer) = ctx.pointer_hover_pos() else { return };
         let count = match &*drag {
             TrackDrag::Collection(ids) | TrackDrag::Usb(_, ids) => ids.len(),
@@ -109,6 +112,50 @@ impl DeckhandApp {
                     });
                 });
             });
+    }
+
+    /// Makes `rect` a place to drop tracks for `deck` (the deck itself, its
+    /// waveform, its mixer channel): outlined while tracks are over it, and
+    /// loading the first on release. A deck's own track dragged back onto
+    /// it does nothing, so a slip cannot reload a playing deck.
+    pub(super) fn deck_drop_target(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        id: egui::Id,
+        deck: usize,
+    ) {
+        let target = ui.interact(rect, id, egui::Sense::hover());
+        let own = self.deck_drag == Some(deck);
+        if target.dnd_hover_payload::<TrackDrag>().is_some() && !own {
+            ui.painter().rect_stroke(
+                rect,
+                4.0,
+                egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(drag) = target.dnd_release_payload::<TrackDrag>()
+            && !own
+        {
+            let ctx = ui.ctx().clone();
+            self.drop_on_deck(&drag, deck, &ctx);
+        }
+    }
+
+    /// The track on a deck starts being dragged (by its title): onto a
+    /// playlist, another deck, a waveform or a mixer channel.
+    pub(super) fn start_deck_drag(&mut self, ctx: &egui::Context, deck: usize) {
+        let Some(track) = &self.decks[deck].track else { return };
+        let drag = if track.from_collection {
+            TrackDrag::Collection(vec![track.id])
+        } else if let Some(root) = &track.usb_root {
+            TrackDrag::Usb(root.clone(), vec![track.id])
+        } else {
+            TrackDrag::Files(vec![track.path.clone()])
+        };
+        egui::DragAndDrop::set_payload(ctx, drag);
+        self.deck_drag = Some(deck);
     }
 
     /// Tracks dropped on a collection playlist.

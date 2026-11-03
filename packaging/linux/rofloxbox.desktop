@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RofLoxBox
+Comment=DJ software for rekordbox libraries and controllers
+Exec=rofloxbox
+Icon=rofloxbox
+Categories=AudioVideo;Audio;Music;
+Terminal=false

@@ -127,6 +127,8 @@ pub struct HotCue {
 /// Everything known about the track on a deck.
 pub struct LoadedTrack {
     pub id: u32,
+    /// The audio file.
+    pub path: PathBuf,
     /// From deckhand's collection rather than a USB export.
     pub from_collection: bool,
     /// The export it came from (USB tracks).
@@ -1800,6 +1802,7 @@ impl LoadRequest {
 
         let track = LoadedTrack {
             id: self.id,
+            path: self.audio_path.clone(),
             from_collection: self.from_collection,
             usb_root: self.usb_root,
             first_sound: self.auto_cue_db.and_then(|db| first_sound(&audio, db)),
@@ -1837,18 +1840,26 @@ mod tests {
                 .collect()
         };
         let audio = TrackAudio { sample_rate: 44_100, samples: sine(1.0) };
-        assert!((auto_gain_db(&audio) - AUTO_GAIN_TARGET_DB).abs() < 0.1, "{}", auto_gain_db(&audio));
+        assert!(
+            (auto_gain_db(&audio) - AUTO_GAIN_TARGET_DB).abs() < 0.1,
+            "{}",
+            auto_gain_db(&audio)
+        );
         let mut samples = vec![0.0; 44_100 * 4];
         samples.extend(sine(0.01));
         samples.extend(sine(0.5));
         let half = auto_gain_db(&TrackAudio { sample_rate: 44_100, samples });
         assert!((half - (AUTO_GAIN_TARGET_DB + 6.0)).abs() < 0.2, "{half}");
-        assert_eq!(auto_gain_db(&TrackAudio { sample_rate: 44_100, samples: vec![0.0; 1000] }), 0.0);
+        assert_eq!(
+            auto_gain_db(&TrackAudio { sample_rate: 44_100, samples: vec![0.0; 1000] }),
+            0.0
+        );
     }
 
     fn track(beats: Vec<(f64, u16)>, bpm: f64) -> LoadedTrack {
         LoadedTrack {
             id: 1,
+            path: PathBuf::new(),
             from_collection: false,
             usb_root: None,
             first_sound: None,

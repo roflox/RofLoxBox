@@ -442,7 +442,10 @@ impl DeckhandApp {
         for deck in &mut self.decks {
             // Track gain, measured on load or changed on the deck.
             if let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection)
-                && self.collection.track(loaded.id).is_some_and(|t| t.gain_db != Some(loaded.gain_db))
+                && self
+                    .collection
+                    .track(loaded.id)
+                    .is_some_and(|t| t.gain_db != Some(loaded.gain_db))
             {
                 let gain = loaded.gain_db;
                 self.collection.update_track(loaded.id, |t| t.gain_db = Some(gain));
@@ -709,7 +712,17 @@ impl DeckhandApp {
                 self.select_entry(super::library_tree::TreeEntry::Collection(Some(id)));
                 self.focus = Focus::Playlists;
             }
-            // Tracks dropped on a playlist are added to it.
+            // Tracks dropped on a playlist are added to it; it is outlined while they are over it.
+            if kind == NodeKind::Playlist
+                && response.dnd_hover_payload::<crate::browser::TrackDrag>().is_some()
+            {
+                ui.painter().rect_stroke(
+                    response.rect,
+                    3.0,
+                    egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
+                    egui::StrokeKind::Inside,
+                );
+            }
             if kind == NodeKind::Playlist
                 && let Some(drag) = response.dnd_release_payload::<crate::browser::TrackDrag>()
             {

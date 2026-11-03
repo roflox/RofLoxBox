@@ -24,10 +24,17 @@ mod usb_import;
 mod waveform;
 mod widgets;
 
+/// The app icon for the window, taskbar and Dock (packaging/icon.svg).
+fn window_icon() -> eframe::egui::IconData {
+    let png = include_bytes!("../../../packaging/icons/RofLoxBox-256.png");
+    eframe::icon_data::from_png_bytes(png).unwrap_or_default()
+}
+
 fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 920.0])
-        .with_title(APP_NAME);
+        .with_title(APP_NAME)
+        .with_icon(window_icon());
     // Test aid: open the window at "x,y" (for example on another monitor).
     if let Some((x, y)) = std::env::var("DECKHAND_WINDOW_POS")
         .ok()
