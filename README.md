@@ -70,13 +70,33 @@ presets for Demucs and audio-separator; results are cached per track.
 Dragging a running waveform stops the deck under the mouse, and it plays on
 from there when let go. Preferences → Appearance has dark and light themes.
 
-### Windows
+### Installers
 
-`scripts/build-windows.sh` cross-compiles a self-contained 64-bit Windows
-10/11 `.exe` from macOS or Linux (needs `cargo install cargo-xwin` and
-`rustup target add x86_64-pc-windows-msvc`); it ends up in
-`target/x86_64-pc-windows-msvc/release/deckhand-app.exe`. On Windows itself,
-`cargo build --release -p deckhand-app` works as usual.
+Each script leaves its results in `target/dist/`:
+
+- `scripts/build-macos.sh [--universal]` (on a Mac): `RofLoxBox.app`, a
+  `.dmg` to drag it into Applications, and a `.zip`. `--universal` also
+  runs on Intel Macs (`rustup target add x86_64-apple-darwin`).
+- `scripts/build-windows.sh` (on macOS or Linux): a self-contained 64-bit
+  Windows 10/11 `RofLoxBox.exe` in a `.zip` and, with NSIS
+  (`brew install makensis`), a `-setup.exe` installer. Needs
+  `cargo install cargo-xwin` and `rustup target add x86_64-pc-windows-msvc`.
+- `scripts/build-linux.sh` (on Linux, with `libasound2-dev`): a `.tar.gz`
+  and, with `appimagetool`, an AppImage.
+
+Pushing a version tag (`git tag v0.1.0 && git push --tags`) runs
+`.github/workflows/release.yml`, which builds all three on GitHub's machines
+and makes a draft release with them and their SHA-256 sums.
+
+Signing needs your own certificates; without them the builds are unsigned
+(macOS ad hoc: open it once with right-click → Open; Windows SmartScreen
+warns once). The scripts read `MACOS_SIGN_IDENTITY` and
+`MACOS_NOTARY_PROFILE` (Apple Developer ID and notarization) and
+`WINDOWS_SIGN_PFX` / `WINDOWS_SIGN_PASSWORD`; the workflow reads the
+repository secrets listed at its top. Linux packages are not signed.
+
+The icon is `packaging/icon.svg`; `packaging/make-icons.sh` renders the
+`.icns`, `.ico` and `.png` files in `packaging/icons/` from it.
 
 ## Crates
 

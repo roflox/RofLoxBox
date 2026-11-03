@@ -397,7 +397,8 @@ pub fn draw_detail(
         if first >= columns {
             break;
         }
-        let end = (((t + 1.0 / px_per_sec) * COLUMNS_PER_SECOND) as usize).clamp(first + 1, columns);
+        let end =
+            (((t + 1.0 / px_per_sec) * COLUMNS_PER_SECOND) as usize).clamp(first + 1, columns);
         let a = step as f32;
         let bar = |height: f32, color: Color32| {
             let h = height.min(1.0) * half;
@@ -406,9 +407,9 @@ pub fn draw_detail(
             }
         };
         if use_bands {
-            let [low, mid_band, high] = data.bands[first..end].iter().fold([0.0f32; 3], |m, b| {
-                [m[0].max(b[0]), m[1].max(b[1]), m[2].max(b[2])]
-            });
+            let [low, mid_band, high] = data.bands[first..end]
+                .iter()
+                .fold([0.0f32; 3], |m, b| [m[0].max(b[0]), m[1].max(b[1]), m[2].max(b[2])]);
             let (low, mid_band, high) = (low * gains[0], mid_band * gains[1], high * gains[2]);
             // Larger of low/mid first, their overlap in brown, highs on top.
             if low >= mid_band {

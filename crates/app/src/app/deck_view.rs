@@ -29,6 +29,8 @@ struct DeckOut {
     make_master_pressed: bool,
     key_sync: bool,
     pad_events: Vec<(DeckAction, bool)>,
+    /// The track's title started being dragged.
+    drag_track: bool,
     /// A Pad FX pad set to something else: (slot 0–15, what it does now).
     pad_fx_edits: Vec<(usize, PadFxSlot)>,
     status: Option<String>,
@@ -140,19 +142,10 @@ impl DeckhandApp {
 
         let out = parts.out;
         let ctx = ui.ctx().clone();
-        // Tracks dragged from a list load onto the deck they are dropped on.
-        let target =
-            ui.interact(area.response.rect, ui.id().with(("track drop", index)), Sense::hover());
-        if target.dnd_hover_payload::<crate::browser::TrackDrag>().is_some() {
-            ui.painter().rect_stroke(
-                area.response.rect,
-                4.0,
-                egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
-                egui::StrokeKind::Inside,
-            );
-        }
-        if let Some(drag) = target.dnd_release_payload::<crate::browser::TrackDrag>() {
-            self.drop_on_deck(&drag, index, &ctx);
+        // Tracks dragged from a list or another deck load onto the deck they are dropped on.
+        self.deck_drop_target(ui, area.response.rect, ui.id().with(("track drop", index)), index);
+        if out.drag_track {
+            self.start_deck_drag(&ctx, index);
         }
         for (slot, pad) in out.pad_fx_edits {
             self.set_pad_fx(slot, pad);
@@ -296,14 +289,22 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             });
         }
         E::Title => match &deck.track {
-            Some(track) if compact => {
-                ui.label(RichText::new(format!("{} — {}", track.title, track.artist)).strong());
-            }
             Some(track) => {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&track.title).size(18.0).strong());
-                    ui.label(&track.artist);
-                });
+                // Dragging the title takes the track to a playlist or another deck.
+                let response = if compact {
+                    ui.label(RichText::new(format!("{} — {}", track.title, track.artist)).strong())
+                } else {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&track.title).size(18.0).strong());
+                        ui.label(&track.artist);
+                    })
+                    .response
+                };
+                let response = response
+                    .interact(Sense::drag())
+                    .on_hover_cursor(egui::CursorIcon::Grab)
+                    .on_hover_text("Drag onto a playlist, another deck, a waveform or a mixer channel");
+                p.out.drag_track |= response.drag_started();
             }
             None => {
                 ui.label(RichText::new("Empty — double-click a track in the library").weak());
@@ -895,16 +896,29 @@ fn pad_fx_area(
                             .size(if compact { 11.0 } else { 13.0 })
                             .color(if lit { Color32::WHITE } else { pad_fx_color(set.effect) });
                         let button = egui::Button::new(text)
-                            .fill(if lit { ACTIVE.gamma_multiply(0.6) } else { Color32::from_gray(30) })
+                            .fill(if lit {
+                                ACTIVE.gamma_multiply(0.6)
+                            } else {
+                                Color32::from_gray(30)
+                            })
                             .min_size(pad)
                             .sense(Sense::click_and_drag());
-                        let response = ui.add_enabled(deck.track.is_some(), button).on_hover_text(format!(
-                            "Pad {}: hold for {}; Shift or right-click for {}",
-                            char::from(b'A' + fx as u8),
-                            set.label(),
-                            effects.pad_slot((fx + 8) % 16).label(),
-                        ));
-                        hold_pad(ui, &response, PadMode::PadFx, slot, shift_held, &mut pad_held[slot], out);
+                        let response =
+                            ui.add_enabled(deck.track.is_some(), button).on_hover_text(format!(
+                                "Pad {}: hold for {}; Shift or right-click for {}",
+                                char::from(b'A' + fx as u8),
+                                set.label(),
+                                effects.pad_slot((fx + 8) % 16).label(),
+                            ));
+                        hold_pad(
+                            ui,
+                            &response,
+                            PadMode::PadFx,
+                            slot,
+                            shift_held,
+                            &mut pad_held[slot],
+                            out,
+                        );
                     }
                 });
             }
@@ -912,7 +926,10 @@ fn pad_fx_area(
         ui.horizontal(|ui| {
             for (n, label) in ["1", "2"].into_iter().enumerate() {
                 if ui
-                    .selectable_label(usize::from(deck.pad_fx_page) == n, RichText::new(label).strong())
+                    .selectable_label(
+                        usize::from(deck.pad_fx_page) == n,
+                        RichText::new(label).strong(),
+                    )
                     .on_hover_text(if n == 0 { "Pads A–H" } else { "Pads I–P" })
                     .clicked()
                 {
@@ -920,12 +937,19 @@ fn pad_fx_area(
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let hover = if deck.pad_fx_settings { "Back to the pads" } else { "Set what each pad does" };
+                let hover = if deck.pad_fx_settings {
+                    "Back to the pads"
+                } else {
+                    "Set what each pad does"
+                };
                 if ui.selectable_label(deck.pad_fx_settings, "⚙").on_hover_text(hover).clicked() {
                     deck.pad_fx_settings = !deck.pad_fx_settings;
                 }
                 if deck.pad_fx_settings
-                    && ui.small_button("↺").on_hover_text("Factory settings for this page's pads").clicked()
+                    && ui
+                        .small_button("↺")
+                        .on_hover_text("Factory settings for this page's pads")
+                        .clicked()
                 {
                     let defaults = PadFxSlot::defaults().into_iter().enumerate();
                     out.pad_fx_edits.extend(defaults.skip(page).take(8));
@@ -972,27 +996,43 @@ fn pad_fx_settings(
                         let mut set = effects.pad_slot(slot);
                         let lit = effects.pad == Some((index, slot as u8));
                         ui.horizontal(|ui| {
-                            let fill = if lit { ACTIVE.gamma_multiply(0.6) } else { Color32::from_gray(22) };
-                            let name = RichText::new(set.effect.label())
-                                .strong()
-                                .color(if lit { Color32::WHITE } else { pad_fx_color(set.effect) });
+                            let fill = if lit {
+                                ACTIVE.gamma_multiply(0.6)
+                            } else {
+                                Color32::from_gray(22)
+                            };
+                            let name = RichText::new(set.effect.label()).strong().color(if lit {
+                                Color32::WHITE
+                            } else {
+                                pad_fx_color(set.effect)
+                            });
                             let button = egui::Button::new(name)
                                 .fill(fill)
                                 .min_size(vec2(name_width, row))
                                 .sense(Sense::click_and_drag());
-                            let response =
-                                ui.add_enabled(deck.track.is_some(), button).on_hover_text(format!(
+                            let response = ui
+                                .add_enabled(deck.track.is_some(), button)
+                                .on_hover_text(format!(
                                     "Pad {}: hold for {}",
                                     char::from(b'A' + slot as u8),
                                     set.label(),
                                 ));
-                            hold_pad(ui, &response, PadMode::PadFx, pad, shift_held, &mut pad_held[pad], out);
+                            hold_pad(
+                                ui,
+                                &response,
+                                PadMode::PadFx,
+                                pad,
+                                shift_held,
+                                &mut pad_held[pad],
+                                out,
+                            );
                             egui::ComboBox::from_id_salt(("pad fx effect", index, slot))
                                 .selected_text("")
                                 .width(18.0)
                                 .show_ui(ui, |ui| {
                                     for kind in BeatFxKind::ALL {
-                                        let text = RichText::new(kind.label()).color(pad_fx_color(kind));
+                                        let text =
+                                            RichText::new(kind.label()).color(pad_fx_color(kind));
                                         ui.selectable_value(&mut set.effect, kind, text);
                                     }
                                 })
@@ -1003,7 +1043,11 @@ fn pad_fx_settings(
                                 .width(list)
                                 .show_ui(ui, |ui| {
                                     for beats in FX_BEATS {
-                                        ui.selectable_value(&mut set.beats, beats, beat_label(beats));
+                                        ui.selectable_value(
+                                            &mut set.beats,
+                                            beats,
+                                            beat_label(beats),
+                                        );
                                     }
                                 })
                                 .response

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262b38"/>
+      <stop offset="1" stop-color="#0c0e13"/>
+    </linearGradient>
+    <radialGradient id="platter" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#3a3f4b"/>
+      <stop offset="0.7" stop-color="#1a1d24"/>
+      <stop offset="1" stop-color="#101217"/>
+    </radialGradient>
+    <linearGradient id="label" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f4f6fa"/>
+      <stop offset="1" stop-color="#c9cfdb"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS icon grid: 824 square inside the 1024 canvas -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="185" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <!-- jog platter -->
+  <circle cx="512" cy="512" r="300" fill="url(#platter)"/>
+  <!-- grooves -->
+  <g fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="4">
+    <circle cx="512" cy="512" r="250"/>
+    <circle cx="512" cy="512" r="215"/>
+    <circle cx="512" cy="512" r="180"/>
+    <circle cx="512" cy="512" r="145"/>
+  </g>
+  <!-- deck rings: blue (deck 1) and orange (deck 2) -->
+  <g fill="none" stroke-width="34" stroke-linecap="round">
+    <path d="M 512 172 A 340 340 0 0 0 512 852" stroke="#3c8cff" transform="rotate(-14 512 512)"/>
+    <path d="M 512 852 A 340 340 0 0 0 512 172" stroke="#ff9a1f" transform="rotate(-14 512 512)"/>
+  </g>
+  <!-- centre label -->
+  <circle cx="512" cy="512" r="104" fill="url(#label)"/>
+  <circle cx="512" cy="512" r="18" fill="#0c0e13"/>
+  <!-- cue marker -->
+  <rect x="500" y="200" width="24" height="96" rx="12" fill="#ff3b30"/>
+</svg>

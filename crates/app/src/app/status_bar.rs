@@ -105,8 +105,9 @@ impl DeckhandApp {
 
     /// Every message of this session, newest first, in its own window.
     fn log_window(&mut self, ctx: &egui::Context) {
-        let builder =
-            ViewportBuilder::default().with_title("RofLoxBox — Log").with_inner_size([640.0, 420.0]);
+        let builder = ViewportBuilder::default()
+            .with_title("RofLoxBox — Log")
+            .with_inner_size([640.0, 420.0]);
         let bar = &mut self.status_bar;
         ctx.show_viewport_immediate(ViewportId::from_hash_of("log"), builder, |ctx, class| {
             if class == egui::ViewportClass::Embedded {
@@ -146,8 +147,10 @@ fn log_contents(ui: &mut egui::Ui, bar: &mut StatusBar) {
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for message in bar.history.iter().rev() {
             ui.horizontal_top(|ui| {
-                ui.label(RichText::new(message.at.format("%H:%M:%S").to_string()).weak().monospace())
-                    .on_hover_text(message.at.format("%Y-%m-%d %H:%M:%S").to_string());
+                ui.label(
+                    RichText::new(message.at.format("%H:%M:%S").to_string()).weak().monospace(),
+                )
+                .on_hover_text(message.at.format("%Y-%m-%d %H:%M:%S").to_string());
                 let color = if message.error { WARN } else { ui.visuals().text_color() };
                 ui.add(
                     egui::Label::new(RichText::new(&message.text).color(color))

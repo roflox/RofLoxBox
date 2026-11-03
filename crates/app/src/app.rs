@@ -133,6 +133,8 @@ pub struct DeckhandApp {
     prefs_tab: PrefsTab,
     effects: Effects,
     status_bar: status_bar::StatusBar,
+    /// The deck whose track is being dragged off it.
+    deck_drag: Option<usize>,
     /// Deck elements can be dragged around.
     editing_layout: bool,
     /// Name typed for saving the deck layout as a preset.
@@ -261,6 +263,7 @@ impl DeckhandApp {
             },
             effects: Effects::default(),
             status_bar: status_bar::StatusBar::default(),
+            deck_drag: None,
             editing_layout: std::env::var_os("DECKHAND_EDIT_LAYOUT").is_some(),
             reveal_selected: false,
             reveal_playlist: false,
@@ -574,9 +577,8 @@ impl DeckhandApp {
     pub(super) fn set_pad_fx(&mut self, slot: usize, pad: crate::effects::PadFxSlot) {
         let p = &mut self.config.prefs;
         if p.pad_fx.len() < crate::effects::PAD_FX_SLOTS {
-            p.pad_fx = (0..crate::effects::PAD_FX_SLOTS)
-                .map(|i| self.effects.pad_slot(i))
-                .collect();
+            p.pad_fx =
+                (0..crate::effects::PAD_FX_SLOTS).map(|i| self.effects.pad_slot(i)).collect();
         }
         p.pad_fx[slot] = pad;
         self.effects.set_pad_slots(&p.pad_fx);
@@ -1760,6 +1762,7 @@ impl DeckhandApp {
             egui::FontId::proportional(14.0),
             DECK_COLORS[index],
         );
+        self.deck_drop_target(ui, rect, ui.id().with(("waveform drop", index)), index);
     }
 
     fn waveform_toolbar(&mut self, ui: &mut Ui) {
@@ -2086,6 +2089,8 @@ impl DeckhandApp {
         let four = self.config.four_decks;
         let current_order = self.config.channel_order;
         let mut new_order = None;
+        // Each channel's column, to drop tracks on.
+        let mut strips = Vec::new();
         let Some(engine) = self.engine.as_mut() else { return };
         // Faders take whatever height the knobs, buttons and crossfader leave.
         let fader_height =
@@ -2132,7 +2137,7 @@ impl DeckhandApp {
                         .max(MIXER_STRIP);
                     for &index in &channels {
                         let deck = &mut self.decks[index];
-                        ui.vertical(|ui| {
+                        let column = ui.vertical(|ui| {
                             ui.set_width(strip);
                             ui.vertical_centered(|ui| {
                                 ui.label(
@@ -2239,6 +2244,7 @@ impl DeckhandApp {
                                 }
                             });
                         });
+                        strips.push((index, column.response.rect));
                     }
                     if !MIXER_MASTER_PARTS.iter().any(|&p| show(p)) {
                         return;
@@ -2326,6 +2332,9 @@ impl DeckhandApp {
                 });
             });
         });
+        for (index, rect) in strips {
+            self.deck_drop_target(ui, rect, ui.id().with(("mixer drop", index)), index);
+        }
         // One order for the app, with or without a controller.
         if let Some(order) = new_order {
             self.config.channel_order = order;
@@ -3238,10 +3247,7 @@ fn pad_face(
             face(
                 fx.pad_slot(slot).short(),
                 if held { ACTIVE } else { Color32::from_rgb(70, 45, 95) },
-                &format!(
-                    "Hold for {}; Shift for the second set",
-                    fx.pad_slot(slot).label()
-                ),
+                &format!("Hold for {}; Shift for the second set", fx.pad_slot(slot).label()),
             )
         }
         PadMode::BeatJump if shift && pad >= 6 => face(

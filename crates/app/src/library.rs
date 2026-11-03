@@ -180,7 +180,9 @@ pub fn eject(root: &Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn windows_eject(root: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
@@ -237,11 +239,18 @@ fn windows_eject(root: &Path) -> anyhow::Result<()> {
         } else {
             let allow = PREVENT_MEDIA_REMOVAL { PreventMediaRemoval: false };
             let allow_ptr = (&raw const allow).cast();
-            control(IOCTL_STORAGE_MEDIA_REMOVAL, allow_ptr, size_of::<PREVENT_MEDIA_REMOVAL>() as u32);
+            control(
+                IOCTL_STORAGE_MEDIA_REMOVAL,
+                allow_ptr,
+                size_of::<PREVENT_MEDIA_REMOVAL>() as u32,
+            );
             if control(IOCTL_STORAGE_EJECT_MEDIA, std::ptr::null(), 0) {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!("could not eject {letter}: {}", std::io::Error::last_os_error()))
+                Err(anyhow::anyhow!(
+                    "could not eject {letter}: {}",
+                    std::io::Error::last_os_error()
+                ))
             }
         };
         CloseHandle(handle);
