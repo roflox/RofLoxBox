@@ -440,6 +440,13 @@ impl DeckhandApp {
     pub(super) fn save_track_edits(&mut self) {
         use deckhand_library::{Cue, CueKind, TempoMarker};
         for deck in &mut self.decks {
+            // Track gain, measured on load or changed on the deck.
+            if let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection)
+                && self.collection.track(loaded.id).is_some_and(|t| t.gain_db != Some(loaded.gain_db))
+            {
+                let gain = loaded.gain_db;
+                self.collection.update_track(loaded.id, |t| t.gain_db = Some(gain));
+            }
             // Detected on load: fills in only what the collection lacks.
             if std::mem::take(&mut deck.analysed)
                 && let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection)

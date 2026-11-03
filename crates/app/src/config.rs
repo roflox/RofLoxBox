@@ -193,7 +193,14 @@ pub struct Preferences {
     pub analyze_on_load: bool,
     /// No loading onto a playing deck.
     pub load_lock: bool,
-    /// No jumping by clicking the overview of a playing deck.
+    /// Tracks play at their track gain (Auto Gain).
+    pub auto_gain: bool,
+    /// What the Pad FX pads do, A to P.
+    pub pad_fx: Vec<crate::effects::PadFxSlot>,
+    /// No jumping by clicking the small waveform (overview) of a playing
+    /// deck. Its own key: the old `needle_lock` was on by default and also
+    /// locked the big waveform.
+    #[serde(rename = "overview_needle_lock")]
     pub needle_lock: bool,
     /// No calling memory cues on a playing deck.
     pub memory_call_lock: bool,
@@ -255,7 +262,9 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             load_lock: true,
-            needle_lock: true,
+            auto_gain: true,
+            pad_fx: crate::effects::PadFxSlot::defaults(),
+            needle_lock: false,
             memory_call_lock: true,
             key_notation: Default::default(),
             theme: Theme::Dark,

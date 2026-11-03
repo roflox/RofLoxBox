@@ -34,6 +34,18 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
+/// On Windows, runs a command-line tool without opening a console window
+/// for it (its output is read through pipes anyway).
+pub fn no_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub const MODEL_FILE: &str = "model.toml";
 /// Audio files a model's results may come as.
 const AUDIO: [&str; 7] = ["wav", "flac", "aif", "aiff", "mp3", "ogg", "m4a"];
@@ -398,7 +410,7 @@ fn separate(
             .replace("{model}", &model.dir.to_string_lossy())
     };
     let args: Vec<String> = model.command.iter().map(fill).collect();
-    let mut child = Command::new(&args[0])
+    let mut child = no_window(&mut Command::new(&args[0]))
         .args(&args[1..])
         .current_dir(&model.dir)
         .env("PATH", search_path(&model.dir))

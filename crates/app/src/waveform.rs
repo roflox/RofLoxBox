@@ -64,16 +64,24 @@ impl WaveformData {
         (!detail.is_empty()).then(|| Self { colored, ..Self::with_detail(detail, bands) })
     }
 
-    /// Gives a waveform without colours (from peaks, or rekordbox's
-    /// monochrome one) colours from its bands, like rekordbox's RGB view:
-    /// bass red, mids green, highs blue.
-    pub fn color_from_bands(&mut self) {
-        if self.colored || self.bands.is_empty() {
+    /// Shapes the waveform from its bands, like rekordbox's RGB view. The
+    /// heights follow the bands' level: rekordbox's own colour waveform
+    /// (PWV5) has spiky heights that drop to almost nothing in loud
+    /// passages, which drew as black gaps the overview did not have. A
+    /// waveform without colours (from peaks, or rekordbox's monochrome one)
+    /// also gets them from the bands: bass red, mids green, highs blue.
+    pub fn shape_from_bands(&mut self) {
+        if self.bands.is_empty() {
             return;
         }
+        let level = |&[low, mid, high]: &[f32; 3]| (low * low + mid * mid + high * high).sqrt();
+        let loudest = self.bands.iter().map(level).fold(0.0f32, f32::max).max(1e-6);
+        let last = self.bands.len() - 1;
         for (i, column) in self.detail.iter_mut().enumerate() {
-            if let Some(&bands) = self.bands.get(i.min(self.bands.len() - 1)) {
-                column.color = band_color(bands);
+            let bands = &self.bands[i.min(last)];
+            column.height = level(bands) / loudest;
+            if !self.colored {
+                column.color = band_color(*bands);
             }
         }
         *self = Self {
@@ -377,12 +385,19 @@ pub fn draw_detail(
     }
 
     let use_bands = style == WaveformStyle::ThreeBand && data.has_bands();
+    let columns = if use_bands { data.bands.len() } else { data.detail.len() };
     for step in 0..length as usize {
         let t = start + step as f64 / px_per_sec;
         if t < 0.0 {
             continue;
         }
-        let index = (t * COLUMNS_PER_SECOND) as usize;
+        // Every column under this pixel counts, the loudest showing (as in
+        // the overview), so zoomed out nothing falls between pixels.
+        let first = (t * COLUMNS_PER_SECOND) as usize;
+        if first >= columns {
+            break;
+        }
+        let end = (((t + 1.0 / px_per_sec) * COLUMNS_PER_SECOND) as usize).clamp(first + 1, columns);
         let a = step as f32;
         let bar = |height: f32, color: Color32| {
             let h = height.min(1.0) * half;
@@ -391,7 +406,9 @@ pub fn draw_detail(
             }
         };
         if use_bands {
-            let Some(&[low, mid_band, high]) = data.bands.get(index) else { break };
+            let [low, mid_band, high] = data.bands[first..end].iter().fold([0.0f32; 3], |m, b| {
+                [m[0].max(b[0]), m[1].max(b[1]), m[2].max(b[2])]
+            });
             let (low, mid_band, high) = (low * gains[0], mid_band * gains[1], high * gains[2]);
             // Larger of low/mid first, their overlap in brown, highs on top.
             if low >= mid_band {
@@ -402,7 +419,10 @@ pub fn draw_detail(
             bar(low.min(mid_band), LOW_MID);
             bar(high * 0.6, HIGH);
         } else {
-            let Some(&column) = data.detail.get(index) else { break };
+            let column = *data.detail[first..end]
+                .iter()
+                .max_by(|a, b| a.height.total_cmp(&b.height))
+                .expect("non-empty range");
             let column = eq_rgb(column, gains);
             bar(column.height, column.color);
         }
@@ -601,7 +621,18 @@ mod tests {
         assert!(hats.b() > 200 && hats.r() < 100, "{hats:?}");
         let mut data =
             WaveformData::from_peaks(&[0.5, 1.0], vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]);
-        data.color_from_bands();
+        data.shape_from_bands();
         assert!(data.colored && data.detail[0].color.r() > data.detail[0].color.b());
+    }
+
+    #[test]
+    fn heights_follow_the_bands() {
+        // rekordbox's heights dip to nothing where the bands stay loud.
+        let mut data = WaveformData::from_peaks(&[1.0, 0.0, 1.0], vec![[0.8, 0.6, 0.0]; 3]);
+        data.colored = true;
+        let color = data.detail[1].color;
+        data.shape_from_bands();
+        assert!(data.detail.iter().all(|c| (c.height - 1.0).abs() < 1e-6));
+        assert_eq!(data.detail[1].color, color, "rekordbox's colours stay");
     }
 }

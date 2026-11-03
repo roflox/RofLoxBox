@@ -76,9 +76,21 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             lock(ui, &mut p.load_lock);
             ui.label(RichText::new("Locked: no loading onto a playing deck.").small().weak());
         });
+        section(ui, "Auto Gain", |ui| {
+            ui.checkbox(&mut p.auto_gain, "Play tracks at their track gain");
+            ui.label(
+                RichText::new(
+                    "Each track gets a gain from its loudness when it is first loaded, so tracks \
+                     play equally loud. Drag the dB value on a deck to change it; collection \
+                     tracks keep it.",
+                )
+                .small()
+                .weak(),
+            );
+        });
         section(ui, "Needle Lock", |ui| {
             lock(ui, &mut p.needle_lock);
-            ui.label(RichText::new("Locked: clicking the overview of a playing deck does not jump.").small().weak());
+            ui.label(RichText::new("Locked: clicking the small waveform of a playing deck does not jump. The big waveform always jumps.").small().weak());
         });
         section(ui, "Key display format", |ui| {
             use crate::deck::KeyNotation;
@@ -184,6 +196,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             let defaults = Preferences::default();
             p.load_lock = defaults.load_lock;
             p.needle_lock = defaults.needle_lock;
+            p.auto_gain = defaults.auto_gain;
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
             p.analysis = defaults.analysis;

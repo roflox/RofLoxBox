@@ -15,7 +15,7 @@ use crate::widgets::{RoundIcon, round_button};
 /// Accent colours of lit buttons.
 const RED: Color32 = Color32::from_rgb(230, 60, 50);
 use crate::deck::{Deck, TempoRange, display_key, format_key};
-use crate::effects::Effects;
+use crate::effects::{Effects, FX_BEATS, PadFxSlot, beat_label};
 use crate::layout::{DeckElement, Place};
 use crate::library::format_time;
 use crate::waveform::{Markers, draw_overview};
@@ -29,6 +29,8 @@ struct DeckOut {
     make_master_pressed: bool,
     key_sync: bool,
     pad_events: Vec<(DeckAction, bool)>,
+    /// A Pad FX pad set to something else: (slot 0–15, what it does now).
+    pad_fx_edits: Vec<(usize, PadFxSlot)>,
     status: Option<String>,
 }
 
@@ -151,6 +153,9 @@ impl DeckhandApp {
         }
         if let Some(drag) = target.dnd_release_payload::<crate::browser::TrackDrag>() {
             self.drop_on_deck(&drag, index, &ctx);
+        }
+        for (slot, pad) in out.pad_fx_edits {
+            self.set_pad_fx(slot, pad);
         }
         for (action, pressed) in out.pad_events {
             self.apply_deck_event(index, action, Value::Pressed(pressed), &ctx);
@@ -340,6 +345,32 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 ui.separator();
                 ui.label(RichText::new(display_key(key, deck.prefs.key_notation)).monospace());
             }
+            let mut new_gain = None;
+            if deck.prefs.auto_gain {
+                ui.separator();
+                let mut gain = track.gain_db;
+                let response = ui
+                    .add(
+                        egui::DragValue::new(&mut gain)
+                            .range(crate::deck::TRACK_GAIN_DB)
+                            .speed(0.05)
+                            .fixed_decimals(1)
+                            .custom_formatter(|v, _| format!("{v:+.1} dB")),
+                    )
+                    .on_hover_text("Track gain (Auto Gain): drag to change, right-click to measure again");
+                let mut measured = None;
+                response.context_menu(|ui| {
+                    if ui.button("Measure again").clicked() {
+                        measured = deck.measured_gain_db();
+                        ui.close();
+                    }
+                    if ui.button("0 dB").clicked() {
+                        measured = Some(0.0);
+                        ui.close();
+                    }
+                });
+                new_gain = measured.or(response.changed().then_some(gain));
+            }
             ui.separator();
             let size = if compact { 15.0 } else { 20.0 };
             ui.label(RichText::new(format_time(position)).size(size).monospace());
@@ -364,6 +395,9 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                         .color(color),
                 )
                 .on_hover_text("Bars.beats to the next memory cue");
+            }
+            if let Some(db) = new_gain {
+                deck.set_track_gain(db, engine);
             }
         }
         E::Overview => {
@@ -557,51 +591,31 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 }
             });
         }
+        E::Pads if deck.pad_mode == PadMode::PadFx => {
+            let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
+            pad_fx_area(ui, deck, p.effects, p.pad_held, &mut p.out, shift_held, index, compact);
+        }
         E::Pads => {
             let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
-            let rows: &[std::ops::Range<usize>] = if compact { &[0..8] } else { &[0..4, 4..8] };
-            ui.vertical(|ui| {
-                for row in rows {
+            let pads = PadBox::new(ui, compact);
+            pads.show(ui, |ui| {
+                for row in [0..4, 4..8] {
                     ui.horizontal(|ui| {
-                        if compact {
-                            // Eight pads in one row must fit a narrow four-deck column.
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                        }
-                        for slot in row.clone() {
-                            let size = if compact { vec2(27.0, 22.0) } else { vec2(52.0, 30.0) };
+                        for slot in row {
                             let face = pad_face(deck, slot, shift_held, p.effects, engine, index);
                             let text = RichText::new(face.label)
                                 .strong()
-                                .size(if compact { 10.0 } else { 12.0 });
+                                .size(if compact { 11.0 } else { 13.0 });
                             // Held pads must keep counting as held past egui's click time.
                             let button = egui::Button::new(text)
                                 .fill(face.fill)
-                                .min_size(size)
+                                .min_size(pads.pad)
                                 .sense(Sense::click_and_drag());
                             let response = ui
                                 .add_enabled(deck.track.is_some() || deck.pad_mode == PadMode::Sampler, button)
                                 .on_hover_text(face.hover);
-                            let down = |button| ui.input(|i| i.pointer.button_down(button));
-                            let primary =
-                                response.is_pointer_button_down_on() && down(egui::PointerButton::Primary);
-                            let secondary =
-                                response.is_pointer_button_down_on() && down(egui::PointerButton::Secondary);
                             let held = &mut p.pad_held[slot];
-                            match (*held, primary || secondary) {
-                                (None, true) => {
-                                    // Shift-click or right-click is Shift + pad.
-                                    let shift = secondary || shift_held;
-                                    if let Some(action) = deck.pad_mode.pad_action(slot as u8, shift) {
-                                        p.out.pad_events.push((action, true));
-                                        *held = Some(action);
-                                    }
-                                }
-                                (Some(action), false) => {
-                                    p.out.pad_events.push((action, false));
-                                    *held = None;
-                                }
-                                _ => {}
-                            }
+                            hold_pad(ui, &response, deck.pad_mode, slot, shift_held, held, &mut p.out);
                         }
                     });
                 }
@@ -764,4 +778,255 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             });
         }
     }
+}
+
+/// Presses a pad while the pointer is down on it and lets go on release.
+/// Shift-click or right-click is Shift + pad.
+fn hold_pad(
+    ui: &Ui,
+    response: &egui::Response,
+    mode: PadMode,
+    slot: usize,
+    shift_held: bool,
+    held: &mut Option<DeckAction>,
+    out: &mut DeckOut,
+) {
+    let down = |button| ui.input(|i| i.pointer.button_down(button));
+    let on = response.is_pointer_button_down_on();
+    let primary = on && down(egui::PointerButton::Primary);
+    let secondary = on && down(egui::PointerButton::Secondary);
+    match (*held, primary || secondary) {
+        (None, true) => {
+            if let Some(action) = mode.pad_action(slot as u8, secondary || shift_held) {
+                out.pad_events.push((action, true));
+                *held = Some(action);
+            }
+        }
+        (Some(action), false) => {
+            out.pad_events.push((action, false));
+            *held = None;
+        }
+        _ => {}
+    }
+}
+
+/// Effect names in colours by kind, as on rekordbox's Pad FX pads.
+fn pad_fx_color(kind: deckhand_audio::BeatFxKind) -> Color32 {
+    use deckhand_audio::BeatFxKind as K;
+    match kind {
+        K::Roll => Color32::from_rgb(90, 205, 235),
+        K::Echo | K::Delay | K::LowCutEcho | K::Spiral => Color32::from_rgb(95, 150, 235),
+        K::Reverb => Color32::from_rgb(120, 215, 70),
+        K::Flanger | K::Phaser | K::Filter | K::Helix => Color32::from_rgb(70, 175, 145),
+        K::Trans | K::Pitch | K::MobiusSaw | K::MobiusTri => Color32::from_rgb(185, 125, 235),
+    }
+}
+
+/// The pads' box, the same in every pad mode: as tall as the Pad FX
+/// settings need, four pads across and two rows filling it above a row for
+/// pages and the cog.
+struct PadBox {
+    size: egui::Vec2,
+    /// A settings row.
+    row: f32,
+    /// The pads' (or settings') part, above the bottom row.
+    body: f32,
+    pad: egui::Vec2,
+}
+
+const PAD_GAP: f32 = 3.0;
+
+impl PadBox {
+    fn new(ui: &Ui, compact: bool) -> Self {
+        let width = ui.available_width().max(200.0);
+        // Four settings rows (two columns of four pads), whatever the width,
+        // so the pads keep their shape on small screens.
+        let row = if compact { 22.0 } else { 26.0 };
+        let body = 4.0 * row + 3.0 * PAD_GAP;
+        let footer = ui.spacing().interact_size.y;
+        Self {
+            size: vec2(width, body + PAD_GAP + footer),
+            row,
+            body,
+            pad: vec2((width - 3.0 * PAD_GAP) / 4.0, (body - PAD_GAP) / 2.0),
+        }
+    }
+
+    /// Draws `contents` in the box, with the pads' spacing.
+    fn show(&self, ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
+        ui.allocate_ui_with_layout(self.size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_min_size(self.size);
+            ui.spacing_mut().item_spacing = vec2(PAD_GAP, PAD_GAP);
+            contents(ui);
+        });
+    }
+}
+
+/// Pad FX mode: the pads, or with the cog their settings (rekordbox's Pad
+/// FX panel), in the same box: as tall as the settings need, so switching
+/// moves nothing. Both end in the same row: pages 1 (A–H) and 2 (I–P), the cog.
+#[allow(clippy::too_many_arguments)]
+fn pad_fx_area(
+    ui: &mut Ui,
+    deck: &mut Deck,
+    effects: &Effects,
+    pad_held: &mut [Option<DeckAction>; 8],
+    out: &mut DeckOut,
+    shift_held: bool,
+    index: usize,
+    compact: bool,
+) {
+    let pads = PadBox::new(ui, compact);
+    let PadBox { row, body, pad, .. } = pads;
+    pads.show(ui, |ui| {
+        let shift = if shift_held { 8 } else { 0 };
+        let page = usize::from(deck.pad_fx_page) * 8;
+        if deck.pad_fx_settings {
+            pad_fx_settings(ui, deck, effects, pad_held, out, shift_held, index, row, body);
+        } else {
+            for pads in [0..4, 4..8] {
+                ui.horizontal(|ui| {
+                    for slot in pads {
+                        let fx = (slot + shift + page) % 16;
+                        let set = effects.pad_slot(fx);
+                        let lit = effects.pad == Some((index, fx as u8));
+                        let text = RichText::new(set.short())
+                            .strong()
+                            .size(if compact { 11.0 } else { 13.0 })
+                            .color(if lit { Color32::WHITE } else { pad_fx_color(set.effect) });
+                        let button = egui::Button::new(text)
+                            .fill(if lit { ACTIVE.gamma_multiply(0.6) } else { Color32::from_gray(30) })
+                            .min_size(pad)
+                            .sense(Sense::click_and_drag());
+                        let response = ui.add_enabled(deck.track.is_some(), button).on_hover_text(format!(
+                            "Pad {}: hold for {}; Shift or right-click for {}",
+                            char::from(b'A' + fx as u8),
+                            set.label(),
+                            effects.pad_slot((fx + 8) % 16).label(),
+                        ));
+                        hold_pad(ui, &response, PadMode::PadFx, slot, shift_held, &mut pad_held[slot], out);
+                    }
+                });
+            }
+        }
+        ui.horizontal(|ui| {
+            for (n, label) in ["1", "2"].into_iter().enumerate() {
+                if ui
+                    .selectable_label(usize::from(deck.pad_fx_page) == n, RichText::new(label).strong())
+                    .on_hover_text(if n == 0 { "Pads A–H" } else { "Pads I–P" })
+                    .clicked()
+                {
+                    deck.pad_fx_page = n as u8;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hover = if deck.pad_fx_settings { "Back to the pads" } else { "Set what each pad does" };
+                if ui.selectable_label(deck.pad_fx_settings, "⚙").on_hover_text(hover).clicked() {
+                    deck.pad_fx_settings = !deck.pad_fx_settings;
+                }
+                if deck.pad_fx_settings
+                    && ui.small_button("↺").on_hover_text("Factory settings for this page's pads").clicked()
+                {
+                    let defaults = PadFxSlot::defaults().into_iter().enumerate();
+                    out.pad_fx_edits.extend(defaults.skip(page).take(8));
+                }
+            });
+        });
+    });
+}
+
+/// rekordbox's Pad FX panel: each pad of the page held by its name and set
+/// with its effect, beat and level lists, `body` tall.
+#[allow(clippy::too_many_arguments)]
+fn pad_fx_settings(
+    ui: &mut Ui,
+    deck: &Deck,
+    effects: &Effects,
+    pad_held: &mut [Option<DeckAction>; 8],
+    out: &mut DeckOut,
+    shift_held: bool,
+    index: usize,
+    row: f32,
+    body: f32,
+) {
+    use deckhand_audio::BeatFxKind;
+    const LEVELS: [u32; 11] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    let page = usize::from(deck.pad_fx_page) * 8;
+    let shift = if shift_held { 8 } else { 0 };
+    let gap = ui.spacing().item_spacing.x;
+    let column_width = (ui.available_width() - gap) / 2.0;
+    // Narrow decks get narrower beat and level lists.
+    let list = if column_width < 260.0 { 36.0 } else { 52.0 };
+    let lists = 18.0 + 2.0 * list + 3.0 * gap + 3.0 * 12.0;
+    let name_width = (column_width - lists).max(40.0);
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), body),
+        egui::Layout::left_to_right(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(body);
+            for column in [0..4, 4..8] {
+                ui.vertical(|ui| {
+                    ui.set_width(column_width);
+                    for pad in column {
+                        let slot = (pad + shift + page) % 16;
+                        let mut set = effects.pad_slot(slot);
+                        let lit = effects.pad == Some((index, slot as u8));
+                        ui.horizontal(|ui| {
+                            let fill = if lit { ACTIVE.gamma_multiply(0.6) } else { Color32::from_gray(22) };
+                            let name = RichText::new(set.effect.label())
+                                .strong()
+                                .color(if lit { Color32::WHITE } else { pad_fx_color(set.effect) });
+                            let button = egui::Button::new(name)
+                                .fill(fill)
+                                .min_size(vec2(name_width, row))
+                                .sense(Sense::click_and_drag());
+                            let response =
+                                ui.add_enabled(deck.track.is_some(), button).on_hover_text(format!(
+                                    "Pad {}: hold for {}",
+                                    char::from(b'A' + slot as u8),
+                                    set.label(),
+                                ));
+                            hold_pad(ui, &response, PadMode::PadFx, pad, shift_held, &mut pad_held[pad], out);
+                            egui::ComboBox::from_id_salt(("pad fx effect", index, slot))
+                                .selected_text("")
+                                .width(18.0)
+                                .show_ui(ui, |ui| {
+                                    for kind in BeatFxKind::ALL {
+                                        let text = RichText::new(kind.label()).color(pad_fx_color(kind));
+                                        ui.selectable_value(&mut set.effect, kind, text);
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Effect");
+                            egui::ComboBox::from_id_salt(("pad fx beat", index, slot))
+                                .selected_text(beat_label(set.beats))
+                                .width(list)
+                                .show_ui(ui, |ui| {
+                                    for beats in FX_BEATS {
+                                        ui.selectable_value(&mut set.beats, beats, beat_label(beats));
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Beat");
+                            let mut level = (set.depth * 100.0).round() as u32;
+                            egui::ComboBox::from_id_salt(("pad fx level", index, slot))
+                                .selected_text(level.to_string())
+                                .width(list)
+                                .show_ui(ui, |ui| {
+                                    for value in LEVELS {
+                                        ui.selectable_value(&mut level, value, value.to_string());
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Level/Depth");
+                            set.depth = level as f32 / 100.0;
+                        });
+                        if set != effects.pad_slot(slot) {
+                            out.pad_fx_edits.push((slot, set));
+                        }
+                    }
+                });
+            }
+        },
+    );
 }
