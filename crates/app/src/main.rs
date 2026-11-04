@@ -5,6 +5,8 @@
 
 /// The name shown to users (the code and settings folder keep "deckhand").
 pub const APP_NAME: &str = "RofLoxBox";
+/// 0.<number of commits>.0 (see build.rs).
+pub const VERSION: &str = env!("ROFLOXBOX_VERSION");
 
 mod analyze;
 mod app;
@@ -33,7 +35,7 @@ fn window_icon() -> eframe::egui::IconData {
 fn main() -> eframe::Result {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 920.0])
-        .with_title(APP_NAME)
+        .with_title(format!("{APP_NAME} {VERSION}"))
         .with_icon(window_icon());
     // Test aid: open the window at "x,y" (for example on another monitor).
     if let Some((x, y)) = std::env::var("DECKHAND_WINDOW_POS")

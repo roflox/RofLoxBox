@@ -88,6 +88,21 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
                 .weak(),
             );
         });
+        section(ui, "Track End Warning", |ui| {
+            ui.add(
+                egui::Slider::new(&mut p.track_end_warning, 0..=60)
+                    .suffix(" s")
+                    .custom_formatter(|v, _| if v == 0.0 { "Off".into() } else { format!("{v:.0}") }),
+            );
+            ui.label(
+                RichText::new(
+                    "The small waveform and the remaining time of a playing deck blink red this \
+                     long before the end, faster in the last 10 seconds.",
+                )
+                .small()
+                .weak(),
+            );
+        });
         section(ui, "Needle Lock", |ui| {
             lock(ui, &mut p.needle_lock);
             ui.label(RichText::new("Locked: clicking the small waveform of a playing deck does not jump. The big waveform always jumps.").small().weak());
@@ -197,6 +212,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.load_lock = defaults.load_lock;
             p.needle_lock = defaults.needle_lock;
             p.auto_gain = defaults.auto_gain;
+            p.track_end_warning = defaults.track_end_warning;
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
             p.analysis = defaults.analysis;

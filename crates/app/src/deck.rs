@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use deckhand_audio::{
-    Command, CrossfaderSide, Engine, TrackAudio, band_waveform, decode_file, peak_waveform,
+    Command, CrossfaderSide, DRUMS, Engine, PARTS, StemLayers, TrackAudio, VOCALS, band_waveform,
+    decode_file, peak_waveform,
 };
 use deckhand_control::PadMode;
 use deckhand_formats::anlz::{
@@ -347,6 +348,14 @@ pub struct Deck {
     /// The key shift was set by key sync.
     pub key_synced: bool,
     pub pad_mode: PadMode,
+    /// Live stems of the loaded track.
+    pub stems: Stems,
+    /// Which stem parts play: vocals, instruments, bass, drums.
+    pub stem_on: [bool; PARTS],
+    /// Part Isolator: the EQ knobs set the vocal, instrument (with bass) and
+    /// drum levels; 0.5 is the full level, as for the EQ.
+    pub part_isolator: bool,
+    pub isolator: [f32; 3],
     /// The loaded track's cues or beat grid changed and should be saved.
     pub edited: bool,
     /// The beat grid itself changed (saved as one tempo marker).
@@ -422,6 +431,10 @@ impl Deck {
             key_shift: 0,
             key_synced: false,
             pad_mode: PadMode::HotCue,
+            stems: Stems::None,
+            stem_on: [true; PARTS],
+            part_isolator: false,
+            isolator: [0.5; 3],
             edited: false,
             grid_edited: false,
             grid_edit: false,
@@ -473,6 +486,7 @@ impl Deck {
         engine.send(Command::Unload { deck: self.index });
         self.track = None;
         self.audio = None;
+        self.stems = Stems::None;
         self.loading = None;
         (self.analysing, self.analysed) = (None, false);
         self.error = None;
@@ -577,6 +591,9 @@ impl Deck {
                 Ok((track, audio)) => {
                     self.audio = Some(audio.clone());
                     engine.send(Command::Load { deck: self.index, audio });
+                    // New track, new stems; the Part Isolator's levels stay.
+                    (self.stems, self.stem_on) = (Stems::None, [true; PARTS]);
+                    self.apply_stems(engine);
                     // Auto Cue, else the earliest memory or hot cue, else the start.
                     let earliest_cue = track
                         .memory_cues
@@ -1336,6 +1353,10 @@ impl Deck {
         let Some(audio) = &self.audio else { return };
         let deck = self.index;
         engine.send(Command::Load { deck, audio: audio.clone() });
+        if let Stems::Ready(stems) = &self.stems {
+            engine.send(Command::SetStems { deck, stems: Some(stems.clone()) });
+        }
+        self.apply_stems(engine);
         engine.send(Command::Seek { deck, seconds: position });
         if let (true, Some((start, end))) = (self.loop_active, self.loop_region) {
             engine.send(Command::SetLoop { deck, start, end });
@@ -1362,6 +1383,66 @@ impl Deck {
     /// The loaded track's gain worked out from its loudness.
     pub fn measured_gain_db(&self) -> Option<f32> {
         self.audio.as_deref().map(auto_gain_db)
+    }
+
+    /// The decoded track's sample rate and length in frames.
+    /// The track's audio as the deck plays it.
+    pub fn audio(&self) -> Option<Arc<TrackAudio>> {
+        self.audio.clone()
+    }
+
+    /// Takes the separated stems, once they are ready.
+    pub fn set_stems(&mut self, stems: Arc<StemLayers>, engine: &mut Engine) {
+        engine.send(Command::SetStems { deck: self.index, stems: Some(stems.clone()) });
+        self.stems = Stems::Ready(stems);
+        self.apply_stems(engine);
+    }
+
+    /// Whether the part can be turned off on its own (stems ready, and the
+    /// model made that stem).
+    pub fn has_part(&self, part: usize) -> bool {
+        matches!(&self.stems, Stems::Ready(stems) if stems.has(part))
+    }
+
+    /// The parts' levels: on or off, times the Part Isolator's knob.
+    pub fn stem_levels(&self) -> [f32; PARTS] {
+        // Left of the centre cuts (squared, for an even feel), right of it
+        // boosts up to +6 dB.
+        let knob = |v: f32| if v <= 0.5 { (v * 2.0).powi(2) } else { 1.0 + (v - 0.5) * 2.0 };
+        std::array::from_fn(|part| {
+            let on = if self.stem_on[part] || !self.has_part(part) { 1.0 } else { 0.0 };
+            let isolator = match part {
+                _ if !self.part_isolator => 1.0,
+                VOCALS => knob(self.isolator[0]),
+                DRUMS => knob(self.isolator[2]),
+                _ => knob(self.isolator[1]),
+            };
+            on * isolator
+        })
+    }
+
+    pub fn apply_stems(&self, engine: &mut Engine) {
+        engine.send(Command::SetStemLevels { deck: self.index, levels: self.stem_levels() });
+    }
+
+    /// Turns a part off or on (once the stems are ready).
+    pub fn toggle_stem(&mut self, part: usize, engine: &mut Engine) {
+        if part < PARTS && self.has_part(part) {
+            self.stem_on[part] = !self.stem_on[part];
+            self.apply_stems(engine);
+        }
+    }
+
+    /// Takes the stems away: the deck plays the track as it is.
+    pub fn clear_stems(&mut self, engine: &mut Engine) {
+        (self.stems, self.stem_on, self.part_isolator) = (Stems::None, [true; PARTS], false);
+        engine.send(Command::SetStems { deck: self.index, stems: None });
+        self.apply_stems(engine);
+    }
+
+    pub fn toggle_part_isolator(&mut self, engine: &mut Engine) {
+        self.part_isolator = !self.part_isolator;
+        self.apply_stems(engine);
     }
 
     /// Sends all mixer settings of this channel.
@@ -1565,6 +1646,17 @@ impl Default for DeckPrefs {
 /// `moved`: shifted by as much as the fader would shift its own tempo.
 fn moved_ratio(ratio: Option<f64>, moved: f32, range: TempoRange) -> Option<f64> {
     ratio.map(|r| (r + f64::from(moved) * range.fraction()).max(0.05))
+}
+
+/// A deck's live stems.
+#[derive(Clone, Default)]
+pub enum Stems {
+    #[default]
+    None,
+    /// Being separated, with the share done when the model says.
+    Separating(Option<u32>),
+    Ready(Arc<StemLayers>),
+    Failed,
 }
 
 /// What detection found for a loaded track.
@@ -1825,6 +1917,36 @@ impl LoadRequest {
 
 #[cfg(test)]
 mod tests {
+
+    /// Time of each step of loading a track:
+    /// `DECKHAND_TEST_TRACK=song.wav cargo test -p deckhand-app load_steps -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn load_steps() {
+        let path = PathBuf::from(std::env::var("DECKHAND_TEST_TRACK").unwrap());
+        let time = |name: &str, started: std::time::Instant| {
+            eprintln!("{name:>14}: {:6.3} s", started.elapsed().as_secs_f64());
+        };
+        let started = std::time::Instant::now();
+        let audio = decode_file(&path).unwrap();
+        time("decode", started);
+        let started = std::time::Instant::now();
+        let _ = deckhand_analysis::waveform::color_detail(&audio.samples, audio.sample_rate);
+        time("color waveform", started);
+        let started = std::time::Instant::now();
+        let _ = band_waveform(&audio);
+        time("band waveform", started);
+        let started = std::time::Instant::now();
+        let _ = peak_waveform(&audio);
+        time("peak waveform", started);
+        let started = std::time::Instant::now();
+        let _ = auto_gain_db(&audio);
+        time("auto gain", started);
+        let started = std::time::Instant::now();
+        let _ = first_sound(&audio, -40.0);
+        time("first sound", started);
+        eprintln!("{:.0} s of audio", audio.duration_secs());
+    }
     use super::*;
 
     #[test]

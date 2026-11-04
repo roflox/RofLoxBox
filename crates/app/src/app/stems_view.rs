@@ -7,7 +7,10 @@ use deckhand_library::Derived;
 use eframe::egui::{self, RichText, Ui};
 
 use super::{DeckhandApp, WARN};
-use crate::stems::{self, Event, Job, Recipe, StemModel};
+use crate::deck::Stems;
+use crate::stems::{self, Event, Job, LiveJob, Recipe, StemModel};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 impl DeckhandApp {
     /// The chosen model, else the first one there is.
@@ -43,11 +46,112 @@ impl DeckhandApp {
         ));
     }
 
-    /// Takes finished separations into the collection and shows progress.
+    /// Separates tracks ahead of time, so they load with their stems.
+    pub(super) fn prepare_stems(&mut self, ids: &[u32]) {
+        let Some(model) = self.stem_model().cloned() else { return };
+        for &id in ids {
+            let Some(track) = self.collection.track(id) else { continue };
+            self.stems.submit(Job {
+                track: id,
+                title: track.title.clone(),
+                input: track.path.clone(),
+                model: model.clone(),
+                makes: Vec::new(),
+            });
+        }
+        self.status = Some(format!(
+            "Getting stems ready with {} ({} waiting)",
+            model.name,
+            self.stems.pending()
+        ));
+    }
+
+    /// Starts separating a deck's track for live stems (from the cache when
+    /// it was done before).
+    pub(super) fn separate_deck(&mut self, d: usize) {
+        if !self.config.prefs.live_stems {
+            return;
+        }
+        let Some(model) = self.stem_model().cloned() else { return };
+        let deck = &mut self.decks[d];
+        let (Some(track), Some(audio)) = (&deck.track, deck.audio()) else {
+            return;
+        };
+        self.stem_playheads[d].store(stems::CANCELLED, Ordering::Relaxed);
+        let position = self.engine.as_ref().map_or(0.0, |e| e.position_secs(d));
+        self.stem_playheads[d] = Arc::new(AtomicU64::new(position.to_bits()));
+        self.live_stems.submit(LiveJob {
+            deck: d,
+            title: track.title.clone(),
+            input: track.path.clone(),
+            model,
+            audio,
+            playhead: self.stem_playheads[d].clone(),
+        });
+        deck.stems = Stems::Separating(None);
+    }
+
+    /// Stops live stems on every deck (Preferences turned them off).
+    fn stop_live_stems(&mut self) {
+        for (d, playhead) in self.stem_playheads.iter().enumerate() {
+            playhead.store(stems::CANCELLED, Ordering::Relaxed);
+            if let Some(engine) = self.engine.as_mut() {
+                self.decks[d].clear_stems(engine);
+            }
+        }
+    }
+
+    /// Newly loaded tracks get separated, when Preferences say so.
+    fn separate_new_tracks(&mut self) {
+        for d in 0..self.deck_count() {
+            let path = self.decks[d].track.as_ref().map(|t| t.path.clone());
+            if path == self.stems_for[d] {
+                continue;
+            }
+            self.stems_for[d] = path.clone();
+            // The earlier track's separation stops.
+            self.stem_playheads[d].store(stems::CANCELLED, Ordering::Relaxed);
+            if path.is_some() && self.config.prefs.stems_on_load && self.stem_model().is_some() {
+                self.separate_deck(d);
+            }
+        }
+    }
+
+    /// Takes finished separations to the decks and the collection, and
+    /// shows progress.
     pub(super) fn poll_stems(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.stems.events.try_recv() {
+        // With stems on, the model is loaded ahead of the first track, once
+        // the decks are done loading (not to slow the start down).
+        let wanted = self.stem_model().filter(|_| self.config.prefs.live_stems).cloned();
+        let settled = self.decks.iter().all(|d| d.loading_title().is_none());
+        if settled && wanted.as_ref().map(|m| &m.id) != self.stems_warmed.as_ref() {
+            self.stems_warmed = wanted.as_ref().map(|m| m.id.clone());
+            match wanted {
+                Some(model) => self.live_stems.warm(model),
+                None => self.live_stems.rest(),
+            }
+        }
+        self.separate_new_tracks();
+        if let Some(engine) = self.engine.as_ref() {
+            for (d, playhead) in self.stem_playheads.iter().enumerate() {
+                let _ = playhead.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                    (bits != stems::CANCELLED).then(|| engine.position_secs(d).to_bits())
+                });
+            }
+        }
+        let events: Vec<Event> =
+            self.live_stems.events.try_iter().chain(self.stems.events.try_iter()).collect();
+        let current = |decks: &[crate::deck::Deck], deck: usize, input: &PathBuf| {
+            decks[deck].track.as_ref().is_some_and(|t| &t.path == input)
+        };
+        for event in events {
             match event {
-                Event::Progress { title, percent } => {
+                Event::Progress { deck: Some(d), percent, .. } => {
+                    if matches!(self.decks[d].stems, Stems::Separating(_)) {
+                        self.decks[d].stems = Stems::Separating(percent);
+                    }
+                }
+                Event::Progress { title, percent, deck: None } => {
                     let done = percent.map(|p| format!(": {p}%")).unwrap_or_default();
                     let waiting = self.stems.pending().saturating_sub(1);
                     let more = if waiting > 0 {
@@ -56,6 +160,14 @@ impl DeckhandApp {
                         String::new()
                     };
                     self.status = Some(format!("Separating {title}{done}{more}"));
+                }
+                Event::Live { deck, input, stems } => {
+                    // A track loaded since then keeps its own.
+                    if current(&self.decks, deck, &input)
+                        && let Some(engine) = self.engine.as_mut()
+                    {
+                        self.decks[deck].set_stems(stems, engine);
+                    }
                 }
                 Event::Made { track, recipe, path, model } => {
                     let made = deckhand_library::read_file(&path).and_then(|file| {
@@ -76,20 +188,29 @@ impl DeckhandApp {
                         }
                     }
                 }
-                Event::Failed { title, error } => {
+                Event::Failed { title, error, deck } => {
+                    if let Some(d) = deck {
+                        self.decks[d].stems = Stems::Failed;
+                    }
                     self.collection_view.error =
                         Some(format!("Could not separate {title}: {error}"));
                 }
             }
         }
-        if self.stems.pending() > 0 {
+        let separating = self.decks.iter().any(|d| match &d.stems {
+            Stems::Separating(_) => true,
+            Stems::Ready(layers) => layers.ready_share() < 1.0,
+            _ => false,
+        });
+        if self.stems.pending() > 0 || separating {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
 
     /// The Stems page of Preferences; returns whether a setting changed.
     pub(super) fn stems_prefs(&mut self, ui: &mut Ui) -> bool {
-        let before = (self.config.prefs.stem_model.clone(), self.config.prefs.stems_folder.clone());
+        let p = &self.config.prefs;
+        let before = (p.stem_model.clone(), p.stems_folder.clone(), p.stems_on_load, p.live_stems);
         let dir = stems::models_dir();
         let chosen = self.stem_model().map(|m| m.id.clone());
         ui.label(RichText::new("Model").strong().size(15.0));
@@ -146,6 +267,31 @@ impl DeckhandApp {
             }
         });
         ui.add_space(6.0);
+        ui.label(RichText::new("Live stems").strong().size(15.0));
+        if ui
+            .checkbox(&mut self.config.prefs.live_stems, "Stems on the decks")
+            .on_hover_text("Off: decks play tracks only and nothing is separated for them")
+            .changed()
+            && !self.config.prefs.live_stems
+        {
+            self.stop_live_stems();
+        }
+        ui.add_enabled_ui(self.config.prefs.live_stems, |ui| {
+            ui.checkbox(&mut self.config.prefs.stems_on_load, "Separate tracks when they load");
+        });
+        ui.label(
+            RichText::new(
+                "The deck plays the track at once. Its stems are made a piece at a time, \
+                 starting where it plays, and each piece plays as soon as it is ready (at once \
+                 for tracks separated before). VOCAL, INST, BASS and DRUMS then turn parts \
+                 off; with all of them on, the deck plays the original. Separating takes a lot \
+                 of processing while it runs; turn stems off to keep the app light. Making \
+                 tracks from stems works either way.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
         ui.label(RichText::new("Made tracks").strong().size(15.0));
         let folder = self.stems_folder();
         ui.label(folder.display().to_string());
@@ -172,6 +318,7 @@ impl DeckhandApp {
             .small()
             .weak(),
         );
-        (self.config.prefs.stem_model.clone(), self.config.prefs.stems_folder.clone()) != before
+        let p = &self.config.prefs;
+        (p.stem_model.clone(), p.stems_folder.clone(), p.stems_on_load, p.live_stems) != before
     }
 }

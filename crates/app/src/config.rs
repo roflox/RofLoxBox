@@ -181,6 +181,11 @@ pub struct Preferences {
     pub theme: Theme,
     /// The stem separation model (its folder's name in `models/`).
     pub stem_model: String,
+    /// Decks can play stems (separating, mixing parts); off, decks play
+    /// tracks only, as before stems.
+    pub live_stems: bool,
+    /// Loaded tracks are separated for live stems.
+    pub stems_on_load: bool,
     /// Where tracks made from stems go; the default when unset.
     pub stems_folder: Option<PathBuf>,
     /// The computer keyboard plays the decks.
@@ -195,6 +200,9 @@ pub struct Preferences {
     pub load_lock: bool,
     /// Tracks play at their track gain (Auto Gain).
     pub auto_gain: bool,
+    /// Seconds before the end of a playing track when its deck starts
+    /// blinking; 0 is off.
+    pub track_end_warning: u32,
     /// What the Pad FX pads do, A to P.
     pub pad_fx: Vec<crate::effects::PadFxSlot>,
     /// No jumping by clicking the small waveform (overview) of a playing
@@ -263,6 +271,7 @@ impl Default for Preferences {
         Self {
             load_lock: true,
             auto_gain: true,
+            track_end_warning: 30,
             pad_fx: crate::effects::PadFxSlot::defaults(),
             needle_lock: false,
             memory_call_lock: true,
@@ -270,6 +279,8 @@ impl Default for Preferences {
             theme: Theme::Dark,
             stem_model: String::new(),
             stems_folder: None,
+            live_stems: true,
+            stems_on_load: true,
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),

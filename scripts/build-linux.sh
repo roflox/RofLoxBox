@@ -8,7 +8,7 @@
 # release publishes SHA-256 sums instead.
 set -eu
 cd "$(dirname "$0")/.."
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -1)
+VERSION=$(scripts/version.sh)
 ARCH=$(uname -m)
 cargo build --release -p deckhand-app
 DIST=$(pwd)/target/dist

@@ -10,7 +10,7 @@ pub mod rekordbox;
 
 pub use action::{
     Action, ActionKind, DECKS, DeckAction, DeckFeedback, Feedback, GlobalAction, GlobalFeedback,
-    PadMode,
+    PadMode, STEM_PARTS,
 };
 pub use learn::Learner;
 pub use mapping::{

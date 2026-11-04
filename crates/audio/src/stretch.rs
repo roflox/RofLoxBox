@@ -8,7 +8,7 @@
 //! grain would have continued with, within a small window around the
 //! playback position, which avoids phase cancellation in the cross-fade.
 
-use crate::decode::TrackAudio;
+use crate::decode::Frames;
 
 /// Grain length in seconds; grains overlap by half.
 const GRAIN_SECS: f64 = 0.04;
@@ -55,7 +55,13 @@ impl Stretcher {
     /// The next output frame. `position` is the deck's playback position in
     /// source frames, and `step` is source frames per output frame at the
     /// original tempo (the ratio of the sample rates).
-    pub fn next(&mut self, audio: &TrackAudio, position: f64, step: f64, cubic: bool) -> [f32; 2] {
+    pub fn next<A: Frames + ?Sized>(
+        &mut self,
+        audio: &A,
+        position: f64,
+        step: f64,
+        cubic: bool,
+    ) -> [f32; 2] {
         let current = match self.current {
             Some(current) if self.offset < self.hop => current,
             Some(current) => {
@@ -87,8 +93,14 @@ impl Stretcher {
 
     /// The start near `target` whose audio best matches `continuation`, the
     /// audio that would have followed the previous grain.
-    fn best_start(&self, audio: &TrackAudio, continuation: f64, target: f64, step: f64) -> f64 {
-        let reach = (SEARCH_SECS * f64::from(audio.sample_rate)) as i64;
+    fn best_start<A: Frames + ?Sized>(
+        &self,
+        audio: &A,
+        continuation: f64,
+        target: f64,
+        step: f64,
+    ) -> f64 {
+        let reach = (SEARCH_SECS * f64::from(audio.rate())) as i64;
         let score =
             |offset: i64| self.similarity(audio, continuation, target + offset as f64, step);
         let mut best = (0, score(0));
@@ -111,7 +123,7 @@ impl Stretcher {
     }
 
     /// Normalised correlation of the mono audio over one hop.
-    fn similarity(&self, audio: &TrackAudio, a: f64, b: f64, step: f64) -> f32 {
+    fn similarity<A: Frames + ?Sized>(&self, audio: &A, a: f64, b: f64, step: f64) -> f32 {
         let (mut dot, mut energy) = (0f32, 0f32);
         for i in (0..self.hop).step_by(COMPARE_STRIDE) {
             let x = mono(audio, a + i as f64 * step);
@@ -123,7 +135,7 @@ impl Stretcher {
     }
 }
 
-fn mono(audio: &TrackAudio, position: f64) -> f32 {
+fn mono<A: Frames + ?Sized>(audio: &A, position: f64) -> f32 {
     let [l, r] = audio.frame(position.round() as i64);
     l + r
 }
@@ -131,6 +143,7 @@ fn mono(audio: &TrackAudio, position: f64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::TrackAudio;
 
     fn sine(rate: u32, hz: f64, secs: f64) -> TrackAudio {
         let frames = (f64::from(rate) * secs) as usize;

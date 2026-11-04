@@ -12,7 +12,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 TARGET=x86_64-pc-windows-msvc
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -1)
+VERSION=$(scripts/version.sh)
 eval "$(cargo xwin env --target "$TARGET")"
 # Its empty RUSTFLAGS would override the per-target flags below.
 unset RUSTFLAGS
@@ -21,7 +21,9 @@ unset RUSTFLAGS
 HOST=$(rustc -vV | sed -n 's/^host: //p')
 export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$(rustc --print sysroot)/lib/rustlib/$HOST/bin/rust-lld"
 # A static C runtime so the .exe runs without the Visual C++ Redistributable.
-export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="$CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS -C target-feature=+crt-static"
+# The C runtime's debug symbols are not shipped; skip the linker's note
+# about each of them (LNK4099).
+export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="$CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS -C target-feature=+crt-static -C link-arg=/ignore:4099"
 cargo build --release -p deckhand-app --target "$TARGET" "$@"
 
 DIST=$(pwd)/target/dist

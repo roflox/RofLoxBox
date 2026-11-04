@@ -110,6 +110,7 @@ impl PadMode {
                 7 => D::KeyboardUp,
                 _ => D::HotCueDelete(pad),
             },
+            (Self::Stems, false) if pad < 4 => D::StemPart(pad),
             (Self::Stems, _) => return None,
             (Self::PadFx, _) => D::PadFx(pad + if shift { 8 } else { 0 }),
             (Self::BeatJump, false) => D::BeatJump(pad),
@@ -244,7 +245,17 @@ pub enum DeckAction {
     BeatLoopSizesDouble,
     /// The controller's DECK button: this deck is the one its side controls.
     Select,
+    /// Turns a stem part off or on: 0 vocals, 1 instruments, 2 bass, 3 drums.
+    StemPart(u8),
+    /// Part Isolator: the EQ knobs set the parts' levels instead.
+    PartIsolator,
+    /// A Part Isolator knob (controllers that send other controls for the
+    /// EQ knobs while it is on): 0 vocals, 1 instruments, 2 drums.
+    PartLevel(u8),
 }
+
+/// The stem parts, as rekordbox names them on the controllers.
+pub const STEM_PARTS: [&str; 4] = ["VOCAL", "INST", "BASS", "DRUMS"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GlobalAction {
@@ -357,7 +368,10 @@ impl DeckAction {
             BeatLoopSizesHalf,
             BeatLoopSizesDouble,
             Select,
+            PartIsolator,
         ]);
+        all.extend((0..4).map(StemPart));
+        all.extend((0..3).map(PartLevel));
         all
     }
 
@@ -432,6 +446,11 @@ impl DeckAction {
             BeatLoopSizesHalf => "beat_loop_sizes_half".into(),
             BeatLoopSizesDouble => "beat_loop_sizes_double".into(),
             Select => "deck_select".into(),
+            StemPart(n) => format!("stem_{}", STEM_PARTS[usize::from(n % 4)].to_lowercase()),
+            PartIsolator => "part_isolator".into(),
+            PartLevel(n) => {
+                format!("part_isolator_{}", ["vocal", "inst", "drums"][usize::from(n % 3)])
+            }
             PadMode(mode) => format!("pad_mode_{}", mode.name()),
             Keyboard(n) => format!("keyboard_{}", n + 1),
             KeyboardDown => "keyboard_down".into(),
@@ -448,7 +467,9 @@ impl DeckAction {
     pub fn kind(self) -> ActionKind {
         use DeckAction::*;
         match self {
-            TempoFader | Volume | Trim | EqLow | EqMid | EqHigh | Filter => ActionKind::Absolute,
+            TempoFader | Volume | Trim | EqLow | EqMid | EqHigh | Filter | PartLevel(_) => {
+                ActionKind::Absolute
+            }
             JogTurn | JogScratch | JogSearch => ActionKind::Relative,
             _ => ActionKind::Button,
         }
@@ -609,6 +630,9 @@ pub enum DeckFeedback {
     PadMode(PadMode),
     /// A pad of that mode, lit when it can be used (flashing when active).
     PadLit(PadMode, u8),
+    /// A stem part is playing (0 vocals … 3 drums).
+    StemOn(u8),
+    PartIsolator,
 }
 
 /// State of the mixer-wide sections.
@@ -663,6 +687,8 @@ impl DeckFeedback {
             KeySync,
         ]);
         all.extend((0..8).map(SamplerPlaying));
+        all.extend((0..4).map(StemOn));
+        all.push(PartIsolator);
         all.extend(self::PadMode::ALL.map(PadMode));
         for mode in [
             self::PadMode::Keyboard,
@@ -698,6 +724,8 @@ impl DeckFeedback {
             SamplerPlaying(n) => format!("sampler_{}_playing", n + 1),
             PadMode(mode) => format!("pad_mode_{}", mode.name()),
             PadLit(mode, n) => format!("{}_pad_{}", mode.name(), n + 1),
+            StemOn(n) => format!("stem_{}_on", STEM_PARTS[usize::from(n % 4)].to_lowercase()),
+            PartIsolator => "part_isolator".into(),
         }
     }
 }

@@ -1,6 +1,8 @@
-# Builds the installers for macOS, Windows and Linux, on each system, for a
-# version tag (v0.1.0, …) or by hand (Actions → Release → Run workflow).
-# A tag also makes a draft GitHub release with them and their SHA-256 sums.
+# Builds the installers for macOS, Windows and Linux, on each system, for
+# every push to main (or by hand: Actions → Release → Run workflow). Every
+# commit is a new version, 0.<number of commits>.0 (scripts/version.sh); a
+# push publishes it as the GitHub release v0.<n>.0, with the installers and
+# their SHA-256 sums.
 #
 # Signing uses these repository secrets when present (Settings → Secrets
 # and variables → Actions); without them the builds are unsigned (macOS:
@@ -18,7 +20,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -29,6 +31,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -74,6 +78,8 @@ jobs:
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release -p deckhand-app
       - name: Installer
@@ -81,9 +87,11 @@ jobs:
           CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -1)
+          VERSION=$(scripts/version.sh)
           mkdir -p target/dist
-          EXE=$(pwd -W)/target/dist/RofLoxBox.exe
+          # Windows paths with backslashes: NSIS on Windows finds no file
+          # behind a D:/a/... path.
+          EXE=$(cygpath -w "$(pwd)/target/dist/RofLoxBox.exe")
           cp target/release/deckhand-app.exe target/dist/RofLoxBox.exe
           SIGNTOOL=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe | tail -1)
           sign() {
@@ -99,7 +107,7 @@ jobs:
           sign target/dist/RofLoxBox.exe
           command -v makensis || choco install nsis -y --no-progress
           MAKENSIS=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
-          SETUP=$(pwd -W)/target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe
+          SETUP=$(cygpath -w "$(pwd)/target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe")
           "$MAKENSIS" -V2 -DVERSION="$VERSION" -DEXE="$EXE" -DOUT="$SETUP" packaging/windows/RofLoxBox.nsi
           sign "target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe"
           (cd target/dist && 7z a -bd "RofLoxBox-$VERSION-windows-x64.zip" RofLoxBox.exe >/dev/null && rm RofLoxBox.exe)
@@ -115,6 +123,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config libfuse2
       - name: appimagetool
@@ -132,10 +142,14 @@ jobs:
             target/dist/*.tar.gz
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: echo "VERSION=$(scripts/version.sh)" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -143,5 +157,8 @@ jobs:
       - run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: v${{ env.VERSION }}
+          name: RofLoxBox ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
           files: dist/*

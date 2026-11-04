@@ -3,6 +3,7 @@
 mod collection_view;
 mod deck_view;
 mod explorer_view;
+mod history;
 mod hotplug;
 mod keyboard;
 mod library_tree;
@@ -152,6 +153,15 @@ pub struct DeckhandApp {
     keyboard: keyboard::KeyboardMixer,
     /// Separates tracks into stems in the background.
     stems: crate::stems::Separator,
+    /// Separates loaded tracks for live stems, apart from the queue of
+    /// tracks being made.
+    live_stems: crate::stems::LiveSeparator,
+    /// Each deck's position for its live separation (see `LiveJob::playhead`).
+    stem_playheads: [std::sync::Arc<std::sync::atomic::AtomicU64>; DECKS],
+    /// The model the live separator was last asked to have ready.
+    stems_warmed: Option<String>,
+    /// The track each deck's stems were asked for.
+    stems_for: [Option<PathBuf>; DECKS],
     /// The models in the models folder, and the ones that could not be read.
     stem_models: (Vec<crate::stems::StemModel>, Vec<String>),
     /// Position of the selected row in the list, telling duplicate tracks
@@ -171,6 +181,9 @@ pub struct DeckhandApp {
     action_filter: String,
     import_choice: Option<usize>,
     cue_held: [bool; DECKS],
+    /// Playing time per deck, for the history.
+    played: [history::Played; DECKS],
+    history_tick: Instant,
     /// Hot cue pads held with the mouse, for gate mode.
     pad_held: [[Option<DeckAction>; HOT_CUES]; DECKS],
     seconds_visible: f64,
@@ -271,6 +284,10 @@ impl DeckhandApp {
             active_decks: [0, 1],
             keyboard,
             stems: Default::default(),
+            live_stems: Default::default(),
+            stem_playheads: Default::default(),
+            stems_warmed: None,
+            stems_for: Default::default(),
             stem_models: crate::stems::load_models(&crate::stems::models_dir()),
             recording: None,
             moved_window: false,
@@ -283,6 +300,8 @@ impl DeckhandApp {
             action_filter: String::new(),
             import_choice: None,
             cue_held: [false; DECKS],
+            played: Default::default(),
+            history_tick: Instant::now(),
             pad_held: [[None; HOT_CUES]; DECKS],
             seconds_visible: keyboard::DEFAULT_SECONDS_VISIBLE,
             status: None,
@@ -1052,6 +1071,22 @@ impl DeckhandApp {
                 deck.trim = v;
                 deck.apply_mixer(engine);
             }
+            (A::StemPart(part), _) if pressed => deck.toggle_stem(usize::from(part), engine),
+            (A::PartIsolator, _) if pressed => deck.toggle_part_isolator(engine),
+            // Part Isolator: the EQ knobs set the vocal, instrument and drum levels.
+            (A::PartLevel(part), Value::Absolute(v)) => {
+                deck.isolator[usize::from(part.min(2))] = v;
+                deck.apply_stems(engine);
+            }
+            (A::EqLow | A::EqMid | A::EqHigh, Value::Absolute(v)) if deck.part_isolator => {
+                let part = match action {
+                    A::EqHigh => 0,
+                    A::EqMid => 1,
+                    _ => 2,
+                };
+                deck.isolator[part] = v;
+                deck.apply_stems(engine);
+            }
             (A::EqLow | A::EqMid | A::EqHigh, Value::Absolute(v)) => {
                 let band = match action {
                     A::EqLow => 0,
@@ -1315,6 +1350,13 @@ impl DeckhandApp {
             set(DeckFeedback::Sync, on(deck.sync));
             set(DeckFeedback::SyncMaster, on(self.master == Some(d)));
             set(DeckFeedback::Quantize, on(deck.quantize));
+            for part in 0..deckhand_audio::PARTS {
+                set(
+                    DeckFeedback::StemOn(part as u8),
+                    on(deck.has_part(part) && deck.stem_on[part]),
+                );
+            }
+            set(DeckFeedback::PartIsolator, on(deck.part_isolator));
             set(DeckFeedback::Vinyl, on(deck.vinyl));
             // Slip flashes while normal playback runs on in the background.
             let slipping = deck.slip
@@ -1411,6 +1453,7 @@ impl eframe::App for DeckhandApp {
             self.apply_event(event, ctx);
         }
         self.save_track_edits();
+        self.track_history();
         self.poll_collection(ctx);
         self.poll_stems(ctx);
         self.poll_explorer(ctx);
@@ -1523,7 +1566,7 @@ impl DeckhandApp {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(crate::APP_NAME);
+                ui.heading(crate::APP_NAME).on_hover_text(format!("Version {}", crate::VERSION));
                 ui.separator();
 
                 let device = self
@@ -2160,11 +2203,23 @@ impl DeckhandApp {
                                     )
                                     .changed();
                                 }
-                                for (part, value, label) in [
-                                    (P::High, high, "HI"),
-                                    (P::Mid, mid, "MID"),
-                                    (P::Low, low, "LOW"),
-                                ] {
+                                // Part Isolator: the knobs are the parts' levels.
+                                let isolating = deck.part_isolator;
+                                let [vocal, inst, drums] = &mut deck.isolator;
+                                let knobs = if isolating {
+                                    [
+                                        (P::High, vocal, "VOCAL"),
+                                        (P::Mid, inst, "INST"),
+                                        (P::Low, drums, "DRUMS"),
+                                    ]
+                                } else {
+                                    [
+                                        (P::High, high, "HI"),
+                                        (P::Mid, mid, "MID"),
+                                        (P::Low, low, "LOW"),
+                                    ]
+                                };
+                                for (part, value, label) in knobs {
                                     if show(part) {
                                         changed |= knob(
                                             ui,
@@ -2241,6 +2296,7 @@ impl DeckhandApp {
                                 }
                                 if changed {
                                     deck.apply_mixer(engine);
+                                    deck.apply_stems(engine);
                                 }
                             });
                         });
@@ -3240,7 +3296,12 @@ fn pad_face(
                 )
             }
         },
-        PadMode::Stems => face("—".into(), idle, "Stems are not available yet"),
+        // The deck view draws its own STEMS pads; this is for anything else.
+        PadMode::Stems => face(
+            deckhand_control::STEM_PARTS.get(pad).map_or("", |p| p).into(),
+            idle,
+            "Turn a stem part off or on",
+        ),
         PadMode::PadFx => {
             let slot = (pad + if shift { 8 } else { 0 } + 8 * usize::from(deck.pad_fx_page)) % 16;
             let held = fx.pad == Some((index, slot as u8));

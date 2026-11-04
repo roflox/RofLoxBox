@@ -27,6 +27,10 @@ const QUEUE: usize = 1024;
 /// steps, which arrive in bursts, into smooth motion (damping ≈ 0.7).
 const JOG_FOLLOW_SECS: f64 = 0.015;
 const JOG_SMOOTH_SECS: f64 = 0.008;
+/// How long a stem part takes to fade in or out fully.
+const STEM_GLIDE_SECS: f64 = 0.008;
+/// How long the stem limiter takes to let go fully.
+const STEM_RELEASE_SECS: f64 = 0.15;
 /// Fastest scratch, times normal speed.
 const MAX_SCRATCH_SPEED: f64 = 8.0;
 /// The screen guesses the position at most this far past the last buffer.
@@ -59,6 +63,14 @@ pub enum CrossfaderSide {
     /// Not affected by the crossfader.
     Thru,
     B,
+}
+
+/// Buffers the audio thread lets go of, to be freed elsewhere (held only
+/// to be dropped there).
+#[allow(dead_code)]
+enum Garbage {
+    Track(Arc<TrackAudio>),
+    Stems(Arc<crate::stems::StemLayers>),
 }
 
 #[derive(Debug)]
@@ -159,6 +171,16 @@ pub enum Command {
     SetFaderCurve(FaderCurve),
     /// Off: the master is only clipped at full scale.
     SetLimiter(bool),
+    /// A deck's stems for live mixing (`None` takes them away).
+    SetStems {
+        deck: usize,
+        stems: Option<Arc<crate::stems::StemLayers>>,
+    },
+    /// Levels 0–1 (or more) of the vocals, instruments, bass and drums.
+    SetStemLevels {
+        deck: usize,
+        levels: [f32; crate::stems::PARTS],
+    },
     /// Vinyl Speed Adjust: how long starting and stopping (brake) take, in
     /// seconds; 0 is instant.
     SetVinylSpeed {
@@ -320,7 +342,7 @@ const JOG_EVENTS: usize = 64;
 pub struct Engine {
     jog: Option<JogSender>,
     commands: rtrb::Producer<Command>,
-    trash: rtrb::Consumer<Arc<TrackAudio>>,
+    trash: rtrb::Consumer<Garbage>,
     shared: Arc<Shared>,
     info: OutputInfo,
     _stream: cpal::Stream,
@@ -522,6 +544,13 @@ where
 
 struct DeckState {
     audio: Option<Arc<TrackAudio>>,
+    /// Stems for live mixing, and their parts' levels: wanted and current
+    /// (moving towards the wanted ones, so changes do not click).
+    stems: Option<Arc<crate::stems::StemLayers>>,
+    stem_target: [f32; crate::stems::PARTS],
+    stem_level: [f32; crate::stems::PARTS],
+    /// The stem limiter's gain (1 = not limiting).
+    stem_gain: f32,
     /// Position in source frames.
     position: f64,
     playing: bool,
@@ -592,7 +621,7 @@ struct Mixer {
     sampler: [SamplerVoice; SAMPLER_SLOTS],
     sampler_volume: f32,
     commands: rtrb::Consumer<Command>,
-    trash: rtrb::Producer<Arc<TrackAudio>>,
+    trash: rtrb::Producer<Garbage>,
     shared: Arc<Shared>,
 }
 
@@ -679,6 +708,14 @@ fn fader_gain(level: f32) -> f32 {
     fader_curve_gain(level, FaderCurve::Standard)
 }
 
+/// A deck's stem mix, limited to full scale: the gain drops at once to
+/// what a peak needs and recovers by `release` per sample.
+fn limit_stems(sample: [f32; 2], gain: &mut f32, release: f32) -> [f32; 2] {
+    let peak = sample[0].abs().max(sample[1].abs());
+    *gain = if peak * *gain > 1.0 { 1.0 / peak } else { (*gain + release).min(1.0) };
+    [sample[0] * *gain, sample[1] * *gain]
+}
+
 /// Gentle limiter: transparent below ±0.8, then saturates towards ±1.
 fn limit(sample: f32) -> f32 {
     let x = sample.abs();
@@ -689,7 +726,7 @@ impl Mixer {
     fn new(
         rate: u32,
         commands: rtrb::Consumer<Command>,
-        trash: rtrb::Producer<Arc<TrackAudio>>,
+        trash: rtrb::Producer<Garbage>,
         shared: Arc<Shared>,
     ) -> Self {
         let deck = |index: usize| DeckState {
@@ -705,6 +742,10 @@ impl Mixer {
             last_jog: 0,
             key_lock: false,
             stretcher: Stretcher::new(rate),
+            stems: None,
+            stem_target: [1.0; crate::stems::PARTS],
+            stem_level: [1.0; crate::stems::PARTS],
+            stem_gain: 1.0,
             target: None,
             held: false,
             velocity: 0.0,
@@ -760,8 +801,13 @@ impl Mixer {
                 let d = &mut self.decks[deck];
                 if let Some(old) = d.audio.replace(audio) {
                     // Freeing a whole track here could stall the callback.
-                    let _ = self.trash.push(old);
+                    let _ = self.trash.push(Garbage::Track(old));
                 }
+                if let Some(old) = d.stems.take() {
+                    let _ = self.trash.push(Garbage::Stems(old));
+                }
+                (d.stem_target, d.stem_level) =
+                    ([1.0; crate::stems::PARTS], [1.0; crate::stems::PARTS]);
                 (d.position, d.playing, d.nudge, d.target, d.held, d.loop_frames) =
                     (0.0, false, 0.0, None, false, None);
                 (d.velocity, d.braking, d.coasting) = (0.0, false, false);
@@ -769,7 +815,10 @@ impl Mixer {
             Command::Unload { deck } => {
                 let d = &mut self.decks[deck];
                 if let Some(old) = d.audio.take() {
-                    let _ = self.trash.push(old);
+                    let _ = self.trash.push(Garbage::Track(old));
+                }
+                if let Some(old) = d.stems.take() {
+                    let _ = self.trash.push(Garbage::Stems(old));
                 }
                 d.playing = false;
             }
@@ -857,7 +906,7 @@ impl Mixer {
             Command::SamplerLoad { slot, audio } => {
                 if let Some(voice) = self.sampler.get_mut(slot) {
                     if let Some(old) = voice.audio.replace(audio) {
-                        let _ = self.trash.push(old);
+                        let _ = self.trash.push(Garbage::Track(old));
                     }
                     voice.playing = false;
                 }
@@ -892,6 +941,13 @@ impl Mixer {
             }
             Command::SetFaderCurve(curve) => self.fader_curve = curve,
             Command::SetLimiter(on) => self.limiter = on,
+            Command::SetStems { deck, stems } => {
+                let d = &mut self.decks[deck];
+                if let Some(old) = std::mem::replace(&mut d.stems, stems) {
+                    let _ = self.trash.push(Garbage::Stems(old));
+                }
+            }
+            Command::SetStemLevels { deck, levels } => self.decks[deck].stem_target = levels,
             Command::SetVinylSpeed { deck, start, brake } => {
                 let d = &mut self.decks[deck];
                 (d.start_secs, d.brake_secs) = (start.max(0.0), brake.max(0.0));
@@ -964,6 +1020,8 @@ impl Mixer {
 
         let fx_target = self.beat_fx.params().target;
         let cubic = self.quality == Quality::High;
+        let stem_glide = 1.0 / (STEM_GLIDE_SECS * self.rate) as f32;
+        let stem_release = 1.0 / (STEM_RELEASE_SECS * self.rate) as f32;
         for frame in out.chunks_mut(channels) {
             let mut master = [0f32; 2];
             let mut cue = [0f32; 2];
@@ -1025,16 +1083,38 @@ impl Mixer {
                     deck.stretcher.reset();
                     continue;
                 }
+                // Stem levels glide, so a muted part fades in a few ms.
+                let glide = stem_glide;
+                for (level, target) in deck.stem_level.iter_mut().zip(deck.stem_target) {
+                    *level += (target - *level).clamp(-glide, glide);
+                }
+                let mixed = deck
+                    .stems
+                    .as_deref()
+                    .filter(|_| deck.stem_level != [1.0; crate::stems::PARTS])
+                    .map(|stems| crate::stems::Mixed { audio, stems, levels: deck.stem_level });
+                let source: &dyn crate::decode::Frames = match &mixed {
+                    Some(mixed) => mixed,
+                    None => audio.as_ref(),
+                };
                 // Scratching always bends the pitch, like a record.
                 let shifted = deck.key_lock || deck.key_ratio != 1.0;
                 let raw = if shifted && deck.target.is_none() {
                     // Grains play at the original pitch (Master Tempo) or the
                     // tempo's, times the key shift.
                     let pitch = if deck.key_lock { step } else { deck.velocity };
-                    deck.stretcher.next(audio, deck.position, pitch * deck.key_ratio, cubic)
+                    deck.stretcher.next(source, deck.position, pitch * deck.key_ratio, cubic)
                 } else {
                     deck.stretcher.reset();
-                    audio.sample_at(deck.position, cubic)
+                    source.sample_at(deck.position, cubic)
+                };
+                // Without a part, a loud master can peak above full scale
+                // (the parts partly cancel at its peaks): held to the
+                // track's own range, the way the track itself plays.
+                let raw = if deck.stems.is_some() {
+                    limit_stems(raw, &mut deck.stem_gain, stem_release)
+                } else {
+                    raw
                 };
                 let sample = [raw[0] * deck.trim, raw[1] * deck.trim];
                 let sample = deck.eq.process(sample);
@@ -1464,6 +1544,38 @@ mod tests {
         assert!((before - dragged_to).abs() < 0.3);
         mixer.render(&mut out, 2);
         assert!(position(&shared, 0) > before);
+    }
+
+    #[test]
+    fn muting_a_stem_fades_it_out_of_the_deck() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, _shared) = mixer(rate);
+        let frames = 48_000;
+        let track = TrackAudio { sample_rate: rate, samples: vec![0.3; frames * 2] };
+        let vocals = TrackAudio { sample_rate: rate, samples: vec![0.1; frames * 2] };
+        let stems = crate::stems::StemLayers::new(Some(&vocals), None, None, rate, frames);
+        tx.push(Command::Load { deck: 0, audio: Arc::new(track) }).unwrap();
+        tx.push(Command::SetStems { deck: 0, stems: Some(Arc::new(stems)) }).unwrap();
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        let mut out = vec![0f32; 256 * 2];
+        mixer.render(&mut out, 2);
+        let full = out[100];
+        assert!(full > 0.0);
+        tx.push(Command::SetStemLevels { deck: 0, levels: [0.0, 1.0, 1.0, 1.0] }).unwrap();
+        mixer.render(&mut out, 2);
+        // Gliding, not jumping: the first frame after the change is still near full.
+        assert!(out[0] > full * 0.95, "{} vs {full}", out[0]);
+        for _ in 0..4 {
+            mixer.render(&mut out, 2);
+        }
+        let muted = out[100];
+        assert!((muted / full - 0.2 / 0.3).abs() < 0.01, "{muted} vs {full}");
+        // Everything up again: the track as it is.
+        tx.push(Command::SetStemLevels { deck: 0, levels: [1.0; 4] }).unwrap();
+        for _ in 0..4 {
+            mixer.render(&mut out, 2);
+        }
+        assert!((out[100] - full).abs() < 1e-6);
     }
 
     #[test]

@@ -34,6 +34,8 @@ struct DeckOut {
     /// A Pad FX pad set to something else: (slot 0–15, what it does now).
     pad_fx_edits: Vec<(usize, PadFxSlot)>,
     status: Option<String>,
+    /// Separate the track into stems now.
+    separate: bool,
 }
 
 /// The parts of the app one deck's controls work on.
@@ -47,9 +49,15 @@ struct Parts<'a> {
     compact: bool,
     is_master: bool,
     needle_lock: bool,
+    /// Track End Warning, seconds (0 = off).
+    end_warning: f64,
     /// Eject/Load Lock: a playing deck keeps its track.
     load_lock: bool,
     tempo_ranges: Vec<TempoRange>,
+    /// A stem model is set up.
+    stem_model: bool,
+    /// Stems on the decks are on in Preferences.
+    live_stems: bool,
     out: DeckOut,
 }
 
@@ -78,6 +86,7 @@ impl DeckhandApp {
             ui.available_width()
         };
         let mut moved: Move = None;
+        let stem_model = self.stem_model().is_some();
         let Some(engine) = self.engine.as_mut() else { return };
         let mut parts = Parts {
             deck: &mut self.decks[index],
@@ -89,8 +98,11 @@ impl DeckhandApp {
             compact,
             is_master: self.master == Some(index),
             needle_lock: self.config.prefs.needle_lock,
+            end_warning: f64::from(self.config.prefs.track_end_warning),
             load_lock: self.config.prefs.load_lock,
             tempo_ranges: self.config.prefs.tempo_ranges.clone(),
+            stem_model,
+            live_stems: self.config.prefs.live_stems,
             out: DeckOut::default(),
         };
         let area = ui.horizontal_top(|ui| {
@@ -171,6 +183,9 @@ impl DeckhandApp {
         if out.status.is_some() {
             self.status = out.status;
         }
+        if out.separate {
+            self.separate_deck(index);
+        }
         if let Some((element, place)) = moved {
             let layout = self.config.deck_layout_mut(four);
             match place {
@@ -237,6 +252,17 @@ fn drop_zone(ui: &mut Ui, text: &str, width: f32, place: Option<Place>, moved: &
     if let Some(dragged) = response.dnd_release_payload::<DeckElement>() {
         *moved = Some((*dragged, place));
     }
+}
+
+/// Track End Warning for a deck `remaining` seconds from the end: `None`
+/// when off or not near the end, else whether the blink is lit now. Once a
+/// second, twice a second in the last 10.
+fn end_warning(ui: &Ui, warning: f64, remaining: f64, playing: bool) -> Option<bool> {
+    if warning <= 0.0 || !playing || remaining > warning || remaining <= 0.0 {
+        return None;
+    }
+    let rate = if remaining <= 10.0 { 2.0 } else { 1.0 };
+    Some((ui.input(|i| i.time) * rate).fract() < 0.5)
 }
 
 fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
@@ -375,12 +401,12 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             ui.separator();
             let size = if compact { 15.0 } else { 20.0 };
             ui.label(RichText::new(format_time(position)).size(size).monospace());
-            ui.label(
-                RichText::new(format!("-{}", format_time(track.duration - position)))
-                    .size(size)
-                    .monospace()
-                    .weak(),
-            );
+            let remaining =
+                RichText::new(format!("-{}", format_time(track.duration - position))).size(size).monospace();
+            ui.label(match end_warning(ui, p.end_warning, track.duration - position, playing) {
+                Some(true) => remaining.color(RED),
+                _ => remaining.weak(),
+            });
             // Bar counter, and bars until the next memory cue, like rekordbox.
             ui.separator();
             let (bar, beat) = track.bar_and_beat(position);
@@ -418,6 +444,11 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             };
             let shown = engine.display_position_secs(index);
             draw_overview(&ui.painter_at(rect), rect, &track.waveform, shown, track.duration, &markers);
+            if end_warning(ui, p.end_warning, track.duration - shown, playing) == Some(true) {
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 2.0, RED.gamma_multiply(0.3));
+                painter.rect_stroke(rect, 2.0, Stroke::new(2.0_f32, RED), egui::StrokeKind::Inside);
+            }
             if let Some(pointer) =
                 response.interact_pointer_pos().filter(|_| response.clicked() || response.dragged())
             {
@@ -552,9 +583,6 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for mode in PadMode::ALL {
-                    if mode == PadMode::Stems {
-                        continue;
-                    }
                     let label = if compact { pad_mode_short(mode) } else { mode.label() };
                     if ui.selectable_label(deck.pad_mode == mode, RichText::new(label).small()).clicked() {
                         deck.set_pad_mode(mode);
@@ -595,6 +623,9 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::Pads if deck.pad_mode == PadMode::PadFx => {
             let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
             pad_fx_area(ui, deck, p.effects, p.pad_held, &mut p.out, shift_held, index, compact);
+        }
+        E::Pads if deck.pad_mode == PadMode::Stems => {
+            stems_pads(ui, deck, engine, &mut p.out, p.stem_model, p.live_stems, compact);
         }
         E::Pads => {
             let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
@@ -809,6 +840,98 @@ fn hold_pad(
         }
         _ => {}
     }
+}
+
+/// The stem parts' colours on the STEMS pads.
+const STEM_COLORS: [Color32; 4] = [
+    Color32::from_rgb(235, 200, 60),
+    Color32::from_rgb(90, 200, 120),
+    Color32::from_rgb(70, 150, 235),
+    Color32::from_rgb(225, 90, 70),
+];
+
+/// STEMS pad mode, like the GRV6's: pads 1–4 turn the vocals, instruments,
+/// bass and drums off and on; 5 is Part Isolator; 6 shows the separation
+/// (or starts it).
+fn stems_pads(
+    ui: &mut Ui,
+    deck: &mut Deck,
+    engine: &mut Engine,
+    out: &mut DeckOut,
+    stem_model: bool,
+    live_stems: bool,
+    compact: bool,
+) {
+    use crate::deck::Stems;
+    let pads = PadBox::new(ui, compact);
+    let size = if compact { 11.0 } else { 13.0 };
+    let loaded = deck.track.is_some();
+    let ready = matches!(deck.stems, Stems::Ready(_));
+    pads.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (part, label) in deckhand_control::STEM_PARTS.iter().enumerate() {
+                let color = STEM_COLORS[part];
+                let on = deck.stem_on[part] && deck.has_part(part);
+                let text = RichText::new(*label).strong().size(size);
+                let button = egui::Button::new(if on { text.color(Color32::BLACK) } else { text.color(color) })
+                    .fill(if on { color.gamma_multiply(0.85) } else { Color32::from_gray(30) })
+                    .min_size(pads.pad);
+                let hover = if !ready {
+                    "Available once the track is separated (pad 6)".to_owned()
+                } else if deck.has_part(part) {
+                    format!("Turn the {} off or on", label.to_lowercase())
+                } else {
+                    "This stem model has no such part; it stays in INST".to_owned()
+                };
+                if ui.add_enabled(ready && deck.has_part(part), button).on_disabled_hover_text(&hover).on_hover_text(&hover).clicked() {
+                    deck.toggle_stem(part, engine);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let iso = egui::Button::new(RichText::new("ISOLATOR").strong().size(size))
+                .fill(if deck.part_isolator { ACTIVE.gamma_multiply(0.6) } else { Color32::from_gray(30) })
+                .min_size(pads.pad);
+            if ui
+                .add_enabled(ready, iso)
+                .on_hover_text("Part Isolator: the HI, MID and LOW knobs set the vocal, instrument and drum levels")
+                .clicked()
+            {
+                deck.toggle_part_isolator(engine);
+            }
+            let (label, hover, enabled) = match &deck.stems {
+                Stems::Ready(layers) if layers.ready_share() < 1.0 => (
+                    format!("{:.0}%", layers.ready_share() * 100.0),
+                    "Separating piece by piece; the parts already work where it's done",
+                    false,
+                ),
+                Stems::Ready(_) => ("READY".to_owned(), "The track is separated", false),
+                Stems::Separating(percent) => (
+                    percent.map_or("…".to_owned(), |p| format!("{p}%")),
+                    "Separating; the track plays as it is meanwhile",
+                    false,
+                ),
+                Stems::Failed => ("RETRY".to_owned(), "Separating failed (see the log); try again", true),
+                Stems::None if !live_stems => {
+                    ("OFF".to_owned(), "Stems are turned off in Preferences, Stems", false)
+                }
+                Stems::None if !stem_model => {
+                    ("NO MODEL".to_owned(), "Add a stem model in Preferences, Stems", false)
+                }
+                Stems::None => ("SEPARATE".to_owned(), "Separate the track into stems", true),
+            };
+            let status = egui::Button::new(RichText::new(label).strong().size(size))
+                .fill(Color32::from_gray(30))
+                .min_size(pads.pad);
+            let response = ui.add_enabled(loaded && enabled, status);
+            if response.on_hover_text(hover).on_disabled_hover_text(hover).clicked() {
+                out.separate = true;
+            }
+            for _ in 0..2 {
+                ui.add_enabled(false, egui::Button::new("").fill(Color32::from_gray(22)).min_size(pads.pad));
+            }
+        });
+    });
 }
 
 /// Effect names in colours by kind, as on rekordbox's Pad FX pads.
