@@ -6,3 +6,17 @@ members = ["crates/*"]
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.88"
+
+# Debug builds: dependencies (decoding, the GUI) and the audio and analysis
+# crates at full speed, so the app runs smoothly while it is being worked
+# on; the app crate itself stays quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
+# Their debug symbols are most of a debug build's size, and never needed.
+debug = false
+
+[profile.dev.package.deckhand-audio]
+opt-level = 3
+
+[profile.dev.package.deckhand-analysis]
+opt-level = 3

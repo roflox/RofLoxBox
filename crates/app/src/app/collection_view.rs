@@ -301,10 +301,6 @@ impl DeckhandApp {
             return;
         }
         self.decks[deck].start_load_file(track, ctx);
-        self.collection.update_track(id, |t| {
-            t.play_count += 1;
-            t.last_played = Some(deckhand_now());
-        });
     }
 
     /// Adding music, importing and new playlists (the COLLECTION menu).
@@ -980,6 +976,18 @@ impl DeckhandApp {
                             }
                             Some(model) => {
                                 ui.label(RichText::new(&model.name).small().weak());
+                                if ui
+                                    .button("Stems ready for the decks")
+                                    .on_hover_text(
+                                        "Separates now, in the background: loaded later, the \
+                                         tracks have their stems at once",
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(TrackAction::PrepareStems(ids.clone()));
+                                    ui.close();
+                                }
+                                ui.separator();
                                 for recipe in &stem_recipes {
                                     if ui.button(&recipe.label).clicked() {
                                         actions
@@ -1048,6 +1056,7 @@ impl DeckhandApp {
                 TrackAction::Forget(id) => self.collection.remove_tracks(&[id]),
                 TrackAction::Analyze(ids) => self.analyze(ids, true),
                 TrackAction::Make(ids, recipe) => self.make_stems(&ids, &recipe),
+                TrackAction::PrepareStems(ids) => self.prepare_stems(&ids),
                 TrackAction::CancelStems => {
                     self.stems.cancel();
                     self.status = Some("Stem separation cancelled".into());
@@ -1082,6 +1091,7 @@ enum TrackAction {
     Edit(u32),
     Analyze(Vec<u32>),
     Make(Vec<u32>, crate::stems::Recipe),
+    PrepareStems(Vec<u32>),
     CancelStems,
     UpdateFromOriginal(u32),
 }
@@ -1104,7 +1114,7 @@ fn date(unix: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn deckhand_now() -> u64 {
+pub(super) fn deckhand_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 

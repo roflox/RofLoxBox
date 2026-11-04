@@ -218,6 +218,14 @@ fn target(name: &str, number: u8, comment: &str) -> Option<Target> {
         "Quantize" => Target::Deck(D::Quantize),
         "Slip" => Target::Deck(D::Slip),
         "Vinyl" => Target::Deck(D::Vinyl),
+        "ActivePartVocal" => Target::Deck(D::StemPart(0)),
+        "ActivePartInst" => Target::Deck(D::StemPart(1)),
+        "ActivePartBass" => Target::Deck(D::StemPart(2)),
+        "ActivePartDrums" => Target::Deck(D::StemPart(3)),
+        "PartIsolatorVocal" => Target::Deck(D::PartLevel(0)),
+        "PartIsolatorInst" => Target::Deck(D::PartLevel(1)),
+        "PartIsolatorDrums" => Target::Deck(D::PartLevel(2)),
+        "PartIsolator" => Target::Deck(D::PartIsolator),
         "LoopIn" => Target::Deck(D::LoopIn),
         "LoopOut" => Target::Deck(D::LoopOut),
         "ReloopExit" => Target::Deck(D::ReloopExit),
@@ -433,6 +441,11 @@ fn deck_feedback(name: &str, number: u8, comment: &str) -> Option<DeckFeedback> 
         "Quantize" => F::Quantize,
         "Slip" => F::Slip,
         "Vinyl" => F::Vinyl,
+        "ActivePartVocal" => F::StemOn(0),
+        "ActivePartInst" => F::StemOn(1),
+        "ActivePartBass" => F::StemOn(2),
+        "ActivePartDrums" => F::StemOn(3),
+        "PartIsolator" => F::PartIsolator,
         "MasterTempo" => F::KeyLock,
         "HeadphoneCue" => F::HeadphoneCue,
         "LoopIn" | "LoopOut" | "GetLoopActive" => F::LoopActive,
@@ -644,6 +657,9 @@ pub fn import(name: &str, text: &str) -> Import {
             mapped_feedback.insert(what, ());
         }
     }
+    mapping.offered = mapping.bindings.iter().map(|b| b.action.to_string()).collect();
+    mapping.offered.sort();
+    mapping.offered.dedup();
     Import { mapping, unsupported }
 }
 

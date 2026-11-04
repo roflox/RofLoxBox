@@ -62,13 +62,13 @@ impl Controller {
         self.error = None;
         match Mapping::load(&mapping_path(port)) {
             Ok(mut mapping) => {
-                // Lights RofLoxBox learned to drive since the mapping was
-                // made; the controls stay as they are.
+                // Functions and lights RofLoxBox learned since the mapping
+                // was made (stems pads, …); the existing controls stay.
                 let rekordbox =
                     rekordbox::find_for_port_with(port, &[crate::config::extra_mapping_dir()])
                         .and_then(|(_, path)| rekordbox::import_file(&path).ok());
                 if let Some(import) = rekordbox
-                    && mapping.add_missing_outputs(&import.mapping) > 0
+                    && mapping.add_new_functions(&import.mapping)
                     && let Err(err) = mapping.save(&mapping_path(port))
                 {
                     self.error = Some(format!("saving mapping: {err:#}"));

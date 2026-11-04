@@ -67,6 +67,13 @@ Separation runs any model you add (Preferences → Stems: a folder with a
 `model.toml` naming its stems and the command that separates a track), with
 presets for Demucs and audio-separator; results are cached per track.
 
+Live stems: loaded tracks are separated in the background (instantly when
+cached) and the deck's VOCAL, INST, BASS and DRUMS buttons, the Stems pad
+mode and the GRV6's part buttons turn parts off; ISO (Part Isolator, Shift +
+headphone CUE on the GRV6) makes the HI, MID and LOW knobs the vocal,
+instrument and drum levels. INST is whatever remains, so with every part on
+the deck plays the original exactly.
+
 Dragging a running waveform stops the deck under the mouse, and it plays on
 from there when let go. Preferences → Appearance has dark and light themes.
 
@@ -84,9 +91,13 @@ Each script leaves its results in `target/dist/`:
 - `scripts/build-linux.sh` (on Linux, with `libasound2-dev`): a `.tar.gz`
   and, with `appimagetool`, an AppImage.
 
-Pushing a version tag (`git tag v0.1.0 && git push --tags`) runs
+Every commit is a new version, `0.<number of commits>.0`
+(`scripts/version.sh`; shown in the window title). Each push to `main` runs
 `.github/workflows/release.yml`, which builds all three on GitHub's machines
-and makes a draft release with them and their SHA-256 sums.
+and publishes them as the release `v0.<n>.0`, with their SHA-256 sums.
+`scripts/publish-release.sh [--draft]` uploads the builds of this version
+from `target/dist/` to that release yourself (needs the GitHub CLI:
+`brew install gh && gh auth login`, and the commit pushed).
 
 Signing needs your own certificates; without them the builds are unsigned
 (macOS ad hoc: open it once with right-click → Open; Windows SmartScreen

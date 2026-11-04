@@ -31,6 +31,33 @@ impl TrackAudio {
     /// The signal at a fractional frame position: linear or cubic (Hermite)
     /// interpolation between the neighbouring frames.
     pub fn sample_at(&self, position: f64, cubic: bool) -> [f32; 2] {
+        Frames::sample_at(self, position, cubic)
+    }
+
+    /// The stereo frame at `index`, or silence outside the track.
+    pub fn frame(&self, index: i64) -> [f32; 2] {
+        if index < 0 {
+            return [0.0; 2];
+        }
+        let at = index as usize * 2;
+        match self.samples.get(at..at + 2) {
+            Some(frame) => [frame[0], frame[1]],
+            None => [0.0; 2],
+        }
+    }
+}
+
+/// Stereo audio a deck plays from: a track, or a track with its stems at
+/// their levels.
+pub trait Frames {
+    fn rate(&self) -> u32;
+
+    /// The stereo frame at `index`, or silence outside the audio.
+    fn frame(&self, index: i64) -> [f32; 2];
+
+    /// The signal at a fractional frame position: linear or cubic (Hermite)
+    /// interpolation between the neighbouring frames.
+    fn sample_at(&self, position: f64, cubic: bool) -> [f32; 2] {
         let base = position.floor();
         let t = (position - base) as f32;
         let i = base as i64;
@@ -47,17 +74,15 @@ impl TrackAudio {
             ((c3 * t + c2) * t + c1) * t + b
         })
     }
+}
 
-    /// The stereo frame at `index`, or silence outside the track.
-    pub fn frame(&self, index: i64) -> [f32; 2] {
-        if index < 0 {
-            return [0.0; 2];
-        }
-        let at = index as usize * 2;
-        match self.samples.get(at..at + 2) {
-            Some(frame) => [frame[0], frame[1]],
-            None => [0.0; 2],
-        }
+impl Frames for TrackAudio {
+    fn rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn frame(&self, index: i64) -> [f32; 2] {
+        TrackAudio::frame(self, index)
     }
 }
 

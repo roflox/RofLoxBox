@@ -150,6 +150,39 @@ pub fn write_wav_file(path: &Path, rate: u32, samples: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// Writes stereo samples as a 32-bit float WAV file, keeping values past
+/// full scale (stems can have them).
+pub fn write_float_wav_file(path: &Path, rate: u32, samples: &[f32]) -> Result<()> {
+    const CHANNELS: u16 = 2;
+    const BYTES: u16 = 4;
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut out = BufWriter::with_capacity(1 << 16, file);
+    let samples = &samples[..samples.len() - samples.len() % 2];
+    let data = (samples.len() as u64 * u64::from(BYTES)).min(u64::from(u32::MAX - 50)) as u32;
+    out.write_all(b"RIFF")?;
+    out.write_all(&(38 + 12 + data).to_le_bytes())?;
+    out.write_all(b"WAVEfmt ")?;
+    out.write_all(&18u32.to_le_bytes())?;
+    out.write_all(&3u16.to_le_bytes())?; // IEEE float
+    out.write_all(&CHANNELS.to_le_bytes())?;
+    out.write_all(&rate.to_le_bytes())?;
+    out.write_all(&(rate * u32::from(CHANNELS * BYTES)).to_le_bytes())?;
+    out.write_all(&(CHANNELS * BYTES).to_le_bytes())?;
+    out.write_all(&(BYTES * 8).to_le_bytes())?;
+    out.write_all(&0u16.to_le_bytes())?;
+    // Float WAV files carry a fact chunk with the frame count.
+    out.write_all(b"fact")?;
+    out.write_all(&4u32.to_le_bytes())?;
+    out.write_all(&((samples.len() / 2) as u32).to_le_bytes())?;
+    out.write_all(b"data")?;
+    out.write_all(&data.to_le_bytes())?;
+    for &s in samples {
+        out.write_all(&s.to_le_bytes())?;
+    }
+    out.flush().with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 fn write_header(out: &mut impl Write, rate: u32, frames: u64) -> Result<()> {
     const CHANNELS: u16 = 2;
     const BYTES: u16 = 3;
@@ -173,6 +206,16 @@ fn write_header(out: &mut impl Write, rate: u32, frames: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_wav_keeps_loud_samples() {
+        let path = std::env::temp_dir().join(format!("deckhand-float-{}.wav", std::process::id()));
+        let samples = vec![0.5, -1.5, 1.25, 0.0];
+        write_float_wav_file(&path, 44_100, &samples).unwrap();
+        let read = crate::decode_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((read.sample_rate, read.samples), (44_100, samples));
+    }
 
     #[test]
     fn writes_a_valid_24_bit_wav() {

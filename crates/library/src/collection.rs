@@ -217,6 +217,9 @@ fn copy_timing(source: &Track, track: &mut Track) {
     track.key = source.key.clone();
 }
 
+/// The top-level folder holding the history playlists.
+pub const HISTORY: &str = "HISTORY";
+
 pub(crate) fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -657,6 +660,27 @@ impl Collection {
         }
     }
 
+    /// The history playlist `name` (e.g. "HISTORY 2026-11-04") in the
+    /// top-level HISTORY folder, made when missing, like rekordbox's.
+    pub fn history_playlist(&mut self, name: &str) -> u32 {
+        let folder = match self
+            .nodes
+            .iter()
+            .find(|n| n.parent.is_none() && n.kind == NodeKind::Folder && n.name == HISTORY)
+        {
+            Some(folder) => folder.id,
+            None => self.create(HISTORY, NodeKind::Folder, None),
+        };
+        match self
+            .nodes
+            .iter()
+            .find(|n| n.parent == Some(folder) && n.kind == NodeKind::Playlist && n.name == name)
+        {
+            Some(playlist) => playlist.id,
+            None => self.create(name, NodeKind::Playlist, Some(folder)),
+        }
+    }
+
     /// The tree in display order: (depth, node).
     pub fn tree(&self) -> Vec<(usize, &Node)> {
         fn walk<'a>(
@@ -684,6 +708,19 @@ mod tests {
 
     fn scanned(path: &str, title: &str) -> ScannedFile {
         ScannedFile { path: PathBuf::from(path), title: title.to_owned(), ..ScannedFile::default() }
+    }
+
+    #[test]
+    fn history_playlists_share_one_folder() {
+        let mut c = Collection::default();
+        let today = c.history_playlist("HISTORY 2026-11-04");
+        assert_eq!(c.history_playlist("HISTORY 2026-11-04"), today);
+        let tomorrow = c.history_playlist("HISTORY 2026-11-05");
+        assert_ne!(tomorrow, today);
+        let folder = c.node(today).unwrap().parent.unwrap();
+        assert_eq!(c.node(tomorrow).unwrap().parent, Some(folder));
+        assert_eq!(c.node(folder).unwrap().name, HISTORY);
+        assert_eq!(c.nodes.len(), 3);
     }
 
     #[test]

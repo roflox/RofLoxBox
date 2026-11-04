@@ -14,7 +14,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 export MACOSX_DEPLOYMENT_TARGET=11.0
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -1)
+VERSION=$(scripts/version.sh)
 TARGETS=aarch64-apple-darwin
 if [ "${1:-}" = "--universal" ]; then
     TARGETS="aarch64-apple-darwin x86_64-apple-darwin"

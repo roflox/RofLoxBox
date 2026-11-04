@@ -192,10 +192,15 @@ Done (milestone 2, 2026-10-25):
   grid. Demucs htdemucs: 60 s for a 4.6 min track on an M1 CPU, stems
   sample-aligned with deckhand's decoding.
 
+- Stems, part 2: live stems. Separation on load in its own queue; the engine
+  mixes vocal/bass/drum layers (16-bit, resampled to the track) with INST as
+  the remainder, gliding levels over 8 ms; the stretcher reads through a
+  `Frames` trait so Master Tempo works on stems. Stems pads 1–4, Part
+  Isolator on the EQ knobs, GRV6 ACTIVE PART buttons and LEDs.
+
 Next:
-1. Stems part 2: live stems on the decks (Stems pads, Part Isolator, GRV6),
-   then a built-in ONNX runner. Demucs' stems sum ~11 dB off the original,
-   so live stems should rebuild "other" as the remainder.
+1. Stems part 3: a built-in ONNX runner; Drum Swap; waveforms that show
+   muted parts.
 2. Beat FX and the sampler; stems (needs separation models).
 3. Save hot cues / cue points set in deckhand.
 4. Tune jog scratch resolution on hardware (`SCRATCH_SECONDS_PER_STEP`).

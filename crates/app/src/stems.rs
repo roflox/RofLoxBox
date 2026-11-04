@@ -7,7 +7,7 @@
 //! ```toml
 //! name = "Demucs (htdemucs)"
 //! stems = ["drums", "bass", "other", "vocals"]
-//! command = ["demucs", "-n", "htdemucs", "-o", "{output}", "{input}"]
+//! command = ["demucs", "-n", "htdemucs", "--float32", "--clip-mode", "none", "-o", "{output}", "{input}"]
 //! install = "pipx install demucs && pipx inject demucs numpy soundfile"   # shown when the command is missing
 //! ```
 //!
@@ -83,6 +83,54 @@ fn cache_dir() -> PathBuf {
     deckhand_library::data_dir().join("stem-cache")
 }
 
+/// The most the stem cache keeps; past it, the stems of the tracks used
+/// least recently go (they are separated again when needed).
+const CACHE_LIMIT: u64 = 2 << 30;
+
+/// Marks a track's cached stems as just used.
+fn touch(dir: &Path) {
+    let _ = std::fs::write(dir.join(".used"), b"");
+}
+
+/// Removes the least recently used tracks' stems until the cache fits
+/// `limit` bytes.
+fn trim_cache(cache: &Path, limit: u64) {
+    let size = |dir: &Path| -> u64 {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    };
+    let mut tracks: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(cache)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|model| std::fs::read_dir(model.path()).into_iter().flatten().flatten())
+        .map(|entry| entry.path())
+        .filter(|dir| dir.is_dir() && dir.extension().is_none())
+        .map(|dir| {
+            let used = std::fs::metadata(dir.join(".used"))
+                .or_else(|_| std::fs::metadata(&dir))
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (used, size(&dir), dir)
+        })
+        .collect();
+    // Newest first: they stay.
+    tracks.sort_by_key(|track| std::cmp::Reverse(track.0));
+    let mut total = 0;
+    for (_, bytes, dir) in tracks {
+        total += bytes;
+        if total > limit {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 /// Where made tracks go unless Preferences say otherwise.
 pub fn default_output_dir() -> PathBuf {
     deckhand_library::data_dir().join("Stems")
@@ -155,7 +203,7 @@ command = ["demucs", "-n", "htdemucs", "-o", "{output}", "--filename", "{stem}.{
         toml: r#"name = "Demucs htdemucs_ft"
 install = "pipx install demucs && pipx inject demucs numpy soundfile"
 stems = ["drums", "bass", "other", "vocals"]
-command = ["demucs", "-n", "htdemucs_ft", "-o", "{output}", "--filename", "{stem}.{ext}", "{input}"]
+command = ["demucs", "-n", "htdemucs_ft", "--float32", "--clip-mode", "none", "-o", "{output}", "--filename", "{stem}.{ext}", "{input}"]
 "#,
     },
     Preset {
@@ -165,7 +213,7 @@ command = ["demucs", "-n", "htdemucs_ft", "-o", "{output}", "--filename", "{stem
         toml: r#"name = "Demucs htdemucs_6s"
 install = "pipx install demucs && pipx inject demucs numpy soundfile"
 stems = ["drums", "bass", "other", "vocals", "guitar", "piano"]
-command = ["demucs", "-n", "htdemucs_6s", "-o", "{output}", "--filename", "{stem}.{ext}", "{input}"]
+command = ["demucs", "-n", "htdemucs_6s", "--float32", "--clip-mode", "none", "-o", "{output}", "--filename", "{stem}.{ext}", "{input}"]
 "#,
     },
     Preset {
@@ -268,12 +316,37 @@ pub struct Job {
     pub makes: Vec<(Recipe, PathBuf)>,
 }
 
+/// Separating a deck's track to play its stems live.
+#[derive(Debug, Clone)]
+pub struct LiveJob {
+    pub deck: usize,
+    pub title: String,
+    pub input: PathBuf,
+    pub model: StemModel,
+    /// The track as the deck decoded it.
+    pub audio: Arc<deckhand_audio::TrackAudio>,
+    /// The deck's position in seconds (`f64` bits), kept up to date by the
+    /// app: the pieces around it go first. [`CANCELLED`] stops the job.
+    pub playhead: Arc<AtomicU64>,
+}
+
+/// A [`LiveJob::playhead`] value: the deck has another track now.
+pub const CANCELLED: u64 = u64::MAX;
+
 #[derive(Debug)]
 pub enum Event {
     /// The job started; `percent` of the model's run is done.
     Progress {
         title: String,
         percent: Option<u32>,
+        /// The deck the stems are for, when played live.
+        deck: Option<usize>,
+    },
+    /// Stems for a deck: the track's file and its parts.
+    Live {
+        deck: usize,
+        input: PathBuf,
+        stems: Arc<deckhand_audio::StemLayers>,
     },
     Made {
         track: u32,
@@ -284,6 +357,7 @@ pub enum Event {
     Failed {
         title: String,
         error: String,
+        deck: Option<usize>,
     },
 }
 
@@ -347,13 +421,19 @@ impl Separator {
 fn run(job: Job, events: &Sender<Event>, running: &Mutex<Option<Child>>, cache: &Path) {
     let (track, title) = (job.track, job.title.clone());
     let progress = |percent| {
-        let _ = events.send(Event::Progress { title: title.clone(), percent });
+        let _ = events.send(Event::Progress { title: title.clone(), percent, deck: None });
     };
     progress(None);
     let stems = match separate(&job.model, &job.input, cache, running, &progress) {
-        Ok(stems) => stems,
+        Ok(stems) => {
+            if let Some(dir) = stems.values().next().and_then(|f| f.parent()) {
+                touch(dir);
+            }
+            trim_cache(cache, CACHE_LIMIT);
+            stems
+        }
         Err(err) => {
-            let _ = events.send(Event::Failed { title, error: format!("{err:#}") });
+            let _ = events.send(Event::Failed { title, error: format!("{err:#}"), deck: None });
             return;
         }
     };
@@ -370,9 +450,534 @@ fn run(job: Job, events: &Sender<Event>, running: &Mutex<Option<Child>>, cache: 
             Err(err) => Event::Failed {
                 title: format!("{} ({})", job.title, recipe.suffix),
                 error: format!("{err:#}"),
+                deck: None,
             },
         });
     }
+}
+
+/// The vocal, bass and drum stems, ready to play at the track's `rate` and
+/// length. A model without one of them leaves that part in the instruments.
+/// Each stem gets the level at which all of them add up to `track` (as
+/// deckhand decodes it), whatever the model did to their levels.
+fn layers(
+    stems: &BTreeMap<String, PathBuf>,
+    track: &deckhand_audio::TrackAudio,
+) -> Result<deckhand_audio::StemLayers> {
+    let mut decoded = stems
+        .iter()
+        .map(|(name, file)| Ok((name.as_str(), deckhand_audio::decode_file(file)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let all: Vec<&deckhand_audio::TrackAudio> = decoded.iter().map(|(_, audio)| audio).collect();
+    let gains = deckhand_audio::fit_gains(track, &all);
+    for ((_, audio), gain) in decoded.iter_mut().zip(gains) {
+        audio.samples.iter_mut().for_each(|s| *s *= gain);
+    }
+    let part =
+        |is: &dyn Fn(&str) -> bool| decoded.iter().find(|(name, _)| is(name)).map(|(_, a)| a);
+    let vocals = part(&|s| is_vocals(s));
+    let bass = part(&|s| s.eq_ignore_ascii_case("bass"));
+    let drums = part(&|s| s.eq_ignore_ascii_case("drums"));
+    if vocals.is_none() && bass.is_none() && drums.is_none() {
+        bail!("the model has no vocal, bass or drum stem to play");
+    }
+    Ok(deckhand_audio::StemLayers::new(vocals, bass, drums, track.sample_rate, track.frames()))
+}
+
+/// Demucs turns each stem down on its own when it would clip (and saves
+/// 16-bit files), so its stems stop adding up to the track. Unless the
+/// command says otherwise, it is asked for float files at their real level,
+/// and on Apple Silicon (with `gpu`) to run on the GPU, about three times
+/// as fast; elsewhere it finds an Nvidia GPU by itself.
+fn model_args(command: &[String], gpu: bool) -> Vec<String> {
+    let mut args = command.to_vec();
+    let program = command.first().map(Path::new).and_then(Path::file_stem);
+    if program.is_some_and(|p| p.eq_ignore_ascii_case("demucs")) {
+        let has = |flags: &[&str]| command.iter().any(|a| flags.contains(&a.as_str()));
+        if gpu
+            && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && !has(&["-d", "--device"])
+        {
+            args.splice(1..1, ["-d".to_owned(), "mps".to_owned()]);
+        }
+        if !has(&["--clip-mode"]) {
+            args.splice(1..1, ["--clip-mode".to_owned(), "none".to_owned()]);
+        }
+        if !has(&["--float32", "--int24", "--mp3", "--flac"]) {
+            args.insert(1, "--float32".to_owned());
+        }
+    }
+    args
+}
+
+/// Live stems are tracked in blocks this long: a piece is a run of them.
+const BLOCK_SECS: f64 = 2.0;
+/// Blocks in the piece under the playhead when it has none yet: short, so
+/// the stems there play within a couple of seconds.
+const FIRST_BLOCKS: usize = 3;
+/// Blocks in the other pieces: longer, as each run has its overhead.
+const PIECE_BLOCKS: usize = 10;
+/// Audio on each side of a piece the model also hears, so it separates the
+/// piece's edges as well as the middle.
+const CONTEXT_SECS: f64 = 2.0;
+/// Pieces meet in a cross-fade this long.
+const JOIN_SECS: f64 = 0.25;
+
+/// Separates decks' tracks for live stems, a piece at a time, on a thread
+/// of its own: always the piece nearest to a deck's playhead that is still
+/// missing, across all decks, so the stems play within seconds and follow
+/// jumps. A finished track goes in the cache like any separation. Demucs
+/// models run in a helper that keeps the model loaded (see [`warm`]).
+///
+/// [`warm`]: LiveSeparator::warm
+pub struct LiveSeparator {
+    jobs: Sender<LiveMessage>,
+    pub events: Receiver<Event>,
+}
+
+enum LiveMessage {
+    Job(LiveJob),
+    /// Load this model now, so the first piece doesn't wait for it.
+    Warm(StemModel),
+    /// Close the helper, freeing its memory.
+    Rest,
+}
+
+impl Default for LiveSeparator {
+    fn default() -> Self {
+        let (jobs, queue) = channel::<LiveMessage>();
+        let (events_tx, events) = channel();
+        std::thread::Builder::new()
+            .name("live stems".into())
+            .spawn(move || live_loop(&queue, &events_tx, &cache_dir()))
+            .expect("starting the live stems thread");
+        Self { jobs, events }
+    }
+}
+
+impl LiveSeparator {
+    pub fn submit(&self, job: LiveJob) {
+        let _ = self.jobs.send(LiveMessage::Job(job));
+    }
+
+    /// Gets the model ready ahead of the first track (for models that run
+    /// in a helper; nothing for others).
+    pub fn warm(&self, model: StemModel) {
+        let _ = self.jobs.send(LiveMessage::Warm(model));
+    }
+
+    /// Closes the model's helper (stems turned off).
+    pub fn rest(&self) {
+        let _ = self.jobs.send(LiveMessage::Rest);
+    }
+}
+
+/// The Demucs helper ([`demucs_worker.py`]) with a model loaded.
+///
+/// [`demucs_worker.py`]: https://github.com/roflox/RofLoxBox/blob/main/crates/app/src/stems/demucs_worker.py
+struct Helper {
+    model: String,
+    child: Child,
+    input: std::process::ChildStdin,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+
+const HELPER_SCRIPT: &str = include_str!("stems/demucs_worker.py");
+
+impl Helper {
+    /// Starts the helper in the Python Demucs is installed in, for a model
+    /// whose command runs `demucs`; `None` for other models.
+    fn start(model: &StemModel) -> Option<Result<Self>> {
+        let (python, name) = demucs_python(model)?;
+        Some(Self::spawn(model, &python, &name))
+    }
+
+    fn spawn(model: &StemModel, python: &Path, name: &str) -> Result<Self> {
+        let script = deckhand_library::data_dir().join("demucs_worker.py");
+        if std::fs::read_to_string(&script).ok().as_deref() != Some(HELPER_SCRIPT) {
+            std::fs::create_dir_all(deckhand_library::data_dir())?;
+            std::fs::write(&script, HELPER_SCRIPT)?;
+        }
+        let mut child = no_window(&mut Command::new(python))
+            .arg("-I")
+            .arg(&script)
+            .arg(name)
+            .current_dir(&model.dir)
+            .env("PATH", search_path(&model.dir))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("starting {}", python.display()))?;
+        let input = child.stdin.take().context("helper input")?;
+        let output = std::io::BufReader::new(child.stdout.take().context("helper output")?);
+        let mut helper = Self { model: model.id.clone(), child, input, output };
+        let ready = helper.answer()?;
+        if !ready.get("ready").is_some_and(serde_json::Value::is_array) {
+            bail!("the Demucs helper did not start: {ready}");
+        }
+        Ok(helper)
+    }
+
+    /// The helper's next line.
+    fn answer(&mut self) -> Result<serde_json::Value> {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if self.output.read_line(&mut line)? == 0 {
+            bail!("the Demucs helper stopped");
+        }
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .with_context(|| format!("the Demucs helper said: {line}"))?;
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+            bail!("Demucs: {error}");
+        }
+        Ok(value)
+    }
+
+    /// Separates `wav` into stem files in `output`.
+    fn separate(&mut self, wav: &Path, output: &Path) -> Result<()> {
+        use std::io::Write;
+        let request = serde_json::json!({ "input": wav, "output": output });
+        writeln!(self.input, "{request}")?;
+        self.input.flush()?;
+        self.answer().map(|_| ())
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// For a model whose command runs `demucs`: the Python it is installed in
+/// (named by the `demucs` launcher's first line, or next to it) and the
+/// Demucs model name (`-n`, else htdemucs).
+fn demucs_python(model: &StemModel) -> Option<(PathBuf, String)> {
+    let program = model.command.first()?;
+    if !Path::new(program).file_stem().is_some_and(|p| p.eq_ignore_ascii_case("demucs")) {
+        return None;
+    }
+    let name = model
+        .command
+        .iter()
+        .position(|a| a == "-n" || a == "--name")
+        .and_then(|i| model.command.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "htdemucs".into());
+    let launcher = if Path::new(program).is_absolute() {
+        Some(PathBuf::from(program))
+    } else {
+        std::env::split_paths(&search_path(&model.dir))
+            .flat_map(|dir| [dir.join(program), dir.join(format!("{program}.exe"))])
+            .find(|p| p.is_file())
+    }?;
+    let first_line = std::fs::read(&launcher).ok().and_then(|bytes| {
+        let line = bytes.split(|b| *b == b'\n').next()?.strip_prefix(b"#!")?.to_vec();
+        String::from_utf8(line).ok()
+    });
+    let named =
+        first_line.map(|l| PathBuf::from(l.trim())).filter(|p| p.is_absolute() && p.is_file());
+    let home =
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    let dir = launcher.parent().map(Path::to_path_buf).unwrap_or_default();
+    let beside = [dir.join("python"), dir.join("python3"), dir.join("python.exe")];
+    // pipx on Windows puts a copy of the launcher in its bin folder.
+    let pipx = home.iter().flat_map(|h| {
+        [h.join(".local/pipx/venvs/demucs"), h.join("pipx/venvs/demucs")]
+            .into_iter()
+            .flat_map(|v| [v.join("bin/python"), v.join("Scripts/python.exe")])
+    });
+    let python = named.or_else(|| beside.into_iter().chain(pipx).find(|p| p.is_file()))?;
+    Some((python, name))
+}
+
+/// A track being separated piece by piece.
+struct Live {
+    job: LiveJob,
+    /// The track as deckhand decodes it.
+    track: Arc<deckhand_audio::TrackAudio>,
+    layers: Arc<deckhand_audio::StemLayers>,
+    /// Every stem of the model, for the cache.
+    stems: BTreeMap<String, Vec<f32>>,
+    /// Blocks done.
+    done: Vec<bool>,
+    /// Frames per block.
+    block: usize,
+    dir: PathBuf,
+}
+
+impl Live {
+    fn cancelled(&self) -> bool {
+        self.job.playhead.load(Ordering::Relaxed) == CANCELLED
+    }
+
+    /// The most urgent piece still missing, as (urgency, first block, end
+    /// block): the playhead's own block first, then ones ahead by their
+    /// distance, ones behind at three times theirs (and a bit).
+    fn next_piece(&self) -> Option<(usize, usize, usize)> {
+        let seconds = f64::from_bits(self.job.playhead.load(Ordering::Relaxed)).max(0.0);
+        let blocks = self.done.len();
+        let at =
+            ((seconds * f64::from(self.track.sample_rate)) as usize / self.block).min(blocks - 1);
+        let ahead = (at..blocks).find(|&b| !self.done[b]).map(|b| (b - at, b));
+        // Behind counts one more, so ahead wins a tie: decks play forwards.
+        let behind = (0..at).rev().find(|&b| !self.done[b]).map(|b| ((at - b) * 3 + 1, b));
+        let (urgency, start) = match (ahead, behind) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        let length = if urgency == 0 { FIRST_BLOCKS } else { PIECE_BLOCKS };
+        if start >= at {
+            // Forwards from there, up to blocks already done.
+            let end = (start..(start + length).min(blocks))
+                .find(|&b| self.done[b])
+                .unwrap_or((start + length).min(blocks));
+            Some((urgency, start, end))
+        } else {
+            // Backwards, ending at the missing block next to what's done.
+            let first = (start.saturating_sub(length - 1)..=start)
+                .rev()
+                .take_while(|&b| !self.done[b])
+                .last()
+                .unwrap_or(start);
+            Some((urgency, first, start + 1))
+        }
+    }
+
+    /// Separates blocks `first..end` and puts them in place.
+    fn separate(
+        &mut self,
+        (first, end): (usize, usize),
+        helper: &mut Option<Helper>,
+        running: &Mutex<Option<Child>>,
+    ) -> Result<()> {
+        let rate = self.track.sample_rate;
+        let frames_total = self.track.frames();
+        let seconds = |s: f64| (s * f64::from(rate)) as usize;
+        let (start, stop) = (first * self.block, (end * self.block).min(frames_total));
+        let (from, to) = (
+            start.saturating_sub(seconds(CONTEXT_SECS)),
+            (stop + seconds(CONTEXT_SECS)).min(frames_total),
+        );
+        let work = self.dir.with_extension("work").join(format!("piece-{first}"));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+        let piece = deckhand_audio::TrackAudio {
+            sample_rate: rate,
+            samples: self.track.samples[from * 2..to * 2].to_vec(),
+        };
+        let wav = work.join("input.wav");
+        deckhand_audio::write_wav_file(&wav, rate, &piece.samples)?;
+        let output = work.join("out");
+        let model = &self.job.model;
+        let by_helper = match helper.as_mut().filter(|h| h.model == model.id) {
+            Some(h) => match h.separate(&wav, &output) {
+                Ok(()) => find_stems(&output, &model.stems, &BTreeMap::new()).ok(),
+                Err(_) => {
+                    // Broken: the next piece starts a new one.
+                    *helper = None;
+                    None
+                }
+            },
+            None => None,
+        };
+        let found = match by_helper {
+            Some(found) => found,
+            None => run_model(model, &wav, &output, &work, running, &|_| {})?,
+        };
+        let decoded = found
+            .iter()
+            .map(|(name, file)| Ok((name.clone(), deckhand_audio::decode_file(file)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let _ = std::fs::remove_dir_all(&work);
+        let all: Vec<&deckhand_audio::TrackAudio> = decoded.iter().map(|(_, a)| a).collect();
+        let gains = deckhand_audio::fit_gains(&piece, &all);
+        let join = seconds(JOIN_SECS);
+        let left = first > 0 && self.done[first - 1];
+        let right = end < self.done.len() && self.done[end];
+        for ((name, audio), gain) in decoded.iter().zip(gains) {
+            let part = live_part(name);
+            let Some(buffer) = self.stems.get_mut(name) else { continue };
+            let step = f64::from(audio.sample_rate) / f64::from(rate);
+            for frame in from..to {
+                // In the piece, or fading in or out over a ready neighbour.
+                let weight = if (start..stop).contains(&frame) {
+                    1.0
+                } else if left && frame < start && frame + join >= start {
+                    1.0 - (start - frame) as f32 / join as f32
+                } else if right && frame >= stop && frame < stop + join {
+                    1.0 - (frame - stop) as f32 / join as f32
+                } else {
+                    continue;
+                };
+                let [l, r] = audio.sample_at((frame - from) as f64 * step, true);
+                let new = [l * gain, r * gain];
+                let old = [buffer[frame * 2], buffer[frame * 2 + 1]];
+                let mixed =
+                    [old[0] + (new[0] - old[0]) * weight, old[1] + (new[1] - old[1]) * weight];
+                buffer[frame * 2] = mixed[0];
+                buffer[frame * 2 + 1] = mixed[1];
+                if let Some(part) = part {
+                    self.layers.set(part, frame, mixed);
+                }
+            }
+        }
+        for block in first..end {
+            self.done[block] = true;
+            self.layers.set_ready(block);
+        }
+        Ok(())
+    }
+
+    /// Keeps the finished separation, as a whole-track one would be.
+    fn save(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating {}", self.dir.display()))?;
+        for (name, samples) in &self.stems {
+            deckhand_audio::write_float_wav_file(
+                &self.dir.join(format!("{name}.wav")),
+                self.track.sample_rate,
+                samples,
+            )?;
+        }
+        let _ = std::fs::remove_dir_all(self.dir.with_extension("work"));
+        Ok(())
+    }
+}
+
+/// The live part a stem plays as (vocals, bass, drums), if any.
+fn live_part(stem: &str) -> Option<usize> {
+    if is_vocals(stem) {
+        Some(deckhand_audio::VOCALS)
+    } else if stem.eq_ignore_ascii_case("bass") {
+        Some(deckhand_audio::BASS)
+    } else if stem.eq_ignore_ascii_case("drums") {
+        Some(deckhand_audio::DRUMS)
+    } else {
+        None
+    }
+}
+
+fn live_loop(queue: &Receiver<LiveMessage>, events: &Sender<Event>, cache: &Path) {
+    let running = Mutex::new(None);
+    let mut active: Vec<Live> = Vec::new();
+    let mut helper: Option<Helper> = None;
+    // Models whose helper would not start: they run as commands.
+    let mut no_helper: Vec<String> = Vec::new();
+    let mut ensure_helper = |model: &StemModel, helper: &mut Option<Helper>| {
+        if helper.as_ref().is_some_and(|h| h.model == model.id) || no_helper.contains(&model.id) {
+            return;
+        }
+        *helper = None;
+        match Helper::start(model) {
+            Some(Ok(started)) => *helper = Some(started),
+            Some(Err(_)) | None => no_helper.push(model.id.clone()),
+        }
+    };
+    loop {
+        // Wait for work when idle; take whatever else came meanwhile.
+        let mut messages: Vec<LiveMessage> = Vec::new();
+        if active.is_empty() {
+            match queue.recv() {
+                Ok(message) => messages.push(message),
+                Err(_) => return,
+            }
+        }
+        messages.extend(queue.try_iter());
+        for message in messages {
+            match message {
+                LiveMessage::Job(job) => start_live(job, events, cache, &mut active),
+                LiveMessage::Warm(model) => ensure_helper(&model, &mut helper),
+                LiveMessage::Rest => helper = None,
+            }
+        }
+        active.retain(|live| !live.cancelled());
+        let next = active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, live)| {
+                live.next_piece().map(|(urgency, first, end)| (urgency, i, first, end))
+            })
+            .min();
+        let Some((_, i, first, end)) = next else { continue };
+        ensure_helper(&active[i].job.model, &mut helper);
+        let live = &mut active[i];
+        if let Err(err) = live.separate((first, end), &mut helper, &running) {
+            let deck = live.job.deck;
+            let _ = events.send(Event::Failed {
+                title: live.job.title.clone(),
+                error: format!("{err:#}"),
+                deck: Some(deck),
+            });
+            active.remove(i);
+            continue;
+        }
+        if live.done.iter().all(|d| *d) {
+            if let Err(err) = live.save() {
+                let _ = events.send(Event::Failed {
+                    title: live.job.title.clone(),
+                    error: format!("keeping the stems: {err:#}"),
+                    deck: None,
+                });
+            }
+            touch(&live.dir);
+            trim_cache(cache, CACHE_LIMIT);
+            active.remove(i);
+        }
+    }
+}
+
+/// Plays the cached stems of a track separated before, else gives the deck
+/// silent stems at once (its parts can be switched straight away) and lines
+/// the track up for separating piece by piece.
+fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut Vec<Live>) {
+    // A deck taking another track drops its earlier job.
+    active.retain(|live| live.job.deck != job.deck && !live.cancelled());
+    let dir = cache.join(&job.model.id).join(cache_key(&job.input));
+    let fail = |err: anyhow::Error| {
+        let _ = events.send(Event::Failed {
+            title: job.title.clone(),
+            error: format!("{err:#}"),
+            deck: Some(job.deck),
+        });
+    };
+    if let Ok(stems) = find_stems(&dir, &job.model.stems, &BTreeMap::new()) {
+        touch(&dir);
+        match layers(&stems, &job.audio) {
+            Ok(layers) => {
+                let _ = events.send(Event::Live {
+                    deck: job.deck,
+                    input: job.input.clone(),
+                    stems: Arc::new(layers),
+                });
+            }
+            Err(err) => fail(err),
+        }
+        return;
+    }
+    let track = job.audio.clone();
+    let has = [deckhand_audio::VOCALS, deckhand_audio::BASS, deckhand_audio::DRUMS]
+        .map(|part| job.model.stems.iter().any(|s| live_part(s) == Some(part)));
+    let block = (BLOCK_SECS * f64::from(track.sample_rate)) as usize;
+    let frames = track.frames();
+    let layers = Arc::new(deckhand_audio::StemLayers::empty(has, frames, block));
+    let _ = events.send(Event::Live {
+        deck: job.deck,
+        input: job.input.clone(),
+        stems: layers.clone(),
+    });
+    let stems = job.model.stems.iter().map(|s| (s.clone(), vec![0.0; frames * 2])).collect();
+    active.push(Live {
+        layers,
+        done: vec![false; frames.div_ceil(block).max(1)],
+        stems,
+        block,
+        dir,
+        track,
+        job,
+    });
 }
 
 /// The cache folder for a file: its path, size and modification time.
@@ -404,12 +1009,56 @@ fn separate(
     deckhand_audio::write_wav_file(&wav, audio.sample_rate, &audio.samples)?;
     drop(audio);
 
+    let found = run_model(model, &wav, &output, &work, running, progress)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut stems = BTreeMap::new();
+    for (stem, file) in found {
+        let ext = file.extension().map_or("wav".into(), |e| e.to_string_lossy().into_owned());
+        let to = dir.join(format!("{stem}.{ext}"));
+        if std::fs::rename(&file, &to).is_err() {
+            std::fs::copy(&file, &to).with_context(|| format!("copying {}", file.display()))?;
+        }
+        stems.insert(stem, to);
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(stems)
+}
+
+/// Runs the model on `wav`, its results going to `output` (and its log to
+/// `work`). Demucs runs on the Mac's GPU when there is one, else (or when
+/// that fails) on the processor.
+fn run_model(
+    model: &StemModel,
+    wav: &Path,
+    output: &Path,
+    work: &Path,
+    running: &Mutex<Option<Child>>,
+    progress: &dyn Fn(Option<u32>),
+) -> Result<BTreeMap<String, PathBuf>> {
+    let gpu = model_args(&model.command, true) != model_args(&model.command, false);
+    match run_model_on(model, wav, output, work, running, progress, gpu) {
+        Err(_) if gpu => run_model_on(model, wav, output, work, running, progress, false),
+        result => result,
+    }
+}
+
+fn run_model_on(
+    model: &StemModel,
+    wav: &Path,
+    output: &Path,
+    work: &Path,
+    running: &Mutex<Option<Child>>,
+    progress: &dyn Fn(Option<u32>),
+    gpu: bool,
+) -> Result<BTreeMap<String, PathBuf>> {
+    let _ = std::fs::remove_dir_all(output);
+    std::fs::create_dir_all(output).with_context(|| format!("creating {}", output.display()))?;
     let fill = |arg: &String| {
         arg.replace("{input}", &wav.to_string_lossy())
             .replace("{output}", &output.to_string_lossy())
             .replace("{model}", &model.dir.to_string_lossy())
     };
-    let args: Vec<String> = model.command.iter().map(fill).collect();
+    let args: Vec<String> = model_args(&model.command, gpu).iter().map(fill).collect();
     let mut child = no_window(&mut Command::new(&args[0]))
         .args(&args[1..])
         .current_dir(&model.dir)
@@ -467,19 +1116,7 @@ fn separate(
     if !status.success() {
         bail!("{}", failure(&model.name, &status.to_string(), &log, &work.join("log.txt")));
     }
-    let found = find_stems(&output, &model.stems, &model.files)?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let mut stems = BTreeMap::new();
-    for (stem, file) in found {
-        let ext = file.extension().map_or("wav".into(), |e| e.to_string_lossy().into_owned());
-        let to = dir.join(format!("{stem}.{ext}"));
-        if std::fs::rename(&file, &to).is_err() {
-            std::fs::copy(&file, &to).with_context(|| format!("copying {}", file.display()))?;
-        }
-        stems.insert(stem, to);
-    }
-    let _ = std::fs::remove_dir_all(&work);
-    Ok(stems)
+    find_stems(output, &model.stems, &model.files)
 }
 
 /// Why a model failed: the cause first (the tool's last real line, such as
@@ -740,6 +1377,25 @@ mod tests {
     }
 
     #[test]
+    fn cache_keeps_the_latest_tracks() {
+        let cache = std::env::temp_dir().join(format!("deckhand-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        for (i, name) in ["old", "new"].iter().enumerate() {
+            let dir = cache.join("model").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("vocals.wav"), vec![0u8; 1000]).unwrap();
+            touch(&dir);
+            if i == 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        trim_cache(&cache, 1500);
+        assert!(!cache.join("model/old").exists());
+        assert!(cache.join("model/new/vocals.wav").exists());
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
+    #[test]
     fn progress_is_read_from_bars() {
         assert_eq!(percent(" 45%|████▌     | 52.6/117.0"), Some(45));
         assert_eq!(percent("100%|██████████|"), Some(100));
@@ -771,6 +1427,121 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
     }
 
     #[cfg(unix)]
+    #[test]
+    fn live_stems_start_at_the_playhead() {
+        let root = std::env::temp_dir().join(format!("deckhand-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let model_dir = root.join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let mut model = fake_model(&model_dir);
+        // Which piece each run was given.
+        let script = std::fs::read_to_string(model_dir.join("separate.sh")).unwrap();
+        std::fs::write(model_dir.join("separate.sh"), script.replace("echo run", "echo \"$1\""))
+            .unwrap();
+        model.id = "fake".into();
+
+        // 50 s.
+        let rate = 8_000;
+        let input = root.join("song.wav");
+        let samples: Vec<f32> =
+            (0..rate * 50 * 2).map(|i| ((i / 2) as f32 * 0.01).sin() * 0.5).collect();
+        deckhand_audio::write_wav_file(&input, rate as u32, &samples).unwrap();
+        let original = deckhand_audio::decode_file(&input).unwrap();
+        let (jobs, queue) = channel();
+        let (events_tx, events) = channel();
+        let cache = root.join("cache");
+        let thread_cache = cache.clone();
+        let worker = std::thread::spawn(move || live_loop(&queue, &events_tx, &thread_cache));
+        jobs.send(LiveMessage::Job(LiveJob {
+            deck: 1,
+            title: "Song".into(),
+            input: input.clone(),
+            model,
+            audio: Arc::new(original.clone()),
+            playhead: Arc::new(AtomicU64::new(30.0_f64.to_bits())),
+        }))
+        .unwrap();
+        drop(jobs);
+        let mut layers = None;
+        for event in events.iter() {
+            match event {
+                Event::Live { deck, stems, .. } => {
+                    assert_eq!(deck, 1);
+                    layers = Some(stems);
+                }
+                Event::Failed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+        worker.join().unwrap();
+        let layers = layers.expect("stems for the deck");
+        assert_eq!(layers.ready_share(), 1.0);
+
+        let runs = std::fs::read_to_string(model_dir.join("runs")).unwrap();
+        // Blocks of 2 s; the playhead's at 15: three blocks there first,
+        // then onwards, then behind it.
+        let order: Vec<usize> = runs
+            .lines()
+            .map(|l| l.split("piece-").nth(1).unwrap().split('/').next().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(order, [15, 18, 5, 0]);
+
+        // The stems are the track again, joins included, and kept.
+        for frame in (0..original.frames()).step_by(1_999) {
+            let want = original.frame(frame as i64)[0];
+            let got = layers.get(deckhand_audio::VOCALS, frame)[0];
+            assert!((got - want).abs() < 1e-3, "frame {frame}: {got} vs {want}");
+        }
+        let kept = find_stems(
+            &cache.join("fake").join(cache_key(&input)),
+            &["vocals".into(), "drums".into()],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let vocals = deckhand_audio::decode_file(&kept["vocals"]).unwrap();
+        assert_eq!(vocals.samples.len(), original.samples.len());
+        assert!(vocals.samples.iter().zip(&original.samples).all(|(v, o)| (v - o).abs() < 1e-4));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demucs_keeps_full_scale() {
+        let strings = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let old = strings(&["demucs", "-n", "htdemucs", "-o", "{output}", "{input}"]);
+        assert_eq!(
+            model_args(&old, false),
+            strings(&[
+                "demucs",
+                "--float32",
+                "--clip-mode",
+                "none",
+                "-n",
+                "htdemucs",
+                "-o",
+                "{output}",
+                "{input}"
+            ])
+        );
+        let own = strings(&[
+            "/opt/bin/demucs",
+            "-d",
+            "cpu",
+            "--clip-mode",
+            "clamp",
+            "--int24",
+            "{input}",
+        ]);
+        assert_eq!(model_args(&own, true), own);
+        let other = strings(&["audio-separator", "{input}"]);
+        assert_eq!(model_args(&other, true), other);
+        let gpu = model_args(&old, true);
+        assert_eq!(
+            gpu.starts_with(&strings(&["demucs", "--float32", "--clip-mode", "none", "-d", "mps"])),
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
+    }
+
     #[test]
     fn separates_once_and_mixes_what_is_asked() {
         let root = std::env::temp_dir().join(format!("deckhand-stems-{}", std::process::id()));
@@ -838,6 +1609,102 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
 
     fn model_with_command(dir: &Path, program: &str) -> StemModel {
         model(&["vocals"], &[program, "{input}"], dir)
+    }
+
+    /// How long a deck takes to get stems separated before:
+    /// `DECKHAND_TEST_TRACK=song.wav DECKHAND_TEST_STEMS=folder cargo test -p
+    /// deckhand-app cached_stems_load -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cached_stems_load() {
+        let track =
+            deckhand_audio::decode_file(Path::new(&std::env::var("DECKHAND_TEST_TRACK").unwrap()))
+                .unwrap();
+        let dir = PathBuf::from(std::env::var("DECKHAND_TEST_STEMS").unwrap());
+        let names: Vec<String> = ["drums", "bass", "other", "vocals"].map(String::from).into();
+        let stems = find_stems(&dir, &names, &BTreeMap::new()).unwrap();
+        let started = std::time::Instant::now();
+        let layers = layers(&stems, &track).unwrap();
+        eprintln!("cached stems ready in {:.2} s", started.elapsed().as_secs_f64());
+        assert!(layers.ready_at(0));
+    }
+
+    /// Live (piece by piece) against whole-track separation with a real
+    /// model: how soon the first piece plays and how far the results differ,
+    /// at the joins and elsewhere. Same variables as `real_model`.
+    #[test]
+    #[ignore]
+    fn real_model_live() {
+        let dir = PathBuf::from(std::env::var("DECKHAND_TEST_MODEL").unwrap());
+        let track = PathBuf::from(std::env::var("DECKHAND_TEST_TRACK").unwrap());
+        let (models, _) = load_models(dir.parent().unwrap());
+        let model = models.into_iter().find(|m| m.dir == dir).unwrap();
+        let root = std::env::temp_dir().join("deckhand-real-live");
+        let _ = std::fs::remove_dir_all(&root);
+        let started = std::time::Instant::now();
+        let whole =
+            separate(&model, &track, &root.join("whole"), &Mutex::new(None), &|_| {}).unwrap();
+        eprintln!("whole track: {:.1} s", started.elapsed().as_secs_f64());
+        let original = deckhand_audio::decode_file(&track).unwrap();
+        let (jobs, queue) = channel();
+        let (events_tx, events) = channel();
+        let cache = root.join("live");
+        let worker = std::thread::spawn(move || live_loop(&queue, &events_tx, &cache));
+        // As the app does when it starts: the model loads ahead of the track.
+        jobs.send(LiveMessage::Warm(model.clone())).unwrap();
+        std::thread::sleep(Duration::from_secs(15));
+        let started = std::time::Instant::now();
+        let seconds = original.frames() as f64 / f64::from(original.sample_rate);
+        jobs.send(LiveMessage::Job(LiveJob {
+            deck: 0,
+            title: "t".into(),
+            input: track.clone(),
+            model,
+            audio: Arc::new(original.clone()),
+            playhead: Arc::new(AtomicU64::new((seconds / 2.0).to_bits())),
+        }))
+        .unwrap();
+        drop(jobs);
+        let mut layers = None;
+        for event in events.iter() {
+            if let Event::Live { stems, .. } = event {
+                // Ready where the deck plays.
+                let middle = original.frames() as i64 / 2;
+                while !stems.ready_at(middle) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                eprintln!(
+                    "stems play at the playhead after {:.1} s",
+                    started.elapsed().as_secs_f64()
+                );
+                layers = Some(stems);
+            }
+        }
+        worker.join().unwrap();
+        eprintln!("live, all pieces: {:.1} s", started.elapsed().as_secs_f64());
+        let layers = layers.unwrap();
+        let reference = deckhand_audio::decode_file(&whole["vocals"]).unwrap();
+        let piece = (BLOCK_SECS * f64::from(original.sample_rate)) as usize;
+        let (mut signal, mut error, mut join_signal, mut join_error) = (0.0, 0.0, 0.0, 0.0);
+        for frame in 0..original.frames() {
+            let want = f64::from(reference.frame(frame as i64)[0]);
+            let got = f64::from(layers.get(deckhand_audio::VOCALS, frame)[0]);
+            let near_join = frame % piece < original.sample_rate as usize / 2
+                || piece - frame % piece < original.sample_rate as usize / 2;
+            let (s, e) = if near_join {
+                (&mut join_signal, &mut join_error)
+            } else {
+                (&mut signal, &mut error)
+            };
+            *s += want * want;
+            *e += (got - want).powi(2);
+        }
+        let db = |s: f64, e: f64| 10.0 * (s / e.max(1e-12)).log10();
+        eprintln!(
+            "vocals, live vs whole: {:.1} dB apart away from joins, {:.1} dB within 0.5 s of a block edge",
+            db(signal, error),
+            db(join_signal, join_error)
+        );
     }
 
     /// With a real separation tool: `DECKHAND_TEST_MODEL=/path/to/models/x

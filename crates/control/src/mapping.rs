@@ -138,6 +138,11 @@ pub struct Mapping {
     /// unset, the known value for the model (see [`Mapping::jog_steps_per_turn`]).
     #[serde(default, rename = "jog_steps_per_turn", skip_serializing_if = "Option::is_none")]
     pub jog_resolution: Option<u32>,
+    /// Functions the controller's rekordbox mapping gave controls when this
+    /// mapping was made or last brought up to date: the ones it gains later
+    /// are added once (see [`Mapping::add_new_functions`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<String>,
 }
 
 /// Jog steps per turn of models whose wheels differ from the common 720.
@@ -201,21 +206,7 @@ impl Mapping {
     }
 
     pub fn add_missing(&mut self, other: &Mapping) -> (usize, usize) {
-        let same_control = |a: &Binding, b: &Binding| {
-            a.message == b.message
-                && a.channel == b.channel
-                && (a.number == b.number || a.lsb == Some(b.number) || b.lsb == Some(a.number))
-                && a.shift == b.shift
-        };
-        let mut bindings = 0;
-        for binding in &other.bindings {
-            let has_action = self.bindings.iter().any(|b| b.action == binding.action);
-            let control_used = self.bindings.iter().any(|b| same_control(b, binding));
-            if !has_action && !control_used {
-                self.bindings.push(binding.clone());
-                bindings += 1;
-            }
-        }
+        let bindings = self.add_bindings(other.bindings.iter());
         let outputs = self.add_missing_outputs(other);
         for control in &other.shift_controls {
             if !self.shift_controls.contains(control) {
@@ -223,6 +214,43 @@ impl Mapping {
             }
         }
         (bindings, outputs)
+    }
+
+    /// Bindings for functions with no binding here, on controls not used
+    /// here yet (in the same Shift layer); returns how many were added.
+    fn add_bindings<'a>(&mut self, bindings: impl Iterator<Item = &'a Binding>) -> usize {
+        let same_control = |a: &Binding, b: &Binding| {
+            a.message == b.message
+                && a.channel == b.channel
+                && (a.number == b.number || a.lsb == Some(b.number) || b.lsb == Some(a.number))
+                && a.shift == b.shift
+        };
+        let mut added = 0;
+        for binding in bindings {
+            let has_action = self.bindings.iter().any(|b| b.action == binding.action);
+            let control_used = self.bindings.iter().any(|b| same_control(b, binding));
+            if !has_action && !control_used {
+                self.bindings.push(binding.clone());
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// Brings a saved mapping up to date with `import`, a fresh conversion of
+    /// the controller's rekordbox mapping: functions RofLoxBox learned since
+    /// get their controls (where free), and lights it learned to drive are
+    /// added. A function offered before and since cleared stays cleared.
+    /// Returns whether anything changed.
+    pub fn add_new_functions(&mut self, import: &Mapping) -> bool {
+        let offered = std::mem::take(&mut self.offered);
+        let new = import.bindings.iter().filter(|b| !offered.contains(&b.action.to_string()));
+        let added = self.add_bindings(new) + self.add_missing_outputs(import);
+        self.offered = offered;
+        let offered = import.offered.clone();
+        let changed = added > 0 || offered != self.offered;
+        self.offered = offered;
+        changed
     }
 
     /// The same mapping under another name.
@@ -463,6 +491,7 @@ mod tests {
             channel_order: None,
             shift_controls: Vec::new(),
             jog_resolution: None,
+            offered: Vec::new(),
         }
     }
 
@@ -580,5 +609,42 @@ mod tests {
         assert_eq!(mine.bindings.len(), 2);
         assert_eq!(mine.bindings[0], note(D::PlayPause, 20));
         assert_eq!(mine.bindings[1].action, Action::Deck(0, D::Sync));
+    }
+
+    #[test]
+    fn new_functions_are_added_once() {
+        use crate::action::DeckAction as D;
+        let note = |action, number| Binding {
+            action: Action::Deck(0, action),
+            message: MessageType::Note,
+            channel: 1,
+            number,
+            encoding: Encoding::Button,
+            lsb: None,
+            invert: false,
+            shift: false,
+        };
+        let names = |m: &Mapping| m.bindings.iter().map(|b| b.action.to_string()).collect();
+        // Saved when the import had only PLAY and CUE; CUE was cleared since.
+        let mut old = Mapping {
+            bindings: vec![note(D::PlayPause, 11), note(D::Cue, 12)],
+            ..Mapping::default()
+        };
+        old.offered = names(&old);
+        let mut mine = Mapping {
+            bindings: vec![note(D::PlayPause, 11)],
+            offered: old.offered,
+            ..Mapping::default()
+        };
+        // Now the import knows the stems pads too.
+        let mut import = Mapping {
+            bindings: vec![note(D::PlayPause, 11), note(D::Cue, 12), note(D::StemPart(0), 16)],
+            ..Mapping::default()
+        };
+        import.offered = names(&import);
+        assert!(mine.add_new_functions(&import));
+        let actions: Vec<String> = names(&mine);
+        assert_eq!(actions, ["deck1.play_pause", "deck1.stem_vocal"]);
+        assert!(!mine.add_new_functions(&import));
     }
 }

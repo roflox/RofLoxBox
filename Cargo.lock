@@ -1031,6 +1031,7 @@ dependencies = [
  "png",
  "rfd",
  "serde",
+ "serde_json",
  "toml",
  "windows-sys 0.61.2",
 ]
