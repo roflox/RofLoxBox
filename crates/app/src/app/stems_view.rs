@@ -100,7 +100,23 @@ impl DeckhandApp {
         deck.stems = Stems::Separating(None);
     }
 
-    /// Stops live stems on every deck (Preferences turned them off).
+    /// Turns stems on the decks on or off. On, loaded tracks get separated
+    /// (when tracks are separated on load); off, every deck plays its
+    /// track only and the helper quits.
+    pub(super) fn set_live_stems(&mut self, on: bool) {
+        self.config.prefs.live_stems = on;
+        if !on {
+            self.stop_live_stems();
+        } else if self.config.prefs.stems_on_load {
+            for d in 0..self.deck_count() {
+                if matches!(self.decks[d].stems, Stems::None | Stems::Failed) {
+                    self.separate_deck(d);
+                }
+            }
+        }
+    }
+
+    /// Stops live stems on every deck.
     fn stop_live_stems(&mut self) {
         for (d, playhead) in self.stem_playheads.iter().enumerate() {
             playhead.store(stems::CANCELLED, Ordering::Relaxed);
@@ -336,13 +352,13 @@ impl DeckhandApp {
         });
         ui.add_space(6.0);
         ui.label(RichText::new("Live stems").strong().size(15.0));
+        let mut on = self.config.prefs.live_stems;
         if ui
-            .checkbox(&mut self.config.prefs.live_stems, "Stems on the decks")
+            .checkbox(&mut on, "Stems on the decks")
             .on_hover_text("Off: decks play tracks only and nothing is separated for them")
             .changed()
-            && !self.config.prefs.live_stems
         {
-            self.stop_live_stems();
+            self.set_live_stems(on);
         }
         ui.add_enabled_ui(self.config.prefs.live_stems, |ui| {
             ui.checkbox(&mut self.config.prefs.stems_on_load, "Separate tracks when they load");

@@ -1717,6 +1717,19 @@ impl DeckhandApp {
                     .port()
                     .map_or_else(|| "🎛 Controller".to_owned(), |p| format!("🎛 {p}"));
                 ui.toggle_value(&mut self.show_controller, label);
+                ui.separator();
+                let mut stems = self.config.prefs.live_stems;
+                if ui
+                    .toggle_value(&mut stems, "STEMS")
+                    .on_hover_text(
+                        "Stems on the decks. Off: nothing is separated and the separating \
+                         helper quits, for more performance",
+                    )
+                    .changed()
+                {
+                    self.set_live_stems(stems);
+                    self.config.save();
+                }
             });
         });
     }

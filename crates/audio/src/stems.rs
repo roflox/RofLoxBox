@@ -146,6 +146,12 @@ impl StemLayers {
                 .is_some_and(|r| r.load(Ordering::Acquire))
     }
 
+    /// Whether each block has its stems, from the track's start; a block
+    /// is the track's length over their count.
+    pub fn ready_blocks(&self) -> impl Iterator<Item = bool> + '_ {
+        self.ready.iter().map(|r| r.load(Ordering::Relaxed))
+    }
+
     /// The share of the track whose stems are in, 0–1.
     pub fn ready_share(&self) -> f32 {
         let done = self.ready.iter().filter(|r| r.load(Ordering::Relaxed)).count();

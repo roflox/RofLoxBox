@@ -518,10 +518,10 @@ fn model_args(command: &[String], gpu: bool) -> Vec<String> {
 
 /// Live stems are tracked in blocks this long: a piece is a run of them.
 const BLOCK_SECS: f64 = 2.0;
-/// Blocks in the piece under the playhead when it has none yet: short, so
-/// the stems there play within a couple of seconds.
-const FIRST_BLOCKS: usize = 3;
-/// Blocks in the other pieces: longer, as each run has its overhead.
+/// The most blocks in a piece: longer pieces take less work in all, as
+/// each run has its overhead and its context. A piece ahead of the playhead
+/// is only as long as the stems are ahead of it, so it is ready before the
+/// track gets there: one block at first, then twice as many each time.
 const PIECE_BLOCKS: usize = 10;
 /// Audio on each side of a piece the model also hears, so it separates the
 /// piece's edges as well as the middle.
@@ -758,14 +758,20 @@ impl Live {
         let at =
             ((seconds * f64::from(self.track.sample_rate)) as usize / self.block).min(blocks - 1);
         let ahead = (at..blocks).find(|&b| !self.done[b]).map(|b| (b - at, b));
-        // Behind counts one more, so ahead wins a tie: decks play forwards.
+        // Behind counts one more, and ahead wins a tie: decks play forwards.
         let behind = (0..at).rev().find(|&b| !self.done[b]).map(|b| ((at - b) * 3 + 1, b));
         let (urgency, start) = match (ahead, behind) {
-            (Some(a), Some(b)) => a.min(b),
+            (Some(a), Some(b)) => {
+                if b.0 < a.0 {
+                    b
+                } else {
+                    a
+                }
+            }
             (a, b) => a.or(b)?,
         };
-        let length = if urgency == 0 { FIRST_BLOCKS } else { PIECE_BLOCKS };
         if start >= at {
+            let length = urgency.clamp(1, PIECE_BLOCKS);
             // Forwards from there, up to blocks already done.
             let end = (start..(start + length).min(blocks))
                 .find(|&b| self.done[b])
@@ -773,7 +779,7 @@ impl Live {
             Some((urgency, start, end))
         } else {
             // Backwards, ending at the missing block next to what's done.
-            let first = (start.saturating_sub(length - 1)..=start)
+            let first = (start.saturating_sub(PIECE_BLOCKS - 1)..=start)
                 .rev()
                 .take_while(|&b| !self.done[b])
                 .last()
@@ -1548,13 +1554,14 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         assert_eq!(layers.ready_share(), 1.0);
 
         let runs = std::fs::read_to_string(model_dir.join("runs")).unwrap();
-        // Blocks of 2 s; the playhead's at 15: three blocks there first,
-        // then onwards, then behind it.
+        // Blocks of 2 s; the playhead's at 15: that block first, then
+        // onwards in pieces growing with the lead; once well ahead, behind
+        // it too.
         let order: Vec<usize> = runs
             .lines()
             .map(|l| l.split("piece-").nth(1).unwrap().split('/').next().unwrap().parse().unwrap())
             .collect();
-        assert_eq!(order, [15, 18, 5, 0]);
+        assert_eq!(order, [15, 16, 17, 19, 5, 23, 0]);
 
         // The stems are the track again, joins included, and kept.
         for frame in (0..original.frames()).step_by(1_999) {

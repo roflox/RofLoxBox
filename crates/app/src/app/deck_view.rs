@@ -431,7 +431,14 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             let Some(track) = &deck.track else { return };
             let height = if compact { 28.0 } else { 44.0 };
             let width = ui.available_width().max(160.0);
-            let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
+            // Below it, with stems, which parts of the track have them.
+            let strip = match &deck.stems {
+                crate::deck::Stems::Ready(layers) => Some((layers.clone(), if compact { 3.0 } else { 4.0 })),
+                _ => None,
+            };
+            let below = strip.as_ref().map_or(0.0, |(_, h)| h + 2.0);
+            let (whole, response) = ui.allocate_exact_size(vec2(width, height + below), Sense::click_and_drag());
+            let rect = egui::Rect::from_min_size(whole.min, vec2(width, height));
             let hot_cues = hot_cue_marks(track);
             let markers = Markers {
                 beats: &[],
@@ -444,6 +451,10 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             };
             let shown = engine.display_position_secs(index);
             draw_overview(&ui.painter_at(rect), rect, &track.waveform, shown, track.duration, &markers);
+            if let Some((layers, h)) = &strip {
+                let under = egui::Rect::from_min_size(rect.left_bottom() + vec2(0.0, 2.0), vec2(width, *h));
+                stems_strip(ui, under, layers);
+            }
             if end_warning(ui, p.end_warning, track.duration - shown, playing) == Some(true) {
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 2.0, RED.gamma_multiply(0.3));
@@ -840,6 +851,34 @@ fn hold_pad(
         }
         _ => {}
     }
+}
+
+/// A strip under the overview showing which parts of the track have their
+/// stems: lit where they play, dim where the deck still plays the original.
+fn stems_strip(ui: &Ui, rect: egui::Rect, layers: &deckhand_audio::StemLayers) {
+    let painter = ui.painter_at(rect);
+    let lit = STEM_COLORS[1];
+    painter.rect_filled(rect, 1.0, lit.gamma_multiply(0.25));
+    let ready: Vec<bool> = layers.ready_blocks().collect();
+    let x = |block: usize| rect.left() + rect.width() * block as f32 / ready.len() as f32;
+    let mut start = None;
+    for (block, &done) in ready.iter().chain([&false]).enumerate() {
+        match (done, start) {
+            (true, None) => start = Some(block),
+            (false, Some(from)) => {
+                let run = egui::Rect::from_x_y_ranges(x(from)..=x(block), rect.y_range());
+                painter.rect_filled(run, 0.0, lit);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    let share = layers.ready_share();
+    ui.interact(rect, ui.id().with("stems strip"), Sense::hover()).on_hover_text(if share < 1.0 {
+        format!("Stems: {:.0}% separated; the dim parts play the original", share * 100.0)
+    } else {
+        "Stems: the whole track is separated".to_owned()
+    });
 }
 
 /// The stem parts' colours on the STEMS pads.
