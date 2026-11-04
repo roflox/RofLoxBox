@@ -19,6 +19,8 @@ mod layout;
 mod library;
 mod parts;
 mod prefs_view;
+mod rekordbox_db;
+mod rekordbox_save;
 mod screen_layout;
 mod stems;
 mod usb_export;

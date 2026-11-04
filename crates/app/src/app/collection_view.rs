@@ -3,11 +3,11 @@
 
 use std::path::PathBuf;
 
-use deckhand_library::{NodeKind, Scan};
+use deckhand_library::{CueKind, NodeKind, Scan};
 use eframe::egui::{self, RichText, Stroke, Ui};
 
 use super::{DeckhandApp, Focus, WARN};
-use crate::browser::{Row, TableOptions, sort_rows, track_table};
+use crate::browser::{Row, Sort, TableOptions, TrackColumn, sort_rows, track_table};
 
 /// Browser state for the collection.
 #[derive(Default)]
@@ -25,6 +25,30 @@ pub struct CollectionView {
     pending_duplicate: Option<(u32, u32)>,
     /// A rekordbox XML file being read.
     xml: Option<std::sync::mpsc::Receiver<anyhow::Result<deckhand_library::XmlLibrary>>>,
+    /// The key that opened rekordbox's library, to keep in the settings.
+    rekordbox_key: Option<std::sync::mpsc::Receiver<(String, i64)>>,
+    /// rekordbox's change count of the library being read.
+    rekordbox_count: Option<i64>,
+    /// Entries of the playlist shown being dragged: (playlist, positions).
+    pub dragged_entries: Option<(u32, Vec<usize>)>,
+    /// "Back up your library first" is being asked before writing to
+    /// rekordbox is allowed.
+    confirm_rekordbox_write: bool,
+    /// Quitting waits for rekordbox to close, with when it was last looked
+    /// for.
+    quit_waiting: Option<std::time::Instant>,
+    /// Changes being written into rekordbox's library, with the
+    /// fingerprint of what is written and whether the save started itself.
+    rekordbox_save: Option<(RekordboxSave, u64, bool)>,
+    /// When changes go into rekordbox's library on their own.
+    rekordbox_due: Option<std::time::Instant>,
+    /// The fingerprint of what rekordbox's library has, as far as known.
+    rekordbox_print: Option<u64>,
+    /// Saving on its own stopped after a failure, until the library is
+    /// read again or saved by hand.
+    rekordbox_paused: bool,
+    /// "rekordbox is open" was said for the changes waiting.
+    rekordbox_waiting_said: bool,
     /// BPM, beat grid and key analysis running, with (tracks given a grid
     /// or key, files that could not be read) so far.
     analysis: Option<(crate::analyze::Analysis, usize, usize)>,
@@ -222,6 +246,476 @@ impl DeckhandApp {
         }
     }
 
+    /// The rekordbox library this computer has (or the one Preferences
+    /// name).
+    fn rekordbox_db(&self) -> Option<PathBuf> {
+        self.config.prefs.rekordbox_db.clone().or_else(crate::rekordbox_db::default_path)
+    }
+
+    /// At start: rekordbox's library is read again, unless deckhand has
+    /// changes it doesn't have yet (they go in first).
+    pub(super) fn rekordbox_at_start(&mut self) {
+        if self.collection.rekordbox_unsaved && self.config.prefs.rekordbox_write {
+            self.collection_view.rekordbox_due = Some(std::time::Instant::now());
+            self.status = Some(
+                "rekordbox's library doesn't have deckhand's last changes yet: saving them \
+                 instead of reading it"
+                    .into(),
+            );
+        } else {
+            self.import_rekordbox_db(false);
+        }
+    }
+
+    /// Reads rekordbox's library in the background, like an XML export;
+    /// `asked`: from a button (else at start, quietly when it isn't there).
+    pub(super) fn import_rekordbox_db(&mut self, asked: bool) {
+        let Some(path) = self.rekordbox_db().filter(|p| asked || p.is_file()) else {
+            if asked {
+                self.collection_view.error = Some("No rekordbox library found".into());
+            }
+            return;
+        };
+        let saved = self.config.prefs.rekordbox_key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (key_tx, key_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = crate::rekordbox_db::open_any(&path, &saved).map(|opened| {
+                let _ = key_tx.send((opened.key, opened.count));
+                opened.library
+            });
+            let _ = tx.send(read);
+        });
+        self.collection_view.xml = Some(rx);
+        self.collection_view.rekordbox_key = Some(key_rx);
+        self.status = Some("Reading the rekordbox library…".into());
+    }
+
+    /// The Library page of Preferences; returns whether a setting changed.
+    pub(super) fn library_prefs(&mut self, ui: &mut Ui) -> bool {
+        let p = &self.config.prefs;
+        let before = (
+            p.rekordbox_key.clone(),
+            p.rekordbox_db.clone(),
+            p.rekordbox_at_start,
+            p.rekordbox_write,
+            p.rekordbox_autosave,
+        );
+        ui.label(RichText::new("rekordbox library").strong().size(15.0));
+        let path = self.rekordbox_db();
+        let found = path.as_ref().is_some_and(|p| p.is_file());
+        ui.horizontal(|ui| {
+            let text = path.as_ref().map_or("not found".to_owned(), |p| p.display().to_string());
+            let text = RichText::new(text).small();
+            ui.label(if found { text.weak() } else { text.color(WARN) });
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Choose…").clicked()
+                && let Some(picked) = rfd::FileDialog::new()
+                    .set_title("rekordbox's library (master.db)")
+                    .add_filter("rekordbox library", &["db"])
+                    .pick_file()
+            {
+                self.config.prefs.rekordbox_db = Some(picked);
+            }
+            if ui
+                .add_enabled(self.config.prefs.rekordbox_db.is_some(), egui::Button::new("Default"))
+                .clicked()
+            {
+                self.config.prefs.rekordbox_db = None;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Key:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.config.prefs.rekordbox_key)
+                    .hint_text("fetched from pyrekordbox")
+                    .password(true)
+                    .desired_width(320.0),
+            );
+        });
+        ui.label(
+            RichText::new(
+                "rekordbox encrypts its library. deckhand doesn't come with the key: the first \
+                 time, it downloads the one the pyrekordbox project publishes and keeps it here. \
+                 Should that ever fail, enter the key yourself.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.checkbox(&mut self.config.prefs.rekordbox_at_start, "Update from rekordbox at start");
+        ui.label(
+            RichText::new(
+                "rekordbox's tracks, tags, beat grids, hot cues, memory cues, loops, ratings, \
+                 colours and playlists come into the collection, with the playlists in the \
+                 rekordbox folder (replacing the ones of the last import). Intelligent \
+                 playlists are not read.",
+            )
+            .small()
+            .weak(),
+        );
+        let mut writable = self.config.prefs.rekordbox_write;
+        if ui.checkbox(&mut writable, "Write changes back to rekordbox").changed() {
+            if writable {
+                self.collection_view.confirm_rekordbox_write = true;
+            } else {
+                self.config.prefs.rekordbox_write = false;
+            }
+        }
+        if self.config.prefs.rekordbox_write {
+            ui.indent("rekordbox autosave", |ui| {
+                ui.checkbox(&mut self.config.prefs.rekordbox_autosave, "Save automatically")
+                    .on_hover_text(
+                        "A few seconds after a change, in the background; while rekordbox is \
+                         open, once it's closed; at quit, what's left",
+                    );
+            });
+        }
+        ui.label(
+            RichText::new(
+                "Off, rekordbox's files are never changed. On, saving (automatically, or with \
+                 \"Save changes to rekordbox\") makes rekordbox's library what deckhand has: \
+                 tags, ratings, colours, hot cues, \
+                 memory cues, loops and beat grids of its tracks, and the playlists in the \
+                 rekordbox folder (made, renamed, moved, reordered or deleted). Tracks put into \
+                 those playlists are added to rekordbox. rekordbox has to be closed, and must \
+                 not have changed its library since deckhand read it. deckhand keeps a copy of \
+                 the library from before each save.",
+            )
+            .small()
+            .weak(),
+        );
+        if self.collection_view.confirm_rekordbox_write {
+            self.confirm_rekordbox_write(ui.ctx());
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    found && self.collection_view.xml.is_none(),
+                    egui::Button::new("Read the rekordbox library now"),
+                )
+                .clicked()
+            {
+                self.import_rekordbox_db(true);
+            }
+            self.save_to_rekordbox_button(ui);
+        });
+        let p = &self.config.prefs;
+        (
+            p.rekordbox_key.clone(),
+            p.rekordbox_db.clone(),
+            p.rekordbox_at_start,
+            p.rekordbox_write,
+            p.rekordbox_autosave,
+        ) != before
+    }
+
+    /// Asks to back up rekordbox's library before writing to it is allowed.
+    fn confirm_rekordbox_write(&mut self, ctx: &egui::Context) {
+        let backups = rekordbox_backups();
+        let modal = egui::Modal::new(egui::Id::new("confirm rekordbox write")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new("Back up your rekordbox library first").strong().size(16.0));
+            ui.add_space(4.0);
+            ui.label(
+                "deckhand will change rekordbox's own library. Before turning this on, make a \
+                 backup in rekordbox: File → Library → Backup Library.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "deckhand also keeps a copy of the library from before each save, in {}.",
+                    backups.display()
+                ))
+                .small()
+                .weak(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("I have a backup: allow writing").clicked() {
+                    self.config.prefs.rekordbox_write = true;
+                    self.collection_view.confirm_rekordbox_write = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.collection_view.confirm_rekordbox_write = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.collection_view.confirm_rekordbox_write = false;
+        }
+    }
+
+    /// "Save changes to rekordbox", when writing to it is allowed.
+    fn save_to_rekordbox_button(&mut self, ui: &mut Ui) {
+        if !self.config.prefs.rekordbox_write {
+            return;
+        }
+        let path = self.rekordbox_db().filter(|p| p.is_file());
+        if ui
+            .add_enabled(
+                path.is_some() && self.collection_view.rekordbox_save.is_none(),
+                egui::Button::new("Save changes to rekordbox"),
+            )
+            .on_hover_text(
+                "Writes tags, cues, beat grids and the rekordbox folder's playlists into \
+                 rekordbox's library. Close rekordbox first.",
+            )
+            .clicked()
+            && let Some(path) = path
+        {
+            self.save_to_rekordbox(path, false);
+        }
+    }
+
+    /// What of the collection rekordbox's library gets, ready to save.
+    fn rekordbox_snapshot(&self) -> crate::rekordbox_save::Snapshot {
+        crate::rekordbox_save::Snapshot {
+            tracks: self.collection.tracks.clone(),
+            playlists: self.collection.rekordbox_playlists(),
+            read_count: self.collection.rekordbox_count,
+        }
+    }
+
+    /// A fingerprint of what saving into rekordbox writes, to tell cheaply
+    /// whether that changed.
+    fn rekordbox_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        for t in &self.collection.tracks {
+            (&t.path, &t.title, &t.artist, &t.album, &t.genre, &t.label, &t.comment).hash(&mut h);
+            (t.rating, t.color, &t.key, t.year, t.track_number).hash(&mut h);
+            for cue in &t.cues {
+                let kind = match cue.kind {
+                    CueKind::Hot(slot) => slot,
+                    CueKind::Memory => u8::MAX,
+                };
+                (kind, cue.start.to_bits(), cue.end.map(f64::to_bits)).hash(&mut h);
+                (cue.color, &cue.name).hash(&mut h);
+            }
+            for m in &t.tempo {
+                (m.start.to_bits(), m.bpm.to_bits(), m.beat).hash(&mut h);
+            }
+        }
+        for n in self.collection.rekordbox_playlists().iter().flatten() {
+            (n.id, &n.name, n.kind == NodeKind::Folder, n.parent, &n.tracks).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Notes a change of the collection: when it is one rekordbox's library
+    /// would get, saving it on its own is due shortly.
+    fn note_rekordbox_change(&mut self) {
+        if !self.config.prefs.rekordbox_write || self.collection.rekordbox_count.is_none() {
+            return;
+        }
+        let print = self.rekordbox_fingerprint();
+        if Some(print) != self.collection_view.rekordbox_print {
+            self.collection.set_rekordbox_unsaved(true);
+            // A moment after the last change, so edits come in one save.
+            self.collection_view.rekordbox_due =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        }
+    }
+
+    /// Starts saving into rekordbox when it is due (in the background).
+    fn auto_save_rekordbox(&mut self, ctx: &egui::Context) {
+        let view = &self.collection_view;
+        let Some(due) = view.rekordbox_due else { return };
+        let prefs = &self.config.prefs;
+        if !prefs.rekordbox_write || !prefs.rekordbox_autosave || view.rekordbox_paused {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if due > now {
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+        // Not while it is being read or saved; not before it was read.
+        if view.rekordbox_save.is_some()
+            || view.xml.is_some()
+            || self.collection.rekordbox_count.is_none()
+        {
+            return;
+        }
+        let Some(path) = self.rekordbox_db().filter(|p| p.is_file()) else { return };
+        self.collection_view.rekordbox_due = None;
+        self.save_to_rekordbox(path, true);
+    }
+
+    /// Whether quitting now would leave changes rekordbox's library doesn't
+    /// have, as rekordbox is open.
+    pub(super) fn rekordbox_blocks_quit(&self) -> bool {
+        let prefs = &self.config.prefs;
+        let view = &self.collection_view;
+        prefs.rekordbox_write
+            && prefs.rekordbox_autosave
+            && !view.rekordbox_paused
+            && (self.collection.rekordbox_unsaved
+                || view.rekordbox_due.is_some()
+                || view.rekordbox_save.is_some())
+            && crate::rekordbox_db::rekordbox_running()
+    }
+
+    pub(super) fn ask_to_close_rekordbox(&mut self) {
+        self.collection_view.quit_waiting = Some(std::time::Instant::now());
+    }
+
+    /// While quitting waits: asks to close rekordbox, and quits (saving)
+    /// once it is closed.
+    pub(super) fn quit_waiting_for_rekordbox(&mut self, ctx: &egui::Context) {
+        let Some(looked) = self.collection_view.quit_waiting else { return };
+        let second = std::time::Duration::from_secs(1);
+        if looked.elapsed() >= second {
+            if !crate::rekordbox_db::rekordbox_running() {
+                self.quit();
+            }
+            self.collection_view.quit_waiting = Some(std::time::Instant::now());
+        }
+        ctx.request_repaint_after(second);
+        let mut quit = false;
+        let mut stay = false;
+        let modal = egui::Modal::new(egui::Id::new("quit waits for rekordbox")).show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.label(RichText::new("Unsaved changes for rekordbox").strong().size(16.0));
+            ui.add_space(4.0);
+            ui.label(
+                "rekordbox's library doesn't have your latest changes yet, and they can't be \
+                 saved while rekordbox is open. Please close rekordbox: RofLoxBox then saves \
+                 them and quits.",
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Waiting for rekordbox to close…").weak());
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                stay = ui.button("Don't quit").clicked();
+                quit = ui
+                    .button("Quit anyway")
+                    .on_hover_text(
+                        "The changes stay in RofLoxBox and go into rekordbox's library at its \
+                         next start, once rekordbox is closed",
+                    )
+                    .clicked();
+            });
+        });
+        if quit {
+            self.quit();
+        }
+        if stay || modal.should_close() {
+            self.collection_view.quit_waiting = None;
+        }
+    }
+
+    /// At quit: changes rekordbox doesn't have yet are saved first (while
+    /// it is closed), waiting for a save already running.
+    pub(super) fn save_to_rekordbox_at_quit(&mut self) {
+        if !self.config.prefs.rekordbox_write || !self.config.prefs.rekordbox_autosave {
+            return;
+        }
+        if let Some((rx, print, auto)) = self.collection_view.rekordbox_save.take()
+            && let Ok(result) = rx.recv_timeout(std::time::Duration::from_secs(60))
+        {
+            self.rekordbox_saved(result, print, auto);
+        }
+        if self.collection_view.rekordbox_due.is_some()
+            && !self.collection_view.rekordbox_paused
+            && self.collection.rekordbox_count.is_some()
+            && !crate::rekordbox_db::rekordbox_running()
+            && let Some(path) = self.rekordbox_db().filter(|p| p.is_file())
+        {
+            self.collection_view.rekordbox_due = None;
+            let print = self.rekordbox_fingerprint();
+            let result = save_into_rekordbox(
+                &path,
+                &self.config.prefs.rekordbox_key,
+                &self.rekordbox_snapshot(),
+            );
+            self.rekordbox_saved(result, print, true);
+        }
+        let _ = self.collection.save();
+    }
+
+    /// Writes the collection's changes into rekordbox's library in the
+    /// background; `auto`: started by itself, so quiet about it.
+    fn save_to_rekordbox(&mut self, path: PathBuf, auto: bool) {
+        let snapshot = self.rekordbox_snapshot();
+        let print = self.rekordbox_fingerprint();
+        let key = self.config.prefs.rekordbox_key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(save_into_rekordbox(&path, &key, &snapshot));
+        });
+        self.collection_view.rekordbox_save = Some((rx, print, auto));
+        if !auto {
+            self.status = Some("Saving changes to rekordbox…".into());
+        }
+    }
+
+    /// A save into rekordbox finished: `print` is the fingerprint of what
+    /// it wrote.
+    fn rekordbox_saved(
+        &mut self,
+        result: anyhow::Result<crate::rekordbox_save::Saved>,
+        print: u64,
+        auto: bool,
+    ) {
+        let view = &mut self.collection_view;
+        match result {
+            Ok(saved) => {
+                if !saved.is_empty() {
+                    self.collection.saved_to_rekordbox(&saved.ids, saved.count);
+                }
+                view.rekordbox_print = Some(print);
+                view.rekordbox_paused = false;
+                view.rekordbox_waiting_said = false;
+                // Changes made while it saved are still to come.
+                if view.rekordbox_due.is_none() {
+                    self.collection.set_rekordbox_unsaved(false);
+                }
+                let parts: Vec<String> = [
+                    (saved.tracks, "track(s) retagged"),
+                    (saved.cues, "with new cues"),
+                    (saved.grids, "with new beat grids"),
+                    (saved.added, "added"),
+                    (saved.playlists, "playlist change(s)"),
+                ]
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{n} {what}"))
+                .collect();
+                if !parts.is_empty() {
+                    self.status = Some(format!("Saved to rekordbox: {}", parts.join(", ")));
+                } else if !auto {
+                    self.status = Some("rekordbox already has these changes".into());
+                }
+            }
+            Err(err) if auto && err.is::<crate::rekordbox_save::RekordboxRunning>() => {
+                // Tried again until rekordbox is closed.
+                view.rekordbox_due =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                if !view.rekordbox_waiting_said {
+                    view.rekordbox_waiting_said = true;
+                    self.status = Some(
+                        "rekordbox is open: deckhand's changes go into its library once it's \
+                         closed"
+                            .into(),
+                    );
+                }
+            }
+            Err(err) if auto => {
+                view.rekordbox_paused = true;
+                view.error = Some(format!(
+                    "Saving into rekordbox stopped: {err:#}. Changes stay in deckhand; \
+                     \"Save changes to rekordbox\" tries again."
+                ));
+            }
+            Err(err) => view.error = Some(format!("Not saved to rekordbox: {err:#}")),
+        }
+    }
+
     /// Reads a rekordbox XML export in the background.
     fn import_xml(&mut self, path: PathBuf) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -234,11 +728,45 @@ impl DeckhandApp {
     /// Merges a finished scan or import and saves. Call every frame.
     pub(super) fn poll_collection(&mut self, ctx: &egui::Context) {
         self.poll_analysis(ctx);
+        let finished = self
+            .collection_view
+            .rekordbox_save
+            .as_ref()
+            .and_then(|(rx, print, auto)| rx.try_recv().ok().map(|r| (r, *print, *auto)));
+        if let Some((result, print, auto)) = finished {
+            self.collection_view.rekordbox_save = None;
+            self.rekordbox_saved(result, print, auto);
+            // What the save changed (new playlists' ids) is no change of
+            // the user's.
+            let _ = self.collection.save();
+        } else if self.collection_view.rekordbox_save.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if let Some(key) =
+            self.collection_view.rekordbox_key.as_ref().and_then(|rx| rx.try_recv().ok())
+        {
+            self.collection_view.rekordbox_key = None;
+            let (key, count) = key;
+            self.collection_view.rekordbox_count = Some(count);
+            if key != self.config.prefs.rekordbox_key {
+                self.config.prefs.rekordbox_key = key;
+                self.config.save();
+            }
+        }
         if let Some(result) = self.collection_view.xml.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.collection_view.xml = None;
             match result {
                 Ok(library) => {
                     let s = self.collection.import_rekordbox(library);
+                    // Read from rekordbox's own library: what saving into
+                    // it compares with.
+                    self.collection.rekordbox_count = self.collection_view.rekordbox_count.take();
+                    if self.collection.rekordbox_count.is_some() {
+                        // The collection is rekordbox's again.
+                        self.collection.set_rekordbox_unsaved(false);
+                        self.collection_view.rekordbox_paused = false;
+                        self.collection_view.rekordbox_print = None;
+                    }
                     let missing = if s.missing > 0 {
                         format!(", {} file(s) not found on this computer", s.missing)
                     } else {
@@ -283,11 +811,13 @@ impl DeckhandApp {
             self.source = super::Source::Collection;
             self.add_music(dropped);
         }
-        if self.collection.is_dirty()
-            && let Err(err) = self.collection.save()
-        {
-            self.collection_view.error = Some(format!("{err:#}"));
+        if self.collection.is_dirty() {
+            self.note_rekordbox_change();
+            if let Err(err) = self.collection.save() {
+                self.collection_view.error = Some(format!("{err:#}"));
+            }
         }
+        self.auto_save_rekordbox(ctx);
     }
 
     pub(super) fn load_from_collection(&mut self, id: u32, deck: usize, ctx: &egui::Context) {
@@ -331,6 +861,18 @@ impl DeckhandApp {
             ui.close();
             self.rescan();
         }
+        if ui
+            .button("Import rekordbox library")
+            .on_hover_text(
+                "Reads rekordbox's own library on this computer (read only): tracks, playlists, \
+                 beat grids, cues, ratings and colours. Settings in Preferences → Library.",
+            )
+            .clicked()
+        {
+            ui.close();
+            self.import_rekordbox_db(true);
+        }
+        self.save_to_rekordbox_button(ui);
         if ui
             .button("Import rekordbox XML…")
             .on_hover_text(
@@ -897,6 +1439,17 @@ impl DeckhandApp {
         let separating = self.stems.pending();
         let derived: std::collections::HashSet<u32> =
             self.collection.tracks.iter().filter(|t| t.derived.is_some()).map(|t| t.id).collect();
+        // In playlist order (by #, or not sorted), entries dragged in the
+        // list move there.
+        let reorder = match self.config.sort {
+            None => Some(false),
+            Some(Sort { column: TrackColumn::Number, descending }) => Some(descending),
+            Some(_) => None,
+        }
+        .filter(|_| {
+            in_playlist.is_some()
+                && self.collection_view.dragged_entries.as_ref().map(|d| d.0) == in_playlist
+        });
         let options = TableOptions {
             selected: self.selected,
             selected_position: self.selected_position,
@@ -905,6 +1458,7 @@ impl DeckhandApp {
             draggable: true,
             marked: &self.marked,
             editable_rating: true,
+            reorder,
         };
         let mut actions: Vec<TrackAction> = Vec::new();
         let output = egui::Frame::new()
@@ -1035,6 +1589,18 @@ impl DeckhandApp {
         if let Some((id, position)) = output.drag_started {
             self.start_track_drag(ui.ctx(), id, position);
         }
+        if let (Some(before), Some(playlist)) = (output.moved_before, in_playlist)
+            && let Some((_, entries)) = self.collection_view.dragged_entries.take()
+        {
+            self.collection.move_in_playlist(playlist, &entries, before);
+            // The moved entries are together now, from `start`; the
+            // selected one goes along.
+            let start = before - entries.iter().filter(|&&e| e < before).count();
+            if let Some(selected) = self.selected_position.filter(|p| entries.contains(p)) {
+                let offset = entries.iter().filter(|&&e| e < selected).count();
+                self.selected_position = Some(start + offset);
+            }
+        }
         if let (Some(id), Some(deck)) = (output.double_clicked, free) {
             load = Some((id, deck));
         }
@@ -1129,4 +1695,26 @@ pub(super) fn reveal(path: &std::path::Path) {
     } else {
         std::process::Command::new("open").arg("-R").arg(path).spawn()
     };
+}
+
+/// Where copies of rekordbox's library are kept before deckhand changes it.
+fn rekordbox_backups() -> PathBuf {
+    deckhand_library::data_dir().join("rekordbox-backups")
+}
+
+/// A save into rekordbox's library running in the background.
+type RekordboxSave = std::sync::mpsc::Receiver<anyhow::Result<crate::rekordbox_save::Saved>>;
+
+/// Saves into rekordbox's library at `path` with the key `saved` (fetched
+/// when there is none).
+fn save_into_rekordbox(
+    path: &std::path::Path,
+    saved: &str,
+    snapshot: &crate::rekordbox_save::Snapshot,
+) -> anyhow::Result<crate::rekordbox_save::Saved> {
+    let key = match saved.trim() {
+        "" => crate::rekordbox_db::fetch_key()?,
+        key => key.to_owned(),
+    };
+    crate::rekordbox_save::save(path, &key, snapshot, &rekordbox_backups())
 }

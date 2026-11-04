@@ -6,6 +6,27 @@ DJ library tooling in Rust, compatible with Pioneer DJ hardware. No
 subscriptions, accounts, telemetry or ads. See [PLAN.md](PLAN.md) for scope,
 ground rules and roadmap.
 
+## Disclaimer: back up your rekordbox library first
+
+RofLoxBox can read and **change rekordbox's own library** (`master.db`, its
+playlist list and its analysis files). Before you use it with your rekordbox
+library, and above all before you turn on **Preferences → Library → Write
+changes back to rekordbox**, make a backup of the library in rekordbox:
+**File → Library → Backup Library**, and keep it somewhere safe.
+
+- Use it at your own risk. It comes with no warranty: a bug could damage or
+  lose your library, cues, beat grids or playlists.
+- Close rekordbox before RofLoxBox saves into its library; it refuses to save
+  while rekordbox runs.
+- RofLoxBox keeps a copy of the library from before each save, in
+  `rekordbox-backups` next to its settings
+  (`~/Library/Application Support/deckhand/` on macOS,
+  `%APPDATA%\deckhand\` on Windows). That is a safety net, not a
+  replacement for your own backup.
+- RofLoxBox is not made, endorsed or supported by AlphaTheta or Pioneer DJ;
+  rekordbox is their trademark. Don't ask them for help with a library
+  RofLoxBox changed.
+
 ## Status
 
 Reads and writes everything rekordbox puts on a USB/SD export:

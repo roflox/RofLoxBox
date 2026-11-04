@@ -231,6 +231,9 @@ pub struct TableOutput {
     pub double_clicked: Option<u32>,
     /// (track, stars) set by clicking the rating.
     pub rated: Option<(u32, u8)>,
+    /// Dragged playlist entries were dropped in front of the entry at this
+    /// position (past the last: at the end).
+    pub moved_before: Option<usize>,
     /// The sort or the shown columns changed (worth saving).
     pub layout_changed: bool,
 }
@@ -250,6 +253,9 @@ pub struct TableOptions<'a> {
     /// all); when not empty, these are the highlighted ones.
     pub marked: &'a std::collections::HashSet<u32>,
     pub editable_rating: bool,
+    /// Playlist entries being dragged can be dropped between rows: shown
+    /// in playlist order, or reversed (`Some(true)`).
+    pub reorder: Option<bool>,
 }
 
 /// The track list. `context` fills a row's right-click menu.
@@ -385,6 +391,26 @@ pub fn track_table(
                     });
                 }
                 let response = table_row.response();
+                if let (Some(reversed), Some(entry)) = (options.reorder, row.entry) {
+                    // The upper half of a row drops in front of it.
+                    let upper = response
+                        .ctx
+                        .pointer_hover_pos()
+                        .is_some_and(|p| p.y < response.rect.center().y);
+                    if response.dnd_hover_payload::<TrackDrag>().is_some() {
+                        let y = if upper { response.rect.top() } else { response.rect.bottom() };
+                        let color = response.ctx.style().visuals.selection.bg_fill;
+                        response.ctx.layer_painter(response.layer_id).hline(
+                            response.rect.x_range(),
+                            y,
+                            egui::Stroke::new(2.0_f32, color),
+                        );
+                    }
+                    if response.dnd_release_payload::<TrackDrag>().is_some() {
+                        output.moved_before =
+                            Some(if upper != reversed { entry } else { entry + 1 });
+                    }
+                }
                 if options.draggable && response.drag_started() {
                     output.drag_started = Some((row.id, row.position));
                 }
@@ -479,6 +505,80 @@ mod tests {
         assert_eq!(c("Abm"), 2.0); // 1A
         assert_eq!(c("B"), 3.0); // 1B
         assert_eq!(c("Dbm"), 24.0); // 12A
+    }
+
+    /// Drags the first of five playlist rows (pressed at `from`, released at
+    /// `to`, in points from the top) through a headless frame loop; returns
+    /// where the table says the entry goes.
+    fn drag_rows(from: f32, to: f32, reorder: Option<bool>) -> Option<usize> {
+        let ctx = egui::Context::default();
+        let rows: Vec<Row> = (0..5)
+            .map(|i| Row { id: i, entry: Some(i as usize), position: i as usize, ..Row::default() })
+            .collect();
+        let marked = std::collections::HashSet::new();
+        let x = 60.0;
+        let mut steps: Vec<Vec<egui::Event>> = vec![
+            vec![egui::Event::PointerMoved(egui::pos2(x, from))],
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(x, from),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ];
+        for i in 1..=10 {
+            let y = from + (to - from) * i as f32 / 10.0;
+            steps.push(vec![egui::Event::PointerMoved(egui::pos2(x, y))]);
+        }
+        steps.push(vec![egui::Event::PointerButton {
+            pos: egui::pos2(x, to),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        steps.push(Vec::new());
+        let mut moved = None;
+        for (i, events) in steps.into_iter().enumerate() {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(400.0, 300.0))),
+                time: Some(i as f64 * 0.1),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let options = TableOptions {
+                        selected: None,
+                        selected_position: None,
+                        reveal_selected: false,
+                        loaded: &[],
+                        draggable: true,
+                        marked: &marked,
+                        editable_rating: false,
+                        reorder,
+                    };
+                    let mut columns = vec![TrackColumn::Number, TrackColumn::Title];
+                    let output =
+                        track_table(ui, &rows, &mut columns, &mut None, &options, &mut |_, _| {});
+                    if let Some((id, _)) = output.drag_started {
+                        egui::DragAndDrop::set_payload(ctx, TrackDrag::Collection(vec![id]));
+                    }
+                    moved = moved.or(output.moved_before);
+                });
+            });
+        }
+        moved
+    }
+
+    #[test]
+    fn rows_dropped_between_others_say_where() {
+        // Rows are 24 points apart below the header: row 0's middle is at
+        // 48, row 3's at 120.
+        let (row0, row3) = (48.0, 120.0);
+        assert_eq!(drag_rows(row0, row3 - 6.0, Some(false)), Some(3), "upper half: in front");
+        assert_eq!(drag_rows(row0, row3 + 6.0, Some(false)), Some(4), "lower half: after");
+        assert_eq!(drag_rows(row0, row3 - 6.0, Some(true)), Some(4), "reversed list");
+        assert_eq!(drag_rows(row0, row3 - 6.0, None), None, "not in playlist order");
     }
 
     #[test]

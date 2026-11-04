@@ -13,16 +13,18 @@ pub enum PrefsTab {
     Mixer,
     Keyboard,
     Stems,
+    Library,
     Appearance,
     Audio,
 }
 
 impl PrefsTab {
-    pub const ALL: [PrefsTab; 6] = [
+    pub const ALL: [PrefsTab; 7] = [
         PrefsTab::Deck,
         PrefsTab::Mixer,
         PrefsTab::Keyboard,
         PrefsTab::Stems,
+        PrefsTab::Library,
         PrefsTab::Appearance,
         PrefsTab::Audio,
     ];
@@ -33,6 +35,7 @@ impl PrefsTab {
             PrefsTab::Mixer => "Mixer",
             PrefsTab::Keyboard => "Keyboard",
             PrefsTab::Stems => "Stems",
+            PrefsTab::Library => "Library",
             PrefsTab::Appearance => "Appearance",
             PrefsTab::Audio => "Audio",
         }
@@ -275,6 +278,9 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
     section(ui, "Waveform", |ui| {
         ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
             .on_hover_text("Bands turned down with the EQ knobs shrink in the waveforms");
+        ui.checkbox(&mut p.scroll_zoom, "Scroll over a waveform to zoom").on_hover_text(
+            "The mouse wheel, or a trackpad's scroll or pinch, zooms the scrolling waveforms",
+        );
     });
     section(ui, "Master Limiter", |ui| {
         ui.checkbox(&mut p.limiter, "Soften peaks before they clip");
@@ -292,6 +298,7 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
         p.iso_high_hz = defaults.iso_high_hz;
         p.limiter = defaults.limiter;
         p.eq_waveforms = defaults.eq_waveforms;
+        p.scroll_zoom = defaults.scroll_zoom;
     }
     *p != before
 }

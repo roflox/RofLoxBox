@@ -189,6 +189,22 @@ pub struct Preferences {
     /// The Python Demucs is installed in, for its fast helper; found by
     /// itself when unset (a model's own `python` comes first).
     pub demucs_python: Option<PathBuf>,
+    /// Separated stems stay on disk between runs (up to the cache's
+    /// limit); off, they are deleted when the app quits.
+    pub keep_stems: bool,
+    /// The passphrase of rekordbox's library (`master.db`): fetched from
+    /// pyrekordbox the first time, or entered.
+    pub rekordbox_key: String,
+    /// rekordbox's library, when not where rekordbox keeps it.
+    pub rekordbox_db: Option<PathBuf>,
+    /// rekordbox's library is read again at every start.
+    pub rekordbox_at_start: bool,
+    /// Changes made in deckhand may be written into rekordbox's library
+    /// (asked for, after a warning to back it up).
+    pub rekordbox_write: bool,
+    /// With writing allowed, changes go into rekordbox's library on their
+    /// own, a moment after they're made.
+    pub rekordbox_autosave: bool,
     /// Where tracks made from stems go; the default when unset.
     pub stems_folder: Option<PathBuf>,
     /// The computer keyboard plays the decks.
@@ -246,6 +262,8 @@ pub struct Preferences {
     pub isolator: bool,
     /// Waveforms shrink the bands the EQ turns down.
     pub eq_waveforms: bool,
+    /// Scrolling (or pinching) over a scrolling waveform zooms it.
+    pub scroll_zoom: bool,
     /// EQ mode: low shelf, mid peak and high shelf in Hz.
     pub eq_low_hz: f32,
     pub eq_mid_hz: f32,
@@ -285,6 +303,12 @@ impl Default for Preferences {
             live_stems: true,
             stems_on_load: true,
             demucs_python: None,
+            keep_stems: false,
+            rekordbox_key: String::new(),
+            rekordbox_db: None,
+            rekordbox_at_start: true,
+            rekordbox_write: false,
+            rekordbox_autosave: true,
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),
@@ -305,6 +329,7 @@ impl Default for Preferences {
             fader_curve: FaderCurveSetting::Standard,
             isolator: true,
             eq_waveforms: true,
+            scroll_zoom: true,
             eq_low_hz: 70.0,
             eq_mid_hz: 1_000.0,
             eq_high_hz: 13_000.0,

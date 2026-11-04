@@ -191,6 +191,10 @@ pub struct Node {
     /// Playlist entries in order; a track may appear more than once.
     #[serde(default)]
     pub tracks: Vec<u32>,
+    /// rekordbox's id of this playlist or folder, when it came from
+    /// rekordbox's library (or was saved into it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekordbox: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -200,6 +204,15 @@ pub struct Collection {
     pub nodes: Vec<Node>,
     /// Folders that were added; rescanned to pick up new files.
     pub folders: Vec<PathBuf>,
+    /// rekordbox's count of changes to its library when the `rekordbox`
+    /// folder was last read from it (or saved into it); `None` after an
+    /// import from elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekordbox_count: Option<i64>,
+    /// Changes rekordbox's library doesn't have yet (saving them waits for
+    /// rekordbox to close, maybe until the next start).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rekordbox_unsaved: bool,
     next_track: u32,
     next_node: u32,
     #[serde(skip)]
@@ -437,7 +450,56 @@ impl Collection {
     /// ones are added. rekordbox's playlists replace the ones of the last
     /// import, in a top-level folder called `rekordbox`.
     pub fn import_rekordbox(&mut self, library: XmlLibrary) -> ImportSummary {
+        self.rekordbox_count = None;
         self.import_into(library, REKORDBOX_FOLDER, true)
+    }
+
+    /// The `rekordbox` folder's playlists and folders, the ones at its top
+    /// without a parent; `None` when there is no such folder.
+    pub fn rekordbox_playlists(&self) -> Option<Vec<Node>> {
+        let root = self
+            .nodes
+            .iter()
+            .find(|n| {
+                n.parent.is_none() && n.kind == NodeKind::Folder && n.name == REKORDBOX_FOLDER
+            })?
+            .id;
+        let mut inside = vec![root];
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < inside.len() {
+            let parent = inside[i];
+            for node in self.nodes.iter().filter(|n| n.parent == Some(parent)) {
+                let mut node = node.clone();
+                if node.parent == Some(root) {
+                    node.parent = None;
+                }
+                inside.push(node.id);
+                out.push(node);
+            }
+            i += 1;
+        }
+        // Siblings in the collection's order.
+        out.sort_by_key(|n| self.nodes.iter().position(|m| m.id == n.id));
+        Some(out)
+    }
+
+    /// Notes whether rekordbox's library lacks changes made here.
+    pub fn set_rekordbox_unsaved(&mut self, unsaved: bool) {
+        if self.rekordbox_unsaved != unsaved {
+            self.rekordbox_unsaved = unsaved;
+            self.dirty = true;
+        }
+    }
+
+    /// After saving into rekordbox: the ids it gave new playlists, and its
+    /// change count now.
+    pub fn saved_to_rekordbox(&mut self, ids: &[(u32, String)], count: i64) {
+        for (node, id) in ids {
+            self.set_rekordbox_id(*node, Some(id.clone()));
+        }
+        self.rekordbox_count = Some(count);
+        self.dirty = true;
     }
 
     /// Imports tracks and playlists like [`Collection::import_rekordbox`],
@@ -548,12 +610,14 @@ impl Collection {
         ) {
             for node in nodes {
                 match node {
-                    XmlNode::Folder { name, children } => {
+                    XmlNode::Folder { name, children, id } => {
                         let folder = c.create(name, NodeKind::Folder, Some(parent));
+                        c.set_rekordbox_id(folder, id.clone());
                         add(c, children, folder, by_key, by_location, count);
                     }
-                    XmlNode::Playlist { name, keys, by_location: located } => {
+                    XmlNode::Playlist { name, keys, by_location: located, id } => {
                         let list = c.create(name, NodeKind::Playlist, Some(parent));
+                        c.set_rekordbox_id(list, id.clone());
                         let map = if *located { by_location } else { by_key };
                         let ids: Vec<u32> =
                             keys.iter().filter_map(|k| map.get(k).copied()).collect();
@@ -584,7 +648,14 @@ impl Collection {
         let parent = parent.filter(|p| self.node(*p).is_some_and(|n| n.kind == NodeKind::Folder));
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, name: name.to_owned(), kind, parent, tracks: Vec::new() });
+        self.nodes.push(Node {
+            id,
+            name: name.to_owned(),
+            kind,
+            parent,
+            tracks: Vec::new(),
+            rekordbox: None,
+        });
         self.dirty = true;
         id
     }
@@ -630,13 +701,40 @@ impl Collection {
         }
     }
 
-    /// Moves a playlist entry to another position.
-    pub fn move_in_playlist(&mut self, id: u32, from: usize, to: usize) {
+    /// Moves playlist entries (by position) together in front of the entry
+    /// at `before` (the end when past it), keeping their order.
+    pub fn move_in_playlist(&mut self, id: u32, entries: &[usize], before: usize) {
+        let Some(node) = self.node_mut(id) else { return };
+        let mut moved = Vec::new();
+        let mut kept = Vec::new();
+        let mut at = None;
+        for (i, &track) in node.tracks.iter().enumerate() {
+            if i == before {
+                at = Some(kept.len());
+            }
+            if entries.contains(&i) {
+                moved.push(track);
+            } else {
+                kept.push(track);
+            }
+        }
+        if moved.is_empty() {
+            return;
+        }
+        let at = at.unwrap_or(kept.len());
+        kept.splice(at..at, moved);
+        if kept != node.tracks {
+            node.tracks = kept;
+            self.dirty = true;
+        }
+    }
+
+    /// Remembers which playlist or folder of rekordbox's `id` stands for.
+    pub fn set_rekordbox_id(&mut self, id: u32, rekordbox: Option<String>) {
         if let Some(node) = self.node_mut(id)
-            && from < node.tracks.len()
+            && node.rekordbox != rekordbox
         {
-            let track = node.tracks.remove(from);
-            node.tracks.insert(to.min(node.tracks.len()), track);
+            node.rekordbox = rekordbox;
             self.dirty = true;
         }
     }
@@ -811,8 +909,19 @@ mod tests {
         let list = c.create("Friday", NodeKind::Playlist, Some(folder));
         let top = c.create("Warmup", NodeKind::Playlist, None);
         assert_eq!(c.add_to_playlist(list, &[a, b, a]), 3, "duplicates are kept");
-        c.move_in_playlist(list, 1, 0);
+        c.move_in_playlist(list, &[1], 0);
         assert_eq!(c.node(list).unwrap().tracks, [b, a, a]);
+        // Several entries move together, in their order: to the end, and
+        // back in front of another.
+        let d = c.create("Moves", NodeKind::Playlist, None);
+        c.add_to_playlist(d, &[1, 2, 3, 4, 5]);
+        c.move_in_playlist(d, &[0, 2], 5);
+        assert_eq!(c.node(d).unwrap().tracks, [2, 4, 5, 1, 3]);
+        c.move_in_playlist(d, &[3, 4], 1);
+        assert_eq!(c.node(d).unwrap().tracks, [2, 1, 3, 4, 5]);
+        c.move_in_playlist(d, &[1], 2);
+        assert_eq!(c.node(d).unwrap().tracks, [2, 1, 3, 4, 5], "in front of its neighbour: stays");
+        c.delete(d);
         c.remove_playlist_entry(list, 2);
         assert_eq!(c.node(list).unwrap().tracks, [b, a], "one entry goes, not every copy");
         let names: Vec<_> = c.tree().iter().map(|(d, n)| (*d, n.name.as_str())).collect();

@@ -20,13 +20,22 @@ rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.1.8"
+flate2 = "1.1.10"
+getrandom = "0.3"
 
 # macOS draws through Metal (wgpu); other systems keep OpenGL.
 [target.'cfg(target_os = "macos")'.dependencies]
 eframe = { version = "0.33.3", features = ["wgpu"] }
 
+# rekordbox's library is SQLCipher (encrypted SQLite): bundled, with the
+# system's crypto (CommonCrypto on macOS, libcrypto on Linux)...
+[target.'cfg(not(windows))'.dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher"] }
+
+# ...and on Windows, which has none SQLCipher can use, OpenSSL built along.
 # Ejecting drives without starting another program.
 [target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [build-dependencies]

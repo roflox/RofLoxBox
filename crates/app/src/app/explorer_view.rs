@@ -354,6 +354,7 @@ impl DeckhandApp {
             draggable: true,
             marked: &self.marked,
             editable_rating: false,
+            reorder: None,
         };
         let selection = self.selected_ids();
         let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };

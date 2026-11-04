@@ -33,16 +33,10 @@ pub struct XmlTrack {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum XmlNode {
-    Folder {
-        name: String,
-        children: Vec<XmlNode>,
-    },
+    /// `id` is rekordbox's own, when read from its library database.
+    Folder { name: String, children: Vec<XmlNode>, id: Option<String> },
     /// Track keys: `TrackID`s, or locations when `by_location`.
-    Playlist {
-        name: String,
-        keys: Vec<String>,
-        by_location: bool,
-    },
+    Playlist { name: String, keys: Vec<String>, by_location: bool, id: Option<String> },
 }
 
 #[derive(Debug, Default)]
@@ -124,9 +118,10 @@ impl XmlLibrary {
                             name,
                             keys: Vec::new(),
                             by_location: get("KeyType") == Some("1"),
+                            id: None,
                         }
                     } else {
-                        XmlNode::Folder { name, children: Vec::new() }
+                        XmlNode::Folder { name, children: Vec::new(), id: None }
                     };
                     stack.push(node);
                     if empty {
@@ -361,10 +356,17 @@ mod tests {
                     children: vec![XmlNode::Playlist {
                         name: "Friday".into(),
                         keys: vec!["12".into(), "11".into()],
-                        by_location: false
-                    }]
+                        by_location: false,
+                        id: None,
+                    }],
+                    id: None,
                 },
-                XmlNode::Playlist { name: "Empty".into(), keys: vec![], by_location: false },
+                XmlNode::Playlist {
+                    name: "Empty".into(),
+                    keys: vec![],
+                    by_location: false,
+                    id: None
+                },
             ]
         );
     }

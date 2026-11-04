@@ -285,6 +285,46 @@ impl DeckhandApp {
         );
     }
 
+    /// Whether separated stems stay on disk, and how much they take.
+    fn stem_cache_prefs(&mut self, ui: &mut Ui) {
+        let fresh = self.stem_cache_size.filter(|(at, _)| at.elapsed().as_secs() < 2);
+        let bytes = match fresh {
+            Some((_, bytes)) => bytes,
+            None => {
+                let bytes = stems::cache_size();
+                self.stem_cache_size = Some((std::time::Instant::now(), bytes));
+                bytes
+            }
+        };
+        let separating = self.stems.pending() > 0
+            || self.decks.iter().any(|d| match &d.stems {
+                Stems::Separating(_) => true,
+                Stems::Ready(layers) => layers.ready_share() < 1.0,
+                _ => false,
+            });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.config.prefs.keep_stems, "Keep stems on disk");
+            ui.label(RichText::new(format!("{:.1} GB now", bytes as f64 / 1e9)).small().weak());
+            if ui
+                .add_enabled(bytes > 0 && !separating, egui::Button::new("Delete now"))
+                .on_disabled_hover_text("Not while a track is being separated")
+                .clicked()
+            {
+                stems::clear_cache();
+                self.stem_cache_size = None;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "On, tracks separated before load with their stems at once, also after a \
+                 restart (up to 2 GB; the tracks used least recently go first). Off, the \
+                 stems are deleted when the app quits.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
     /// The Stems page of Preferences; returns whether a setting changed.
     pub(super) fn stems_prefs(&mut self, ui: &mut Ui) -> bool {
         let p = &self.config.prefs;
@@ -294,6 +334,7 @@ impl DeckhandApp {
             p.stems_on_load,
             p.live_stems,
             p.demucs_python.clone(),
+            p.keep_stems,
         );
         let dir = stems::models_dir();
         let chosen = self.stem_model().map(|m| m.id.clone());
@@ -376,6 +417,7 @@ impl DeckhandApp {
             .small()
             .weak(),
         );
+        self.stem_cache_prefs(ui);
         ui.add_space(6.0);
         ui.label(RichText::new("Made tracks").strong().size(15.0));
         let folder = self.stems_folder();
@@ -410,6 +452,7 @@ impl DeckhandApp {
             p.stems_on_load,
             p.live_stems,
             p.demucs_python.clone(),
+            p.keep_stems,
         ) != before
     }
 }

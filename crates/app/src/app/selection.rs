@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use deckhand_library::NodeKind;
 use eframe::egui::{self, Key, Modifiers};
 
 use super::{DeckhandApp, Focus, Source};
@@ -75,6 +76,23 @@ impl DeckhandApp {
             self.click_track(id, position, Modifiers::NONE);
         }
         let ids = if self.marked.contains(&id) { self.selected_ids() } else { vec![id] };
+        // From a playlist, the entries can move within it too.
+        let playlist = self.collection_view.node.filter(|n| {
+            matches!(self.source, Source::Collection)
+                && self.collection.node(*n).is_some_and(|n| n.kind == NodeKind::Playlist)
+        });
+        self.collection_view.dragged_entries = playlist.map(|playlist| {
+            let entries = if self.marked.contains(&id) {
+                self.visible_rows()
+                    .into_iter()
+                    .filter(|(row, _)| self.marked.contains(row))
+                    .map(|(_, position)| position)
+                    .collect()
+            } else {
+                vec![position]
+            };
+            (playlist, entries)
+        });
         let drag = match &self.source {
             Source::Collection => TrackDrag::Collection(ids),
             Source::Usb(root) => TrackDrag::Usb(root.clone(), ids),
@@ -91,6 +109,7 @@ impl DeckhandApp {
     pub(super) fn drag_hint(&mut self, ctx: &egui::Context) {
         let Some(drag) = egui::DragAndDrop::payload::<TrackDrag>(ctx) else {
             self.deck_drag = None;
+            self.collection_view.dragged_entries = None;
             return;
         };
         let Some(pointer) = ctx.pointer_hover_pos() else { return };

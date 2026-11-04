@@ -486,7 +486,7 @@ fn rekordbox_analysis(
     (dat, ext, two_ex)
 }
 
-fn replace_grid(file: &mut AnlzFile, grid: BeatGrid) {
+pub(crate) fn replace_grid(file: &mut AnlzFile, grid: BeatGrid) {
     if let Some(section) = file.sections.iter_mut().find(|s| matches!(s, Section::BeatGrid(_))) {
         *section = Section::BeatGrid(grid);
     } else {
@@ -496,7 +496,10 @@ fn replace_grid(file: &mut AnlzFile, grid: BeatGrid) {
     }
 }
 
-fn same_markers(a: &[deckhand_library::TempoMarker], b: &[deckhand_library::TempoMarker]) -> bool {
+pub(crate) fn same_markers(
+    a: &[deckhand_library::TempoMarker],
+    b: &[deckhand_library::TempoMarker],
+) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
             (x.start - y.start).abs() < 0.002 && (x.bpm - y.bpm).abs() < 0.005 && x.beat == y.beat
@@ -504,7 +507,7 @@ fn same_markers(a: &[deckhand_library::TempoMarker], b: &[deckhand_library::Temp
 }
 
 /// The collection's beat grid as rekordbox stores it: every beat.
-fn collection_grid(track: &CollectionTrack) -> BeatGrid {
+pub(crate) fn collection_grid(track: &CollectionTrack) -> BeatGrid {
     let mut beats = Vec::new();
     for (i, marker) in track.tempo.iter().enumerate() {
         if marker.bpm <= 0.0 {

@@ -236,11 +236,13 @@ fn playlist_node(node: &PlaylistNode) -> XmlNode {
         PlaylistKind::Folder(children) => XmlNode::Folder {
             name: node.name.clone(),
             children: children.iter().map(playlist_node).collect(),
+            id: None,
         },
         PlaylistKind::Playlist(ids) => XmlNode::Playlist {
             name: node.name.clone(),
             keys: ids.iter().map(u32::to_string).collect(),
             by_location: false,
+            id: None,
         },
     }
 }

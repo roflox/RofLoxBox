@@ -156,6 +156,8 @@ pub struct DeckhandApp {
     /// Separates loaded tracks for live stems, apart from the queue of
     /// tracks being made.
     live_stems: crate::stems::LiveSeparator,
+    /// The stem cache's size, and when it was measured (for Preferences).
+    stem_cache_size: Option<(Instant, u64)>,
     /// Each deck's position for its live separation (see `LiveJob::playhead`).
     stem_playheads: [std::sync::Arc<std::sync::atomic::AtomicU64>; DECKS],
     /// The model the live separator was last asked to have ready.
@@ -189,6 +191,8 @@ pub struct DeckhandApp {
     seconds_visible: f64,
     status: Option<String>,
     screenshot: Option<Screenshot>,
+    /// Test aid: the window asks to close at this time.
+    close_at: Option<Instant>,
     /// Test aid (`DECKHAND_AUTOPLAY`): start every loaded deck once its
     /// track is in.
     autoplay: bool,
@@ -206,6 +210,10 @@ struct Screenshot {
 impl DeckhandApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut config = Config::load();
+        // Left over from a run that didn't quit normally.
+        if !config.prefs.keep_stems {
+            crate::stems::clear_cache();
+        }
         crate::widgets::apply_theme(&cc.egui_ctx, config.prefs.theme);
         let keyboard = keyboard::KeyboardMixer::new(&config.prefs.key_bindings);
         if let Some(root) = std::env::var_os("DECKHAND_LIBRARY") {
@@ -262,13 +270,16 @@ impl DeckhandApp {
             controller: Controller::default(),
             show_controller: std::env::var_os("DECKHAND_SHOW_CONTROLLER").is_some(),
             show_prefs: std::env::var_os("DECKHAND_SHOW_AUDIO").is_some()
-                || std::env::var_os("DECKHAND_SHOW_PREFS").is_some(),
+                || std::env::var_os("DECKHAND_SHOW_PREFS").is_some()
+                || std::env::var_os("DECKHAND_SHOW_LIBRARY_PREFS").is_some(),
             prefs_tab: if std::env::var_os("DECKHAND_SHOW_MIXER_PREFS").is_some() {
                 PrefsTab::Mixer
             } else if std::env::var_os("DECKHAND_SHOW_KEYBOARD_PREFS").is_some() {
                 PrefsTab::Keyboard
             } else if std::env::var_os("DECKHAND_SHOW_STEMS_PREFS").is_some() {
                 PrefsTab::Stems
+            } else if std::env::var_os("DECKHAND_SHOW_LIBRARY_PREFS").is_some() {
+                PrefsTab::Library
             } else if std::env::var_os("DECKHAND_SHOW_AUDIO").is_some() {
                 PrefsTab::Audio
             } else {
@@ -285,6 +296,7 @@ impl DeckhandApp {
             keyboard,
             stems: Default::default(),
             live_stems: Default::default(),
+            stem_cache_size: None,
             stem_playheads: Default::default(),
             stems_warmed: None,
             stems_for: Default::default(),
@@ -305,6 +317,10 @@ impl DeckhandApp {
             pad_held: [[None; HOT_CUES]; DECKS],
             seconds_visible: keyboard::DEFAULT_SECONDS_VISIBLE,
             status: None,
+            close_at: std::env::var("DECKHAND_CLOSE_AFTER")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|s| Instant::now() + Duration::from_secs(s)),
             screenshot: std::env::var_os("DECKHAND_SCREENSHOT").map(|p| {
                 let delay = std::env::var("DECKHAND_SCREENSHOT_DELAY")
                     .ok()
@@ -396,6 +412,9 @@ impl DeckhandApp {
         if let Some(folder) = std::env::var_os("DECKHAND_EXPLORER") {
             app.explorer.open = true;
             app.open_explorer_folder(folder.into());
+        }
+        if app.config.prefs.rekordbox_at_start {
+            app.rekordbox_at_start();
         }
         if app.screenshot.is_some() || app.autoplay {
             let ids = app.visible_track_ids();
@@ -1417,6 +1436,20 @@ impl DeckhandApp {
     }
 }
 
+impl DeckhandApp {
+    /// Saves what is left and leaves.
+    pub(super) fn quit(&mut self) -> ! {
+        self.save_to_rekordbox_at_quit();
+        self.save_session(true);
+        self.finish_recording();
+        self.config.save();
+        if !self.config.prefs.keep_stems {
+            crate::stems::clear_cache();
+        }
+        std::process::exit(0);
+    }
+}
+
 impl eframe::App for DeckhandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Before anything is drawn, so focused widgets don't take the arrows.
@@ -1425,10 +1458,22 @@ impl eframe::App for DeckhandApp {
         // winit's window teardown can trip an AppKit exception on recent macOS;
         // nothing needs cleaning up, so leave directly.
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.save_session(true);
-            self.finish_recording();
-            self.config.save();
-            std::process::exit(0);
+            if self.rekordbox_blocks_quit() {
+                // Changes for rekordbox can't be saved while it is open.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.ask_to_close_rekordbox();
+            } else {
+                self.quit();
+            }
+        }
+        self.quit_waiting_for_rekordbox(ctx);
+        if let Some(at) = self.close_at {
+            if Instant::now() >= at {
+                self.close_at = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(at - Instant::now());
+            }
         }
         if let Some(engine) = self.engine.as_mut() {
             engine.collect_garbage();
@@ -1752,6 +1797,15 @@ impl DeckhandApp {
         let Some(engine) = self.engine.as_mut() else { return };
         let deck = &self.decks[index];
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+        if self.config.prefs.scroll_zoom && response.hovered() {
+            // Scrolling up (or pinching out) shows less, like a wheel notch
+            // of the controller's zoom.
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            if scroll != 0.0 || pinch != 1.0 {
+                let factor = 1.15f64.powf(-f64::from(scroll) / 50.0) / f64::from(pinch);
+                self.seconds_visible = (self.seconds_visible * factor).clamp(2.0, 30.0);
+            }
+        }
         let painter = ui.painter_at(rect);
         let mut jump = None;
         let mut drag = None;
@@ -2662,6 +2716,7 @@ impl DeckhandApp {
             draggable: true,
             marked: &self.marked,
             editable_rating: false,
+            reorder: None,
         };
         let selection = self.selected_ids();
         let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };
@@ -2813,6 +2868,10 @@ impl DeckhandApp {
                     }
                     PrefsTab::Stems => {
                         prefs_changed |= self.stems_prefs(ui);
+                        return;
+                    }
+                    PrefsTab::Library => {
+                        prefs_changed |= self.library_prefs(ui);
                         return;
                     }
                     PrefsTab::Appearance => {

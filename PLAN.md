@@ -14,9 +14,7 @@ subscriptions, accounts, telemetry or ads. "deckhand" is a working name.
    login (Gigya), product registration, analytics and crash reporting
    (Bugsnag), ads and upsell UI, KUVO. Features that exist only behind
    a paid plan are either left out or built independently; their
-   licensing is never bypassed. Encrypted rekordbox databases
-   (`master.db`) are not decrypted — library import goes through
-   rekordbox XML or USB exports.
+   licensing is never bypassed.
 4. **Interoperability is verified, not assumed.** Every format reader is
    tested against real exports; every writer is tested by round-trip and,
    at milestones, by loading the result on real hardware.
@@ -151,7 +149,7 @@ from a local library without rekordbox.
 ### Playable app (priority, started 2026-10-25)
 Goal: play the user's library from a rekordbox USB export with the
 AlphaTheta GRV6, later any controller rekordbox supports. The library
-source is the USB export (the encrypted `master.db` is not touched).
+source is the USB export.
 
 Done (milestone 1):
 - `crates/audio`: decoding (symphonia), real-time two-deck mixer (cpal,

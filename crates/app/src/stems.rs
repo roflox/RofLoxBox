@@ -136,6 +136,28 @@ fn trim_cache(cache: &Path, limit: u64) {
     }
 }
 
+/// Deletes every track's cached stems (made tracks stay).
+pub fn clear_cache() {
+    let _ = std::fs::remove_dir_all(cache_dir());
+}
+
+/// Bytes the stem cache takes on disk.
+pub fn cache_size() -> u64 {
+    fn size(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| match entry.metadata() {
+                Ok(m) if m.is_dir() => size(&entry.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+    size(&cache_dir())
+}
+
 /// Where made tracks go unless Preferences say otherwise.
 pub fn default_output_dir() -> PathBuf {
     deckhand_library::data_dir().join("Stems")
@@ -697,12 +719,12 @@ fn demucs_python(model: &StemModel) -> Option<(PathBuf, String)> {
             .flat_map(|dir| [dir.join(program), dir.join(format!("{program}.exe"))])
             .find(|p| p.is_file())
     }?;
-    let first_line = std::fs::read(&launcher).ok().and_then(|bytes| {
-        let line = bytes.split(|b| *b == b'\n').next()?.strip_prefix(b"#!")?.to_vec();
-        String::from_utf8(line).ok()
-    });
-    let named =
-        first_line.map(|l| PathBuf::from(l.trim())).filter(|p| p.is_absolute() && p.is_file());
+    // pipx links the launcher from its bin folder into the environment's.
+    let launcher = launcher.canonicalize().unwrap_or(launcher);
+    let named = std::fs::read(&launcher)
+        .ok()
+        .and_then(|bytes| launcher_python(&String::from_utf8_lossy(&bytes)))
+        .filter(|p| p.is_file());
     let home =
         std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
     let dir = launcher.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -721,12 +743,32 @@ fn demucs_python(model: &StemModel) -> Option<(PathBuf, String)> {
         .map(PathBuf::from)
         .into_iter()
         .chain(local.map(|l| l.join("pipx/pipx")))
-        .chain(home.iter().flat_map(|h| [h.join(".local/pipx"), h.join("pipx")]));
+        .chain(home.iter().flat_map(|h| {
+            [h.join(".local/pipx"), h.join("pipx"), h.join("Library/Application Support/pipx")]
+        }));
     let pipx = pipx_homes
         .map(|p| p.join("venvs/demucs"))
         .flat_map(|v| [v.join("bin/python"), v.join("Scripts/python.exe")]);
     let python = named.or_else(|| beside.into_iter().chain(pipx).find(|p| p.is_file()))?;
     Some((python, name))
+}
+
+/// The Python a launcher script runs: its `#!` line, or, when the path has
+/// a space (which `#!` can't hold), the one its `/bin/sh` lines `exec`.
+fn launcher_python(script: &str) -> Option<PathBuf> {
+    let is_python = |p: &Path| {
+        p.is_absolute() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("python"))
+    };
+    let mut lines = script.lines().take(4);
+    let shebang = PathBuf::from(lines.next()?.strip_prefix("#!")?.trim());
+    if is_python(&shebang) {
+        return Some(shebang);
+    }
+    // '''exec' "/path with space/python" "$0" "$@"
+    lines.find_map(|line| {
+        let quoted = line.strip_prefix("'''exec' \"")?;
+        Some(PathBuf::from(&quoted[..quoted.find('"')?])).filter(|p| is_python(p))
+    })
 }
 
 /// A track being separated piece by piece.
@@ -1579,6 +1621,17 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         assert_eq!(vocals.samples.len(), original.samples.len());
         assert!(vocals.samples.iter().zip(&original.samples).all(|(v, o)| (v - o).abs() < 1e-4));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finds_the_python_a_launcher_runs() {
+        let plain = "#!/opt/venv/bin/python\nimport sys\n";
+        assert_eq!(launcher_python(plain), Some(PathBuf::from("/opt/venv/bin/python")));
+        let python = "/Users/me/Library/Application Support/pipx/venvs/demucs/bin/python";
+        let spaced = format!("#!/bin/sh\n'''exec' \"{python}\" \"$0\" \"$@\"\n' '''\nimport sys\n");
+        assert_eq!(launcher_python(&spaced), Some(PathBuf::from(python)));
+        assert_eq!(launcher_python("#!/bin/sh\nexec demucs \"$@\"\n"), None);
+        assert_eq!(launcher_python("MZ binary"), None);
     }
 
     #[cfg(unix)]
