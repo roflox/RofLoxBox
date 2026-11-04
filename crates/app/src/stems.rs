@@ -26,7 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,6 +59,8 @@ struct ModelFile {
     files: BTreeMap<String, String>,
     #[serde(default)]
     install: String,
+    #[serde(default)]
+    python: Option<PathBuf>,
 }
 
 /// A separation model the user added.
@@ -72,6 +74,9 @@ pub struct StemModel {
     files: BTreeMap<String, String>,
     /// How to install its tool, for when it is missing.
     install: String,
+    /// For Demucs: the Python it is installed in, to run the fast helper
+    /// with; found by itself when unset.
+    pub python: Option<PathBuf>,
     dir: PathBuf,
 }
 
@@ -155,6 +160,7 @@ pub fn load_models(dir: &Path) -> (Vec<StemModel>, Vec<String>) {
                 command: m.command,
                 files: m.files,
                 install: m.install,
+                python: m.python,
                 dir: folder,
             }),
             Err(err) => errors.push(format!("{id}: {err:#}")),
@@ -576,7 +582,7 @@ impl LiveSeparator {
 ///
 /// [`demucs_worker.py`]: https://github.com/roflox/RofLoxBox/blob/main/crates/app/src/stems/demucs_worker.py
 struct Helper {
-    model: String,
+    model: StemModel,
     child: Child,
     input: std::process::ChildStdin,
     output: std::io::BufReader<std::process::ChildStdout>,
@@ -611,7 +617,7 @@ impl Helper {
             .with_context(|| format!("starting {}", python.display()))?;
         let input = child.stdin.take().context("helper input")?;
         let output = std::io::BufReader::new(child.stdout.take().context("helper output")?);
-        let mut helper = Self { model: model.id.clone(), child, input, output };
+        let mut helper = Self { model: model.clone(), child, input, output };
         let ready = helper.answer()?;
         if !ready.get("ready").is_some_and(serde_json::Value::is_array) {
             bail!("the Demucs helper did not start: {ready}");
@@ -651,14 +657,29 @@ impl Drop for Helper {
     }
 }
 
+/// Whether the model's command runs `demucs`.
+pub fn uses_demucs(model: &StemModel) -> bool {
+    model
+        .command
+        .first()
+        .and_then(|p| Path::new(p).file_stem())
+        .is_some_and(|p| p.eq_ignore_ascii_case("demucs"))
+}
+
+/// The Python the fast Demucs helper runs with, for a model whose command
+/// runs `demucs`: the one set, else the one found.
+pub fn helper_python(model: &StemModel) -> Option<PathBuf> {
+    demucs_python(model).map(|(python, _)| python)
+}
+
 /// For a model whose command runs `demucs`: the Python it is installed in
-/// (named by the `demucs` launcher's first line, or next to it) and the
-/// Demucs model name (`-n`, else htdemucs).
+/// (the one set, else named by the `demucs` launcher's first line, or next
+/// to it) and the Demucs model name (`-n`, else htdemucs).
 fn demucs_python(model: &StemModel) -> Option<(PathBuf, String)> {
-    let program = model.command.first()?;
-    if !Path::new(program).file_stem().is_some_and(|p| p.eq_ignore_ascii_case("demucs")) {
+    if !uses_demucs(model) {
         return None;
     }
+    let program = model.command.first()?;
     let name = model
         .command
         .iter()
@@ -666,6 +687,9 @@ fn demucs_python(model: &StemModel) -> Option<(PathBuf, String)> {
         .and_then(|i| model.command.get(i + 1))
         .cloned()
         .unwrap_or_else(|| "htdemucs".into());
+    if let Some(python) = &model.python {
+        return Some((python.clone(), name));
+    }
     let launcher = if Path::new(program).is_absolute() {
         Some(PathBuf::from(program))
     } else {
@@ -682,13 +706,25 @@ fn demucs_python(model: &StemModel) -> Option<(PathBuf, String)> {
     let home =
         std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
     let dir = launcher.parent().map(Path::to_path_buf).unwrap_or_default();
-    let beside = [dir.join("python"), dir.join("python3"), dir.join("python.exe")];
-    // pipx on Windows puts a copy of the launcher in its bin folder.
-    let pipx = home.iter().flat_map(|h| {
-        [h.join(".local/pipx/venvs/demucs"), h.join("pipx/venvs/demucs")]
-            .into_iter()
-            .flat_map(|v| [v.join("bin/python"), v.join("Scripts/python.exe")])
-    });
+    // Beside it in a virtual environment; or, installed with pip on
+    // Windows, the launcher is in Python's Scripts folder.
+    let beside = [
+        dir.join("python"),
+        dir.join("python3"),
+        dir.join("python.exe"),
+        dir.parent().map(|p| p.join("python.exe")).unwrap_or_default(),
+    ];
+    // pipx on Windows puts a copy of the launcher in its bin folder, and
+    // keeps the environment under PIPX_HOME, AppData or the home folder.
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let pipx_homes = std::env::var_os("PIPX_HOME")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(local.map(|l| l.join("pipx/pipx")))
+        .chain(home.iter().flat_map(|h| [h.join(".local/pipx"), h.join("pipx")]));
+    let pipx = pipx_homes
+        .map(|p| p.join("venvs/demucs"))
+        .flat_map(|v| [v.join("bin/python"), v.join("Scripts/python.exe")]);
     let python = named.or_else(|| beside.into_iter().chain(pipx).find(|p| p.is_file()))?;
     Some((python, name))
 }
@@ -772,7 +808,7 @@ impl Live {
         deckhand_audio::write_wav_file(&wav, rate, &piece.samples)?;
         let output = work.join("out");
         let model = &self.job.model;
-        let by_helper = match helper.as_mut().filter(|h| h.model == model.id) {
+        let by_helper = match helper.as_mut().filter(|h| h.model == *model) {
             Some(h) => match h.separate(&wav, &output) {
                 Ok(()) => find_stems(&output, &model.stems, &BTreeMap::new()).ok(),
                 Err(_) => {
@@ -865,15 +901,15 @@ fn live_loop(queue: &Receiver<LiveMessage>, events: &Sender<Event>, cache: &Path
     let mut active: Vec<Live> = Vec::new();
     let mut helper: Option<Helper> = None;
     // Models whose helper would not start: they run as commands.
-    let mut no_helper: Vec<String> = Vec::new();
+    let mut no_helper: Vec<StemModel> = Vec::new();
     let mut ensure_helper = |model: &StemModel, helper: &mut Option<Helper>| {
-        if helper.as_ref().is_some_and(|h| h.model == model.id) || no_helper.contains(&model.id) {
+        if helper.as_ref().is_some_and(|h| h.model == *model) || no_helper.contains(model) {
             return;
         }
         *helper = None;
         match Helper::start(model) {
             Some(Ok(started)) => *helper = Some(started),
-            Some(Err(_)) | None => no_helper.push(model.id.clone()),
+            Some(Err(_)) | None => no_helper.push(model.clone()),
         }
     };
     loop {
@@ -1036,10 +1072,42 @@ fn run_model(
     progress: &dyn Fn(Option<u32>),
 ) -> Result<BTreeMap<String, PathBuf>> {
     let gpu = model_args(&model.command, true) != model_args(&model.command, false);
-    match run_model_on(model, wav, output, work, running, progress, gpu) {
-        Err(_) if gpu => run_model_on(model, wav, output, work, running, progress, false),
+    let run = |gpu| match run_model_on(model, wav, output, work, running, progress, gpu) {
+        Err(error) if old_demucs(&error) => {
+            OLD_DEMUCS.store(true, Ordering::Relaxed);
+            run_model_on(model, wav, output, work, running, progress, gpu)
+        }
+        result => result,
+    };
+    match run(gpu) {
+        Err(_) if gpu => run(false),
         result => result,
     }
+}
+
+/// Set once Demucs turns down `--clip-mode none`: the release on PyPI
+/// (4.0) only has rescale and clamp. Rescale it is then: it turns a stem
+/// down as a whole, which [`layers`] undoes.
+static OLD_DEMUCS: AtomicBool = AtomicBool::new(false);
+
+fn old_demucs(error: &anyhow::Error) -> bool {
+    let error = error.to_string();
+    !OLD_DEMUCS.load(Ordering::Relaxed)
+        && error.contains("--clip-mode")
+        && error.contains("invalid choice: 'none'")
+}
+
+/// `args` with `--clip-mode none` swapped for rescale when Demucs is too
+/// old for it.
+fn clip_mode_for_this_demucs(mut args: Vec<String>) -> Vec<String> {
+    if OLD_DEMUCS.load(Ordering::Relaxed) {
+        for i in 1..args.len() {
+            if args[i - 1] == "--clip-mode" && args[i] == "none" {
+                args[i] = "rescale".into();
+            }
+        }
+    }
+    args
 }
 
 fn run_model_on(
@@ -1058,7 +1126,8 @@ fn run_model_on(
             .replace("{output}", &output.to_string_lossy())
             .replace("{model}", &model.dir.to_string_lossy())
     };
-    let args: Vec<String> = model_args(&model.command, gpu).iter().map(fill).collect();
+    let args: Vec<String> =
+        clip_mode_for_this_demucs(model_args(&model.command, gpu)).iter().map(fill).collect();
     let mut child = no_window(&mut Command::new(&args[0]))
         .args(&args[1..])
         .current_dir(&model.dir)
@@ -1302,6 +1371,7 @@ mod tests {
             command: command.iter().map(|s| s.to_string()).collect(),
             files: BTreeMap::new(),
             install: "pipx install no-such-tool".into(),
+            python: None,
             dir: dir.to_path_buf(),
         }
     }

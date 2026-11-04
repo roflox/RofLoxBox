@@ -159,7 +159,7 @@ pub struct DeckhandApp {
     /// Each deck's position for its live separation (see `LiveJob::playhead`).
     stem_playheads: [std::sync::Arc<std::sync::atomic::AtomicU64>; DECKS],
     /// The model the live separator was last asked to have ready.
-    stems_warmed: Option<String>,
+    stems_warmed: Option<crate::stems::StemModel>,
     /// The track each deck's stems were asked for.
     stems_for: [Option<PathBuf>; DECKS],
     /// The models in the models folder, and the ones that could not be read.

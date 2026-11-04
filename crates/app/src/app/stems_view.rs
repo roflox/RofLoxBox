@@ -13,10 +13,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 impl DeckhandApp {
-    /// The chosen model, else the first one there is.
-    pub(super) fn stem_model(&self) -> Option<&StemModel> {
+    /// The chosen model, else the first one there is, with the Python
+    /// from Preferences unless its model.toml names one.
+    pub(super) fn stem_model(&self) -> Option<StemModel> {
         let models = &self.stem_models.0;
-        models.iter().find(|m| m.id == self.config.prefs.stem_model).or(models.first())
+        let mut model = models
+            .iter()
+            .find(|m| m.id == self.config.prefs.stem_model)
+            .or(models.first())?
+            .clone();
+        if model.python.is_none() {
+            model.python = self.config.prefs.demucs_python.clone();
+        }
+        Some(model)
     }
 
     fn stems_folder(&self) -> PathBuf {
@@ -25,7 +34,7 @@ impl DeckhandApp {
 
     /// Queues the tracks for separation and making `recipe` of them.
     pub(super) fn make_stems(&mut self, ids: &[u32], recipe: &Recipe) {
-        let Some(model) = self.stem_model().cloned() else { return };
+        let Some(model) = self.stem_model() else { return };
         let folder = self.stems_folder();
         for &id in ids {
             let Some(track) = self.collection.track(id) else { continue };
@@ -48,7 +57,7 @@ impl DeckhandApp {
 
     /// Separates tracks ahead of time, so they load with their stems.
     pub(super) fn prepare_stems(&mut self, ids: &[u32]) {
-        let Some(model) = self.stem_model().cloned() else { return };
+        let Some(model) = self.stem_model() else { return };
         for &id in ids {
             let Some(track) = self.collection.track(id) else { continue };
             self.stems.submit(Job {
@@ -72,7 +81,7 @@ impl DeckhandApp {
         if !self.config.prefs.live_stems {
             return;
         }
-        let Some(model) = self.stem_model().cloned() else { return };
+        let Some(model) = self.stem_model() else { return };
         let deck = &mut self.decks[d];
         let (Some(track), Some(audio)) = (&deck.track, deck.audio()) else {
             return;
@@ -122,10 +131,10 @@ impl DeckhandApp {
     pub(super) fn poll_stems(&mut self, ctx: &egui::Context) {
         // With stems on, the model is loaded ahead of the first track, once
         // the decks are done loading (not to slow the start down).
-        let wanted = self.stem_model().filter(|_| self.config.prefs.live_stems).cloned();
+        let wanted = self.stem_model().filter(|_| self.config.prefs.live_stems);
         let settled = self.decks.iter().all(|d| d.loading_title().is_none());
-        if settled && wanted.as_ref().map(|m| &m.id) != self.stems_warmed.as_ref() {
-            self.stems_warmed = wanted.as_ref().map(|m| m.id.clone());
+        if settled && wanted != self.stems_warmed {
+            self.stems_warmed = wanted.clone();
             match wanted {
                 Some(model) => self.live_stems.warm(model),
                 None => self.live_stems.rest(),
@@ -207,10 +216,69 @@ impl DeckhandApp {
         }
     }
 
+    /// Which Python runs the fast Demucs helper: found by itself, or picked.
+    fn demucs_python_prefs(&mut self, ui: &mut Ui) {
+        let model = self.stem_model();
+        let found = model.as_ref().and_then(stems::helper_python);
+        ui.horizontal(|ui| {
+            ui.label("Python for Demucs:");
+            let (text, color) = match (&found, &self.config.prefs.demucs_python) {
+                (Some(python), _) if !python.is_file() => {
+                    (format!("{} (not there)", python.display()), Some(WARN))
+                }
+                (Some(python), Some(_)) => (python.display().to_string(), None),
+                (Some(python), None) => (format!("{} (found)", python.display()), None),
+                (None, _) if model.as_ref().is_some_and(stems::uses_demucs) => {
+                    ("not found".to_owned(), Some(WARN))
+                }
+                (None, _) => ("not used by this model".to_owned(), None),
+            };
+            let text = RichText::new(text).small();
+            ui.label(match color {
+                Some(color) => text.color(color),
+                None => text.weak(),
+            });
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Choose Python…").clicked()
+                && let Some(picked) = rfd::FileDialog::new()
+                    .set_title("The Python Demucs is installed in")
+                    .pick_file()
+            {
+                self.config.prefs.demucs_python = Some(picked);
+            }
+            if ui
+                .add_enabled(
+                    self.config.prefs.demucs_python.is_some(),
+                    egui::Button::new("Find it"),
+                )
+                .clicked()
+            {
+                self.config.prefs.demucs_python = None;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Demucs models separate live stems fastest in a helper that keeps the model \
+                 loaded, run by the Python Demucs is installed in. Without it, each piece \
+                 starts Demucs again and takes several times as long. With pipx on Windows it \
+                 is usually %LOCALAPPDATA%\\pipx\\pipx\\venvs\\demucs\\Scripts\\python.exe.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
     /// The Stems page of Preferences; returns whether a setting changed.
     pub(super) fn stems_prefs(&mut self, ui: &mut Ui) -> bool {
         let p = &self.config.prefs;
-        let before = (p.stem_model.clone(), p.stems_folder.clone(), p.stems_on_load, p.live_stems);
+        let before = (
+            p.stem_model.clone(),
+            p.stems_folder.clone(),
+            p.stems_on_load,
+            p.live_stems,
+            p.demucs_python.clone(),
+        );
         let dir = stems::models_dir();
         let chosen = self.stem_model().map(|m| m.id.clone());
         ui.label(RichText::new("Model").strong().size(15.0));
@@ -278,6 +346,7 @@ impl DeckhandApp {
         }
         ui.add_enabled_ui(self.config.prefs.live_stems, |ui| {
             ui.checkbox(&mut self.config.prefs.stems_on_load, "Separate tracks when they load");
+            self.demucs_python_prefs(ui);
         });
         ui.label(
             RichText::new(
@@ -319,6 +388,12 @@ impl DeckhandApp {
             .weak(),
         );
         let p = &self.config.prefs;
-        (p.stem_model.clone(), p.stems_folder.clone(), p.stems_on_load, p.live_stems) != before
+        (
+            p.stem_model.clone(),
+            p.stems_folder.clone(),
+            p.stems_on_load,
+            p.live_stems,
+            p.demucs_python.clone(),
+        ) != before
     }
 }

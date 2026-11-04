@@ -892,7 +892,7 @@ impl DeckhandApp {
         let selection = self.selected_ids();
         let marked = self.marked.clone();
         let group = |id: u32| if marked.contains(&id) { selection.clone() } else { vec![id] };
-        let stem_model = self.stem_model().cloned();
+        let stem_model = self.stem_model();
         let stem_recipes = stem_model.as_ref().map(crate::stems::recipes).unwrap_or_default();
         let separating = self.stems.pending();
         let derived: std::collections::HashSet<u32> =

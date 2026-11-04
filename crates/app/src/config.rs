@@ -186,6 +186,9 @@ pub struct Preferences {
     pub live_stems: bool,
     /// Loaded tracks are separated for live stems.
     pub stems_on_load: bool,
+    /// The Python Demucs is installed in, for its fast helper; found by
+    /// itself when unset (a model's own `python` comes first).
+    pub demucs_python: Option<PathBuf>,
     /// Where tracks made from stems go; the default when unset.
     pub stems_folder: Option<PathBuf>,
     /// The computer keyboard plays the decks.
@@ -281,6 +284,7 @@ impl Default for Preferences {
             stems_folder: None,
             live_stems: true,
             stems_on_load: true,
+            demucs_python: None,
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),
