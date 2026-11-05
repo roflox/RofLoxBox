@@ -1,7 +1,8 @@
-# Builds the installers for macOS, Windows and Linux, on each system, for
-# every push to main (or by hand: Actions → Release → Run workflow). Every
-# commit is a new version, 0.<number of commits>.0 (scripts/version.sh); a
-# push publishes it as the GitHub release v0.<n>.0, with the installers and
+# Builds the installers for macOS, Windows and Linux on GitHub's machines,
+# only when started by hand (Actions → Release → Run workflow): releases are
+# normally built locally and uploaded with scripts/publish-release.sh. Every
+# commit is a version, 0.<number of commits>.0 (scripts/version.sh); a run
+# publishes it as the GitHub release v0.<n>.0, with the installers and
 # their SHA-256 sums.
 #
 # Signing uses these repository secrets when present (Settings → Secrets
@@ -19,8 +20,6 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -76,6 +75,10 @@ jobs:
     env:
       # A static C runtime: no Visual C++ Redistributable needed.
       RUSTFLAGS: -C target-feature=+crt-static
+      # OpenSSL (for rekordbox's encrypted library) is built from source;
+      # Git Bash's perl lacks modules its Configure needs, Strawberry's has
+      # them.
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,7 +145,6 @@ jobs:
             target/dist/*.tar.gz
 
   release:
-    if: github.event_name == 'push'
     needs: [macos, windows, linux]
     runs-on: ubuntu-latest
     steps:
