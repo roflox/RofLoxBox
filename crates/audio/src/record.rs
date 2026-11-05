@@ -22,6 +22,8 @@ const BUFFER_SECS: usize = 4;
 pub struct RecordTap {
     samples: rtrb::Producer<f32>,
     dropped: Arc<AtomicU64>,
+    /// What was played, to replay it.
+    pub(crate) session: Option<crate::session::SessionTap>,
 }
 
 impl std::fmt::Debug for RecordTap {
@@ -49,6 +51,7 @@ pub struct Recording {
     frames: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     writer: Option<JoinHandle<Result<()>>>,
+    session: Option<JoinHandle<Result<()>>>,
 }
 
 impl Recording {
@@ -65,18 +68,26 @@ impl Recording {
         let writer = std::thread::Builder::new()
             .name("recorder".into())
             .spawn(move || write_wav(file, rate, consumer, &counter))?;
+        let (session, session_writer) =
+            crate::session::start(&crate::session::session_path(path), rate)?;
         let recording = Self {
             path: path.to_path_buf(),
             rate,
             frames,
             dropped: dropped.clone(),
             writer: Some(writer),
+            session: Some(session_writer),
         };
-        Ok((recording, RecordTap { samples: producer, dropped }))
+        Ok((recording, RecordTap { samples: producer, dropped, session: Some(session) }))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The session kept with the recording, to replay it.
+    pub fn session_path(&self) -> PathBuf {
+        crate::session::session_path(&self.path)
     }
 
     /// Length recorded so far.
@@ -94,6 +105,12 @@ impl Recording {
     pub(crate) fn finish(mut self) -> Result<PathBuf> {
         if let Some(writer) = self.writer.take() {
             writer.join().map_err(|_| anyhow::anyhow!("the recorder stopped unexpectedly"))??;
+        }
+        if let Some(writer) = self.session.take() {
+            writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("the session writer stopped unexpectedly"))?
+                .context("writing the session")?;
         }
         Ok(self.path.clone())
     }
@@ -121,7 +138,7 @@ fn write_wav(
         let chunk = samples.read_chunk(available - available % 2)?;
         let (a, b) = chunk.as_slices();
         for &s in a.iter().chain(b) {
-            let v = (s.clamp(-1.0, 1.0) * 8_388_607.0) as i32;
+            let v = to_24_bit(s);
             out.write_all(&v.to_le_bytes()[..3])?;
         }
         let count = a.len() + b.len();
@@ -143,7 +160,7 @@ pub fn write_wav_file(path: &Path, rate: u32, samples: &[f32]) -> Result<()> {
     let mut out = BufWriter::with_capacity(1 << 16, file);
     write_header(&mut out, rate, samples.len() as u64 / 2)?;
     for &s in &samples[..samples.len() - samples.len() % 2] {
-        let v = (s.clamp(-1.0, 1.0) * 8_388_607.0) as i32;
+        let v = to_24_bit(s);
         out.write_all(&v.to_le_bytes()[..3])?;
     }
     out.flush().with_context(|| format!("writing {}", path.display()))?;
@@ -183,7 +200,12 @@ pub fn write_float_wav_file(path: &Path, rate: u32, samples: &[f32]) -> Result<(
     Ok(())
 }
 
-fn write_header(out: &mut impl Write, rate: u32, frames: u64) -> Result<()> {
+/// A sample as the recorder writes it.
+pub(crate) fn to_24_bit(sample: f32) -> i32 {
+    (sample.clamp(-1.0, 1.0) * 8_388_607.0) as i32
+}
+
+pub(crate) fn write_header(out: &mut impl Write, rate: u32, frames: u64) -> Result<()> {
     const CHANNELS: u16 = 2;
     const BYTES: u16 = 3;
     let data =

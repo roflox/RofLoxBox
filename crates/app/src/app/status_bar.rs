@@ -109,15 +109,24 @@ impl DeckhandApp {
             .with_title("RofLoxBox — Log")
             .with_inner_size([640.0, 420.0]);
         let bar = &mut self.status_bar;
+        let inside = |ctx: &egui::Context, bar: &mut StatusBar| {
+            let mut open = true;
+            egui::Window::new("Log")
+                .open(&mut open)
+                .default_size([560.0, 360.0])
+                .show(ctx, |ui| log_contents(ui, bar));
+            bar.log_open = open;
+        };
+        // In full screen macOS makes a new window a tab of the app's, hiding
+        // the app behind it: then the log is a window inside the app.
+        if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            inside(ctx, bar);
+            return;
+        }
         ctx.show_viewport_immediate(ViewportId::from_hash_of("log"), builder, |ctx, class| {
             if class == egui::ViewportClass::Embedded {
                 // No separate windows here: a window inside the app.
-                let mut open = true;
-                egui::Window::new("Log")
-                    .open(&mut open)
-                    .default_size([560.0, 360.0])
-                    .show(ctx, |ui| log_contents(ui, bar));
-                bar.log_open = open;
+                inside(ctx, bar);
             } else {
                 egui::CentralPanel::default().show(ctx, |ui| log_contents(ui, bar));
                 if ctx.input(|i| i.viewport().close_requested()) {

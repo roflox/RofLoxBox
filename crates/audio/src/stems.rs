@@ -5,7 +5,12 @@
 //! remains of the track without them. So with every part up the deck plays exactly
 //! the original, whatever the model's stems add up to.
 
+use std::io::{BufWriter, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI16, Ordering};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::decode::{Frames, TrackAudio};
 
@@ -172,6 +177,114 @@ impl StemLayers {
     pub fn has(&self, part: usize) -> bool {
         part == INSTRUMENTS || self.layer(part).is_some()
     }
+
+    /// Whether `dir` holds stems kept with [`StemLayers::save`].
+    pub fn saved_in(dir: &Path) -> bool {
+        dir.join(SAVED).is_file()
+    }
+
+    /// Keeps the stems exactly as they are in `dir`: a 16-bit WAV of each
+    /// part (at the track's `rate`), and which blocks are separated.
+    pub fn save(&self, dir: &Path, rate: u32) -> Result<()> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut parts = Vec::new();
+        for (name, layer) in
+            [("vocals", &self.vocals), ("bass", &self.bass), ("drums", &self.drums)]
+        {
+            let Some(layer) = layer else { continue };
+            let path = dir.join(format!("{name}.wav"));
+            let file = std::fs::File::create(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            let mut out = BufWriter::with_capacity(1 << 16, file);
+            write_pcm16_header(&mut out, rate, layer.samples.len() as u64 / 2)?;
+            for sample in &layer.samples {
+                out.write_all(&sample.load(Ordering::Relaxed).to_le_bytes())?;
+            }
+            out.flush()?;
+            parts.push(SavedPart { name: name.to_owned(), scale: layer.scale });
+        }
+        let ready: String =
+            self.ready.iter().map(|r| if r.load(Ordering::Relaxed) { '1' } else { '0' }).collect();
+        let frames = [&self.vocals, &self.bass, &self.drums]
+            .into_iter()
+            .flatten()
+            .map(|l| l.samples.len() / 2)
+            .next()
+            .unwrap_or(0);
+        let saved = Saved { frames, block: self.block, ready, parts };
+        std::fs::write(dir.join(SAVED), serde_json::to_vec_pretty(&saved)?)?;
+        Ok(())
+    }
+
+    /// Stems kept with [`StemLayers::save`].
+    pub fn load(dir: &Path) -> Result<Self> {
+        let saved: Saved = serde_json::from_slice(
+            &std::fs::read(dir.join(SAVED))
+                .with_context(|| format!("reading {}", dir.display()))?,
+        )?;
+        let mut stems = Self::empty([false; 3], saved.frames, saved.block);
+        for part in &saved.parts {
+            let path = dir.join(format!("{}.wav", part.name));
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|mut f| f.read_to_end(&mut bytes))
+                .with_context(|| format!("reading {}", path.display()))?;
+            if bytes.len() < 44 || &bytes[36..40] != b"data" {
+                bail!("{} is not a stem kept by this app", path.display());
+            }
+            let samples = bytes[44..]
+                .chunks_exact(2)
+                .map(|b| AtomicI16::new(i16::from_le_bytes([b[0], b[1]])))
+                .collect();
+            let layer = Some(Layer { samples, scale: part.scale });
+            match part.name.as_str() {
+                "vocals" => stems.vocals = layer,
+                "bass" => stems.bass = layer,
+                "drums" => stems.drums = layer,
+                _ => {}
+            }
+        }
+        for (ready, flag) in stems.ready.iter().zip(saved.ready.chars()) {
+            ready.store(flag == '1', Ordering::Relaxed);
+        }
+        Ok(stems)
+    }
+}
+
+/// The description of stems kept with [`StemLayers::save`].
+const SAVED: &str = "layers.json";
+
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    frames: usize,
+    block: usize,
+    /// "1" for each block separated, "0" for one not yet.
+    ready: String,
+    parts: Vec<SavedPart>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedPart {
+    name: String,
+    /// The sample value 32767 stands for.
+    scale: f32,
+}
+
+fn write_pcm16_header(out: &mut impl Write, rate: u32, frames: u64) -> Result<()> {
+    let data = (frames * 4).min(u64::from(u32::MAX - 36)) as u32;
+    out.write_all(b"RIFF")?;
+    out.write_all(&(36 + data).to_le_bytes())?;
+    out.write_all(b"WAVEfmt ")?;
+    out.write_all(&16u32.to_le_bytes())?;
+    out.write_all(&1u16.to_le_bytes())?;
+    out.write_all(&2u16.to_le_bytes())?;
+    out.write_all(&rate.to_le_bytes())?;
+    out.write_all(&(rate * 4).to_le_bytes())?;
+    out.write_all(&4u16.to_le_bytes())?;
+    out.write_all(&16u16.to_le_bytes())?;
+    out.write_all(b"data")?;
+    out.write_all(&data.to_le_bytes())?;
+    Ok(())
 }
 
 /// A track with its parts at the given levels.

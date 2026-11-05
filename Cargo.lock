@@ -1046,6 +1046,8 @@ dependencies = [
  "anyhow",
  "cpal",
  "rtrb",
+ "serde",
+ "serde_json",
  "symphonia",
 ]
 

@@ -5,6 +5,7 @@ mod engine;
 mod eq;
 mod fx;
 mod record;
+mod session;
 mod stems;
 mod stretch;
 
@@ -16,5 +17,11 @@ pub use engine::{
 pub use eq::{EQ_MAX_DB, EQ_MIN_DB, EqSettings, Equalizer, Filter};
 pub use fx::{BeatFx, BeatFxKind, BeatFxParams, ColorFx, ColorFxKind, FxTarget};
 pub use record::{Recording, write_float_wav_file, write_wav_file};
+pub use session::{
+    Clash, Comparison, Curve, Files, FxSpan, Grid, Played, Point, Rendered, SYNC_CHECK_SECS,
+    SYNC_DRIFT_BEATS, Session, Setting, Sources, StemsSource, SyncSpan, TrackMove, TrackSpan,
+    clashes, fx_spans, lane_value, move_fx, remember_grid, remember_stems, remember_track,
+    remove_fx, restyle_fx, session_path,
+};
 pub use stems::{BASS, DRUMS, INSTRUMENTS, PARTS, StemLayers, VOCALS, fit_gains};
 pub use stretch::Stretcher;

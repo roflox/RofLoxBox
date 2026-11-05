@@ -225,6 +225,7 @@ impl DeckhandApp {
                     loaded.beats = stored.beats(loaded.duration);
                     loaded.bpm = stored.bpm.unwrap_or(loaded.bpm);
                     loaded.key = stored.key.clone();
+                    deck.remember_grid();
                 }
             }
         }

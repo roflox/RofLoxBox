@@ -159,6 +159,15 @@ impl LoadedTrack {
         if self.bpm > 0.0 { 60.0 / self.bpm } else { 0.5 }
     }
 
+    /// The beat grid as recorded sessions keep it, to redo sync.
+    pub fn session_grid(&self) -> deckhand_audio::Grid {
+        deckhand_audio::Grid {
+            bpm: self.bpm,
+            beats: self.beats.iter().map(|b| b.0).collect(),
+            bars: self.beats.iter().map(|b| b.1).collect(),
+        }
+    }
+
     /// Position in beats (fractional) at `seconds`, from the beat grid, or
     /// from the BPM if there is none.
     pub fn beat_at(&self, seconds: f64) -> f64 {
@@ -1258,7 +1267,15 @@ impl Deck {
         };
         track.set_straight_grid(anchor, number, bpm.clamp(20.0, 999.0));
         (self.edited, self.grid_edited) = (true, true);
+        self.remember_grid();
         true
+    }
+
+    /// Lets recorded sessions know the track's beat grid as it is now.
+    pub fn remember_grid(&self) {
+        if let (Some(audio), Some(track)) = (&self.audio, &self.track) {
+            deckhand_audio::remember_grid(audio, track.session_grid());
+        }
     }
 
     /// Moves the beat grid later (positive) or earlier by `seconds`.
@@ -1911,7 +1928,10 @@ impl LoadRequest {
             memory_loops,
             gain_db: stored_gain.unwrap_or_else(|| auto_gain_db(&audio)),
         };
-        Ok((track, Arc::new(audio)))
+        let audio = Arc::new(audio);
+        deckhand_audio::remember_track(&audio, &self.audio_path);
+        deckhand_audio::remember_grid(&audio, track.session_grid());
+        Ok((track, audio))
     }
 }
 

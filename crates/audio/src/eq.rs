@@ -2,7 +2,9 @@
 
 use std::f32::consts::PI;
 
-#[derive(Debug, Clone, Copy, Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub(crate) struct Biquad {
     b: [f32; 3],
     a: [f32; 2],
@@ -76,7 +78,7 @@ impl Biquad {
 }
 
 /// How the three EQ knobs work and at which frequencies.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EqSettings {
     /// Isolator: the signal is split into three bands that are turned up and
     /// down (fully left removes a band). EQ: shelving / peaking filters that
@@ -109,7 +111,7 @@ impl Default for EqSettings {
 
 /// A Linkwitz-Riley crossover of 4th order (two Butterworth stages per
 /// side): low + high add up to an all-pass, so the bands sum back flat.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct Crossover {
     low: [Biquad; 2],
     high: [Biquad; 2],
@@ -138,7 +140,7 @@ impl Crossover {
 /// Three-band DJ EQ or isolator (see [`EqSettings`]). Gains are in dB;
 /// [`EQ_MIN_DB`] and below remove the band as an isolator, and cut by
 /// 26 dB as an EQ.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Equalizer {
     rate: f32,
     settings: EqSettings,
@@ -191,6 +193,11 @@ impl Equalizer {
         }
     }
 
+    /// A band's gain in dB, as last set.
+    pub fn gain(&self, band: usize) -> f32 {
+        self.gains[band.min(2)]
+    }
+
     pub fn set_gain(&mut self, band: usize, gain_db: f32) {
         let gain_db = gain_db.clamp(EQ_MIN_DB - 40.0, EQ_MAX_DB);
         self.gains[band] = gain_db;
@@ -234,7 +241,7 @@ impl Equalizer {
 }
 
 /// One-knob DJ filter: low-pass left of center, high-pass right of center.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Filter {
     rate: f32,
     biquad: Biquad,

@@ -12,6 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig, SupportedBufferSize};
+use serde::{Deserialize, Serialize};
 
 use crate::decode::TrackAudio;
 use crate::eq::Equalizer;
@@ -27,6 +28,10 @@ const QUEUE: usize = 1024;
 /// steps, which arrive in bursts, into smooth motion (damping ≈ 0.7).
 const JOG_FOLLOW_SECS: f64 = 0.015;
 const JOG_SMOOTH_SECS: f64 = 0.008;
+/// Below this, a deck's sound counts as its low end (bass, kick).
+const LOW_HZ: f32 = 150.0;
+/// How long the editor's cuts take to fade in or out.
+const GATE_FADE_SECS: f64 = 0.005;
 /// How long a stem part takes to fade in or out fully.
 const STEM_GLIDE_SECS: f64 = 0.008;
 /// How long the stem limiter takes to let go fully.
@@ -38,7 +43,7 @@ const MAX_EXTRAPOLATION_SECS: f64 = 0.05;
 
 /// How samples between the source frames are computed when the speed or
 /// sample rate differs from the original.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Quality {
     /// Linear interpolation: cheapest, slightly dull highs and some aliasing.
     Standard,
@@ -57,7 +62,7 @@ pub struct AudioOptions {
 }
 
 /// Which side of the crossfader a channel is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrossfaderSide {
     A,
     /// Not affected by the crossfader.
@@ -73,10 +78,13 @@ enum Garbage {
     Stems(Arc<crate::stems::StemLayers>),
 }
 
-#[derive(Debug)]
+/// What the mixer can be told. Recorded in sessions (see
+/// [`crate::session`]), where tracks are named by their file.
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
     Load {
         deck: usize,
+        #[serde(with = "crate::session::track")]
         audio: Arc<TrackAudio>,
     },
     Unload {
@@ -149,6 +157,7 @@ pub enum Command {
     SetBeatFx(BeatFxParams),
     SamplerLoad {
         slot: usize,
+        #[serde(with = "crate::session::track")]
         audio: Arc<TrackAudio>,
     },
     /// Plays the slot from its start (again, if it is playing).
@@ -167,6 +176,7 @@ pub enum Command {
     SetJogResolution(f64),
     SetCrossfaderCurve(CrossfaderCurve),
     /// Starts (Some) or ends (None) taking the master into a recording.
+    #[serde(skip)]
     Record(Option<crate::record::RecordTap>),
     SetFaderCurve(FaderCurve),
     /// Off: the master is only clipped at full scale.
@@ -174,6 +184,7 @@ pub enum Command {
     /// A deck's stems for live mixing (`None` takes them away).
     SetStems {
         deck: usize,
+        #[serde(with = "crate::session::stems")]
         stems: Option<Arc<crate::stems::StemLayers>>,
     },
     /// Levels 0–1 (or more) of the vocals, instruments, bass and drums.
@@ -233,6 +244,40 @@ pub enum Command {
     /// 0.0 = only cued channels, 1.0 = only master.
     SetHeadphoneMix(f32),
     SetHeadphoneVolume(f32),
+    /// Made by sync: [`Command::SetTempo`] matching the master's tempo.
+    SyncTempo {
+        deck: usize,
+        ratio: f64,
+    },
+    /// Made by sync: [`Command::Shift`] back onto the master's beat.
+    SyncShift {
+        deck: usize,
+        seconds: f64,
+    },
+    /// Made in the session editor: lets the deck's sound through or cuts
+    /// it, fading over [`GATE_FADE_SECS`]; a new track opens it.
+    Gate {
+        deck: usize,
+        open: bool,
+    },
+    /// Made in the session editor: the deck's track plays `later` seconds
+    /// later in the set from here (earlier if negative), until it jumps.
+    MoveTrack {
+        deck: usize,
+        later: f64,
+    },
+    /// Which deck leads and which follow it (for sessions; the mixer
+    /// ignores it).
+    SyncState {
+        master: Option<usize>,
+        synced: [bool; DECKS],
+    },
+    /// The beat phase a synced deck keeps to the master's, in beats (for
+    /// sessions; the mixer ignores it).
+    SyncOffset {
+        deck: usize,
+        beats: f64,
+    },
 }
 
 /// Deck state the audio thread publishes for the UI.
@@ -542,6 +587,7 @@ where
     )?)
 }
 
+/// Kept in a [`DeckSnapshot`] too: a field added here goes there as well.
 struct DeckState {
     audio: Option<Arc<TrackAudio>>,
     /// Stems for live mixing, and their parts' levels: wanted and current
@@ -593,7 +639,19 @@ struct DeckState {
     key_ratio: f64,
     side: CrossfaderSide,
     cue: bool,
+    /// Made in the session editor: the deck's sound let through (1) or
+    /// cut (0), fading between.
+    gate: f32,
+    gate_open: bool,
     peak: f32,
+    /// Since the last look (offline only, not kept in snapshots): the
+    /// loudest the track played, and the loudest that reached the mix.
+    played_peak: f32,
+    heard_peak: f32,
+    /// The low end that reached the mix (below [`LOW_HZ`]), measured
+    /// when the mixer is told to.
+    low: crate::eq::Biquad,
+    low_peak: f32,
 }
 
 struct Mixer {
@@ -613,6 +671,8 @@ struct Mixer {
     master_peak: f32,
     master_cue: bool,
     recorder: Option<crate::record::RecordTap>,
+    /// Measure each deck's low end (offline only).
+    measure_low: bool,
     crossfader_curve: CrossfaderCurve,
     fader_curve: FaderCurve,
     limiter: bool,
@@ -626,15 +686,16 @@ struct Mixer {
 }
 
 /// One sampler slot: plays its sample once from the start.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct SamplerVoice {
+    #[serde(with = "crate::session::track_opt")]
     audio: Option<Arc<TrackAudio>>,
     position: f64,
     playing: bool,
 }
 
 /// How the crossfader blends the A and B sides.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrossfaderCurve {
     /// A long blend: one side fades in while the other fades out.
     Smooth,
@@ -646,7 +707,7 @@ pub enum CrossfaderCurve {
 }
 
 /// How the channel faders rise.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FaderCurve {
     /// Quiet for most of the travel, loud at the top.
     Slow,
@@ -716,6 +777,11 @@ fn limit_stems(sample: [f32; 2], gain: &mut f32, release: f32) -> [f32; 2] {
     [sample[0] * *gain, sample[1] * *gain]
 }
 
+/// The master's gain at `level`, as the mixer applies it.
+pub(crate) fn master_gain(level: f32) -> f32 {
+    fader_gain(level) * 1.25
+}
+
 /// Gentle limiter: transparent below ±0.8, then saturates towards ±1.
 fn limit(sample: f32) -> f32 {
     let x = sample.abs();
@@ -765,7 +831,17 @@ impl Mixer {
             // Decks 1 and 3 on the left, 2 and 4 on the right.
             side: if index.is_multiple_of(2) { CrossfaderSide::A } else { CrossfaderSide::B },
             cue: false,
+            gate: 1.0,
+            gate_open: true,
             peak: 0.0,
+            played_peak: 0.0,
+            heard_peak: 0.0,
+            low: {
+                let mut low = crate::eq::Biquad::default();
+                low.low_pass(rate as f32, LOW_HZ, std::f32::consts::FRAC_1_SQRT_2);
+                low
+            },
+            low_peak: 0.0,
         };
         Self {
             jog: None,
@@ -782,6 +858,7 @@ impl Mixer {
             master_peak: 0.0,
             master_cue: false,
             recorder: None,
+            measure_low: false,
             crossfader_curve: CrossfaderCurve::default(),
             fader_curve: FaderCurve::default(),
             limiter: true,
@@ -795,11 +872,11 @@ impl Mixer {
         }
     }
 
-    fn apply(&mut self, command: Command) {
-        match command {
-            Command::Load { deck, audio } => {
+    fn apply(&mut self, command: &Command) {
+        match *command {
+            Command::Load { deck, ref audio } => {
                 let d = &mut self.decks[deck];
-                if let Some(old) = d.audio.replace(audio) {
+                if let Some(old) = d.audio.replace(audio.clone()) {
                     // Freeing a whole track here could stall the callback.
                     let _ = self.trash.push(Garbage::Track(old));
                 }
@@ -811,6 +888,7 @@ impl Mixer {
                 (d.position, d.playing, d.nudge, d.target, d.held, d.loop_frames) =
                     (0.0, false, 0.0, None, false, None);
                 (d.velocity, d.braking, d.coasting) = (0.0, false, false);
+                (d.gate, d.gate_open) = (1.0, true);
             }
             Command::Unload { deck } => {
                 let d = &mut self.decks[deck];
@@ -839,7 +917,11 @@ impl Mixer {
                     d.target = d.held.then_some(d.position);
                 }
             }
-            Command::Shift { deck, seconds } => {
+            Command::Gate { deck, open } => self.decks[deck].gate_open = open,
+            Command::MoveTrack { deck, later } => {
+                self.apply(&Command::Shift { deck, seconds: -later });
+            }
+            Command::Shift { deck, seconds } | Command::SyncShift { deck, seconds } => {
                 let d = &mut self.decks[deck];
                 if let Some(audio) = &d.audio {
                     d.position = (d.position + seconds * f64::from(audio.sample_rate))
@@ -847,7 +929,9 @@ impl Mixer {
                     d.target = d.held.then_some(d.position);
                 }
             }
-            Command::SetTempo { deck, ratio } => self.decks[deck].tempo = ratio.clamp(0.0, 4.0),
+            Command::SetTempo { deck, ratio } | Command::SyncTempo { deck, ratio } => {
+                self.decks[deck].tempo = ratio.clamp(0.0, 4.0)
+            }
             Command::SetNudge { deck, amount } => self.decks[deck].nudge = amount.clamp(-0.9, 0.9),
             Command::SetKeyLock { deck, on } => self.decks[deck].key_lock = on,
             Command::Hold { deck, held } => {
@@ -903,9 +987,9 @@ impl Mixer {
             }
             Command::SetColorFxOn(on) => self.color_on = on,
             Command::SetBeatFx(params) => self.beat_fx.set(params),
-            Command::SamplerLoad { slot, audio } => {
+            Command::SamplerLoad { slot, ref audio } => {
                 if let Some(voice) = self.sampler.get_mut(slot) {
-                    if let Some(old) = voice.audio.replace(audio) {
+                    if let Some(old) = voice.audio.replace(audio.clone()) {
                         let _ = self.trash.push(Garbage::Track(old));
                     }
                     voice.playing = false;
@@ -934,16 +1018,13 @@ impl Mixer {
                     if steps >= 1.0 { steps } else { DEFAULT_JOG_STEPS_PER_TURN };
             }
             Command::SetCrossfaderCurve(curve) => self.crossfader_curve = curve,
-            Command::Record(tap) => {
-                // Dropping the old tap (an Arc) frees nothing large here: the
-                // writer still holds the buffer.
-                self.recorder = tap;
-            }
+            // Taken by `render`.
+            Command::Record(_) => {}
             Command::SetFaderCurve(curve) => self.fader_curve = curve,
             Command::SetLimiter(on) => self.limiter = on,
-            Command::SetStems { deck, stems } => {
+            Command::SetStems { deck, ref stems } => {
                 let d = &mut self.decks[deck];
-                if let Some(old) = std::mem::replace(&mut d.stems, stems) {
+                if let Some(old) = std::mem::replace(&mut d.stems, stems.clone()) {
                     let _ = self.trash.push(Garbage::Stems(old));
                 }
             }
@@ -958,6 +1039,162 @@ impl Mixer {
             Command::SetMasterVolume(level) => self.master = level,
             Command::SetHeadphoneMix(mix) => self.headphone_mix = mix.clamp(0.0, 1.0),
             Command::SetHeadphoneVolume(level) => self.headphone_volume = level,
+            Command::SyncState { .. } | Command::SyncOffset { .. } => {}
+        }
+    }
+
+    /// The session being recorded, if any.
+    fn session(&mut self) -> Option<&mut crate::session::SessionTap> {
+        self.recorder.as_mut()?.session.as_mut()
+    }
+
+    /// Starts or ends recording; a session starts from the mixer as it is.
+    fn set_recorder(&mut self, mut tap: Option<crate::record::RecordTap>) {
+        let now = self.clock;
+        if let Some(session) = self.session() {
+            session.end(now);
+        }
+        if let Some(session) = tap.as_mut().and_then(|t| t.session.as_mut()) {
+            session.start(|snapshot| *snapshot = self.snapshot());
+        }
+        // Dropping the old tap (an Arc) frees nothing large here: the
+        // writer still holds the buffer.
+        self.recorder = tap;
+    }
+
+    /// The mixer as it is (copies, never allocates).
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            clock: self.clock,
+            bend_sensitivity: self.bend_sensitivity,
+            jog_steps_per_turn: self.jog_steps_per_turn,
+            quality: self.quality,
+            crossfader: self.crossfader,
+            master: self.master,
+            headphone_mix: self.headphone_mix,
+            headphone_volume: self.headphone_volume,
+            master_cue: self.master_cue,
+            crossfader_curve: self.crossfader_curve,
+            fader_curve: self.fader_curve,
+            limiter: self.limiter,
+            color_on: self.color_on,
+            sampler: self.sampler.clone(),
+            sampler_volume: self.sampler_volume,
+            beat_fx: self.beat_fx.state(),
+            decks: std::array::from_fn(|i| {
+                let d = &self.decks[i];
+                DeckSnapshot {
+                    audio: d.audio.clone(),
+                    stems: d.stems.clone(),
+                    stem_target: d.stem_target,
+                    stem_level: d.stem_level,
+                    stem_gain: d.stem_gain,
+                    position: d.position,
+                    playing: d.playing,
+                    tempo: d.tempo,
+                    nudge: d.nudge,
+                    jog_events: d.jog_events,
+                    jog_next: d.jog_next,
+                    jog_bend: d.jog_bend,
+                    coasting: d.coasting,
+                    last_jog: d.last_jog,
+                    key_lock: d.key_lock,
+                    stretcher: d.stretcher.state(),
+                    target: d.target,
+                    held: d.held,
+                    velocity: d.velocity,
+                    start_secs: d.start_secs,
+                    brake_secs: d.brake_secs,
+                    braking: d.braking,
+                    loop_frames: d.loop_frames,
+                    volume: d.volume,
+                    trim: d.trim,
+                    eq: d.eq,
+                    color: d.color.state(),
+                    slip: d.slip,
+                    slip_hold: d.slip_hold,
+                    was_slipping: d.was_slipping,
+                    shadow: d.shadow,
+                    key_ratio: d.key_ratio,
+                    side: d.side,
+                    cue: d.cue,
+                    gate: d.gate,
+                    gate_open: d.gate_open,
+                }
+            }),
+        }
+    }
+
+    /// Carries on from a snapshot.
+    fn restore(&mut self, s: &Snapshot) {
+        self.clock = s.clock;
+        self.bend_sensitivity = s.bend_sensitivity;
+        self.jog_steps_per_turn = s.jog_steps_per_turn;
+        self.quality = s.quality;
+        self.crossfader = s.crossfader;
+        self.master = s.master;
+        self.headphone_mix = s.headphone_mix;
+        self.headphone_volume = s.headphone_volume;
+        self.master_cue = s.master_cue;
+        self.crossfader_curve = s.crossfader_curve;
+        self.fader_curve = s.fader_curve;
+        self.limiter = s.limiter;
+        self.color_on = s.color_on;
+        self.sampler = s.sampler.clone();
+        self.sampler_volume = s.sampler_volume;
+        self.beat_fx.restore(&s.beat_fx);
+        for (d, s) in self.decks.iter_mut().zip(&s.decks) {
+            let DeckSnapshot {
+                audio,
+                stems,
+                stem_target,
+                stem_level,
+                stem_gain,
+                position,
+                playing,
+                tempo,
+                nudge,
+                jog_events,
+                jog_next,
+                jog_bend,
+                coasting,
+                last_jog,
+                key_lock,
+                stretcher,
+                target,
+                held,
+                velocity,
+                start_secs,
+                brake_secs,
+                braking,
+                loop_frames,
+                volume,
+                trim,
+                eq,
+                color,
+                slip,
+                slip_hold,
+                was_slipping,
+                shadow,
+                key_ratio,
+                side,
+                cue,
+                gate,
+                gate_open,
+            } = s;
+            (d.audio, d.stems) = (audio.clone(), stems.clone());
+            (d.stem_target, d.stem_level, d.stem_gain) = (*stem_target, *stem_level, *stem_gain);
+            (d.position, d.playing, d.tempo, d.nudge) = (*position, *playing, *tempo, *nudge);
+            (d.jog_events, d.jog_next, d.jog_bend) = (*jog_events, *jog_next, *jog_bend);
+            (d.coasting, d.last_jog, d.key_lock) = (*coasting, *last_jog, *key_lock);
+            d.stretcher.restore(*stretcher);
+            (d.target, d.held, d.velocity) = (*target, *held, *velocity);
+            (d.start_secs, d.brake_secs, d.braking) = (*start_secs, *brake_secs, *braking);
+            (d.loop_frames, d.volume, d.trim, d.eq) = (*loop_frames, *volume, *trim, *eq);
+            d.color.restore(color);
+            (d.slip, d.slip_hold, d.was_slipping) = (*slip, *slip_hold, *was_slipping);
+            (d.shadow, d.key_ratio, d.side, d.cue) = (*shadow, *key_ratio, *side, *cue);
+            (d.gate, d.gate_open) = (*gate, *gate_open);
         }
     }
 
@@ -968,6 +1205,9 @@ impl Mixer {
         let now = self.clock;
         self.clock += frames as u64;
         while let Some(Ok((deck, steps))) = self.jog.as_mut().map(rtrb::Consumer::pop) {
+            if let Some(session) = self.session() {
+                session.jog(now, deck, steps);
+            }
             let Some(d) = self.decks.get_mut(usize::from(deck)) else { continue };
             d.last_jog = now;
             if d.playing && !d.held && !d.coasting {
@@ -975,7 +1215,7 @@ impl Mixer {
                 d.jog_next = (d.jog_next + 1) % JOG_EVENTS;
             } else {
                 let seconds = f64::from(steps) * JOG_SECONDS_PER_TURN / self.jog_steps_per_turn;
-                self.apply(Command::JogMove { deck: usize::from(deck), seconds });
+                self.apply(&Command::JogMove { deck: usize::from(deck), seconds });
             }
         }
         let window = (JOG_WINDOW_SECS * self.rate) as u64;
@@ -1010,10 +1250,23 @@ impl Mixer {
     }
 
     fn render<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T], channels: usize) {
+        let frames = out.len() / channels.max(1);
+        let now = self.clock;
         while let Ok(command) = self.commands.pop() {
-            self.apply(command);
+            match command {
+                Command::Record(tap) => self.set_recorder(tap),
+                command => {
+                    self.apply(&command);
+                    if let Some(session) = self.session() {
+                        session.command(now, command);
+                    }
+                }
+            }
         }
-        self.apply_jog(out.len() / channels.max(1));
+        if let Some(session) = self.session() {
+            session.block(now, frames);
+        }
+        self.apply_jog(frames);
         let xfade = crossfader_gains(self.crossfader, self.crossfader_curve);
         let master_gain = fader_gain(self.master) * 1.25;
         let headphone_gain = fader_gain(self.headphone_volume) * 1.25;
@@ -1021,6 +1274,7 @@ impl Mixer {
         let fx_target = self.beat_fx.params().target;
         let cubic = self.quality == Quality::High;
         let stem_glide = 1.0 / (STEM_GLIDE_SECS * self.rate) as f32;
+        let gate_step = 1.0 / (GATE_FADE_SECS * self.rate) as f32;
         let stem_release = 1.0 / (STEM_RELEASE_SECS * self.rate) as f32;
         for frame in out.chunks_mut(channels) {
             let mut master = [0f32; 2];
@@ -1116,6 +1370,14 @@ impl Mixer {
                 } else {
                     raw
                 };
+                // The editor's cuts, faded so they do not click.
+                if deck.gate_open || deck.gate > 0.0 {
+                    let target = if deck.gate_open { 1.0 } else { 0.0 };
+                    deck.gate += (target - deck.gate).clamp(-gate_step, gate_step);
+                }
+                let raw =
+                    if deck.gate < 1.0 { [raw[0] * deck.gate, raw[1] * deck.gate] } else { raw };
+                deck.played_peak = deck.played_peak.max(raw[0].abs()).max(raw[1].abs());
                 let sample = [raw[0] * deck.trim, raw[1] * deck.trim];
                 let sample = deck.eq.process(sample);
                 let sample = if self.color_on { deck.color.process(sample) } else { sample };
@@ -1134,6 +1396,11 @@ impl Mixer {
                         master[channel] += post;
                     }
                     deck.peak = deck.peak.max(post.abs());
+                    deck.heard_peak = deck.heard_peak.max(post.abs());
+                    if self.measure_low {
+                        let low = deck.low.process(channel, post);
+                        deck.low_peak = deck.low_peak.max(low.abs());
+                    }
                     if deck.cue {
                         cue[channel] += sample[channel];
                     }
@@ -1196,7 +1463,6 @@ impl Mixer {
             }
         }
 
-        let frames = out.len() / channels.max(1);
         let buffer_secs = frames as f64 / self.rate;
         let now = self.shared.epoch.elapsed().as_nanos() as u64;
         for (deck, meter) in self.decks.iter_mut().zip(&self.shared.decks) {
@@ -1221,6 +1487,211 @@ impl Mixer {
         }
         self.master_peak *= 0.9;
     }
+}
+
+/// The mixer at one moment: enough to carry on from there in a replay,
+/// all but what its echoes and reverbs still ring with.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Snapshot {
+    /// Frames the mixer had played.
+    pub(crate) clock: u64,
+    bend_sensitivity: f64,
+    jog_steps_per_turn: f64,
+    quality: Quality,
+    crossfader: f32,
+    master: f32,
+    headphone_mix: f32,
+    headphone_volume: f32,
+    master_cue: bool,
+    crossfader_curve: CrossfaderCurve,
+    fader_curve: FaderCurve,
+    limiter: bool,
+    color_on: bool,
+    #[serde(with = "crate::session::array")]
+    sampler: [SamplerVoice; SAMPLER_SLOTS],
+    sampler_volume: f32,
+    beat_fx: crate::fx::BeatFxState,
+    decks: [DeckSnapshot; DECKS],
+}
+
+/// A [`DeckState`] in a [`Snapshot`].
+#[derive(Debug, Serialize, Deserialize)]
+struct DeckSnapshot {
+    #[serde(with = "crate::session::track_opt")]
+    audio: Option<Arc<TrackAudio>>,
+    #[serde(with = "crate::session::stems")]
+    stems: Option<Arc<crate::stems::StemLayers>>,
+    stem_target: [f32; crate::stems::PARTS],
+    stem_level: [f32; crate::stems::PARTS],
+    stem_gain: f32,
+    position: f64,
+    playing: bool,
+    tempo: f64,
+    nudge: f64,
+    #[serde(with = "crate::session::array")]
+    jog_events: [(u64, f32); JOG_EVENTS],
+    jog_next: usize,
+    jog_bend: f64,
+    coasting: bool,
+    last_jog: u64,
+    key_lock: bool,
+    stretcher: crate::stretch::StretchState,
+    target: Option<f64>,
+    held: bool,
+    velocity: f64,
+    start_secs: f64,
+    brake_secs: f64,
+    braking: bool,
+    loop_frames: Option<(f64, f64)>,
+    volume: f32,
+    trim: f32,
+    eq: Equalizer,
+    color: crate::fx::ColorFxState,
+    slip: bool,
+    slip_hold: bool,
+    was_slipping: bool,
+    shadow: f64,
+    key_ratio: f64,
+    side: CrossfaderSide,
+    cue: bool,
+    #[serde(default = "open_gate")]
+    gate: f32,
+    #[serde(default = "is_open")]
+    gate_open: bool,
+}
+
+/// Sessions from before the editor's cuts have their gates open.
+fn open_gate() -> f32 {
+    1.0
+}
+
+fn is_open() -> bool {
+    true
+}
+
+impl Snapshot {
+    /// A knob or fader as it stood.
+    pub(crate) fn setting(&self, setting: crate::session::Setting) -> f64 {
+        use crate::session::Setting;
+        let deck = |d: usize| &self.decks[d.min(DECKS - 1)];
+        match setting {
+            Setting::Volume(d) => f64::from(deck(d).volume),
+            Setting::Trim(d) => f64::from(deck(d).trim),
+            Setting::Eq(d, band) => f64::from(deck(d).eq.gain(band)),
+            Setting::Filter(d) => f64::from(deck(d).color.position()),
+            Setting::Tempo(d) => deck(d).tempo,
+            Setting::Crossfader => f64::from(self.crossfader),
+            Setting::Master => f64::from(self.master),
+        }
+    }
+
+    /// The Beat FX unit's settings.
+    pub(crate) fn beat_fx(&self) -> BeatFxParams {
+        self.beat_fx.params()
+    }
+
+    /// The channel fader's and crossfader's curves, and the Color FX type.
+    pub(crate) fn curves(&self) -> (FaderCurve, CrossfaderCurve, crate::fx::ColorFxKind) {
+        (self.fader_curve, self.crossfader_curve, self.decks[0].color.kind())
+    }
+
+    /// Whether a deck's Master Tempo (key lock) was on.
+    pub(crate) fn key_lock(&self, deck: usize) -> bool {
+        self.decks[deck].key_lock
+    }
+
+    /// A deck's stems.
+    pub(crate) fn stems(&self, deck: usize) -> Option<&Arc<crate::stems::StemLayers>> {
+        self.decks[deck].stems.as_ref()
+    }
+
+    /// A deck's track and whether it was playing.
+    pub(crate) fn deck(&self, deck: usize) -> (Option<&Arc<TrackAudio>>, bool) {
+        let d = &self.decks[deck];
+        (d.audio.as_ref(), d.playing)
+    }
+}
+
+/// A snapshot of a newly started mixer, to be filled in later (allocates,
+/// so not on the audio thread).
+pub(crate) fn blank_snapshot(rate: u32) -> Box<Snapshot> {
+    let (_, commands) = rtrb::RingBuffer::new(1);
+    let (trash, _) = rtrb::RingBuffer::new(1);
+    Box::new(Mixer::new(rate, commands, trash, Arc::new(Shared::default())).snapshot())
+}
+
+/// The mixer without an audio device, replaying a session.
+pub(crate) struct Offline {
+    mixer: Mixer,
+    commands: rtrb::Producer<Command>,
+    jog: rtrb::Producer<JogEvent>,
+    trash: rtrb::Consumer<Garbage>,
+}
+
+impl Offline {
+    /// A mixer carrying on from `snapshot`.
+    pub(crate) fn new(rate: u32, snapshot: &Snapshot) -> Self {
+        let (commands, command_rx) = rtrb::RingBuffer::new(QUEUE);
+        let (trash_tx, trash) = rtrb::RingBuffer::new(QUEUE);
+        let (jog, jog_rx) = rtrb::RingBuffer::new(QUEUE);
+        let mut mixer = Mixer::new(rate, command_rx, trash_tx, Arc::new(Shared::default()));
+        mixer.jog = Some(jog_rx);
+        mixer.restore(snapshot);
+        mixer.measure_low = true;
+        Self { mixer, commands, jog, trash }
+    }
+
+    /// Takes effect with the next buffer, as with the audio device.
+    pub(crate) fn command(&mut self, command: Command) -> Result<()> {
+        self.commands.push(command).map_err(|_| anyhow!("too many commands at one moment"))
+    }
+
+    pub(crate) fn jog(&mut self, deck: u8, steps: i16) -> Result<()> {
+        self.jog.push((deck, steps)).map_err(|_| anyhow!("too much jog movement at one moment"))
+    }
+
+    /// Plays one buffer of interleaved stereo.
+    pub(crate) fn render(&mut self, out: &mut [f32]) {
+        self.mixer.render(out, 2);
+        while self.trash.pop().is_ok() {}
+    }
+
+    /// The loudest a deck's track played since the last call, the loudest
+    /// that reached the mix, and the loudest of its low end there.
+    pub(crate) fn take_peaks(&mut self, deck: usize) -> (f32, f32, f32) {
+        let d = &mut self.mixer.decks[deck];
+        let peaks = (d.played_peak, d.heard_peak, d.low_peak);
+        (d.played_peak, d.heard_peak, d.low_peak) = (0.0, 0.0, 0.0);
+        peaks
+    }
+
+    /// A deck as it is after the last buffer.
+    pub(crate) fn deck(&self, deck: usize) -> DeckView {
+        let d = &self.mixer.decks[deck];
+        let rate = d.audio.as_ref().map_or(1.0, |a| f64::from(a.sample_rate));
+        DeckView {
+            loaded: d.audio.is_some(),
+            seconds: d.position / rate,
+            tempo: d.tempo,
+            playing: d.playing,
+            handled: d.jog_bend != 0.0
+                || d.coasting
+                || d.held
+                || d.nudge != 0.0
+                || d.target.is_some(),
+        }
+    }
+}
+
+/// A deck in an [`Offline`] mixer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeckView {
+    pub(crate) loaded: bool,
+    pub(crate) seconds: f64,
+    pub(crate) tempo: f64,
+    pub(crate) playing: bool,
+    /// Nudged, bent or held by the jog right now.
+    pub(crate) handled: bool,
 }
 
 #[cfg(test)]

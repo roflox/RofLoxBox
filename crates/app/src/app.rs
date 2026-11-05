@@ -7,6 +7,7 @@ mod history;
 mod hotplug;
 mod keyboard;
 mod library_tree;
+mod mix_editor;
 mod recording;
 mod selection;
 mod session;
@@ -76,10 +77,12 @@ const MIXER_MASTER_PARTS: [crate::parts::MixerPart; 4] = [
     crate::parts::MixerPart::PhonesMix,
     crate::parts::MixerPart::PhonesLevel,
 ];
-/// How often synced decks are checked for phase drift.
-const DRIFT_CHECK: Duration = Duration::from_millis(500);
+/// How often synced decks are checked for phase drift (the same as when
+/// an edited session is synced again).
+const DRIFT_CHECK: Duration =
+    Duration::from_millis((deckhand_audio::SYNC_CHECK_SECS * 1000.0) as u64);
 /// Phase error (in beats) that sync corrects.
-const DRIFT_LIMIT: f64 = 0.02;
+const DRIFT_LIMIT: f64 = deckhand_audio::SYNC_DRIFT_BEATS;
 /// Auto master: below this gain (about −30 dB) the master has left the mix…
 const OUT_OF_MIX: f32 = 0.03;
 /// …and a deck must be above this one (about −20 dB) to take over, so a
@@ -111,6 +114,10 @@ pub struct DeckhandApp {
     /// only then does leaving the mix pass MASTER on.
     master_heard: Option<usize>,
     last_drift_check: Instant,
+    /// The sync state and phase offsets last told to the engine, for
+    /// recorded sessions.
+    sync_sent: Option<(Option<usize>, [bool; DECKS])>,
+    offsets_sent: [Option<f64>; DECKS],
     crossfader: f32,
     master_volume: f32,
     headphone_mix: f32,
@@ -148,6 +155,11 @@ pub struct DeckhandApp {
     show_diagnostics: bool,
     /// The master being recorded.
     recording: Option<deckhand_audio::Recording>,
+    /// A session being replayed into a WAV.
+    replay: Option<recording::Replay>,
+    /// PERFORMANCE or EDIT (a recorded set as a little DAW).
+    mode: mix_editor::Mode,
+    edit_view: mix_editor::EditView,
     /// The deck each side of the controller drives (left 1/3, right 2/4).
     active_decks: [usize; 2],
     keyboard: keyboard::KeyboardMixer,
@@ -252,6 +264,8 @@ impl DeckhandApp {
             master: None,
             master_heard: None,
             last_drift_check: Instant::now(),
+            sync_sent: None,
+            offsets_sent: [None; DECKS],
             crossfader: 0.0,
             master_volume: 0.8,
             headphone_mix: 0.0,
@@ -302,6 +316,14 @@ impl DeckhandApp {
             stems_for: Default::default(),
             stem_models: crate::stems::load_models(&crate::stems::models_dir()),
             recording: None,
+            replay: None,
+            // Test aid: start in EDIT mode with this session.
+            mode: if std::env::var_os("DECKHAND_EDIT_SESSION").is_some() {
+                mix_editor::Mode::Edit
+            } else {
+                mix_editor::Mode::Performance
+            },
+            edit_view: mix_editor::EditView::default(),
             moved_window: false,
             hotplug: Default::default(),
             was_bending: [false; DECKS],
@@ -416,6 +438,8 @@ impl DeckhandApp {
         if app.config.prefs.rekordbox_at_start {
             app.rekordbox_at_start();
         }
+        // Test aid: start with the log open.
+        app.status_bar.log_open = std::env::var_os("DECKHAND_SHOW_LOG").is_some();
         if app.screenshot.is_some() || app.autoplay {
             let ids = app.visible_track_ids();
             let decks = if app.config.four_decks { DECKS } else { 2 };
@@ -880,7 +904,7 @@ impl DeckhandApp {
         let ratio = master_bpm / track.bpm;
         if target.sync_ratio.is_none_or(|r| (r - ratio).abs() > 1e-6) {
             target.sync_ratio = Some(ratio);
-            target.apply_tempo(engine);
+            engine.send(Command::SyncTempo { deck, ratio: target.tempo_ratio() });
         }
         // While the DJ nudges, leave the phase alone; afterwards keep the
         // offset they chose (the grid can be off, so they get the last word).
@@ -896,7 +920,7 @@ impl DeckhandApp {
             error -= error.round();
             if error.abs() > DRIFT_LIMIT {
                 let seconds = track.time_of_beat(beat - error) - track.time_of_beat(beat);
-                engine.send(Command::Shift { deck, seconds });
+                engine.send(Command::SyncShift { deck, seconds });
             }
         }
     }
@@ -926,6 +950,23 @@ impl DeckhandApp {
             if self.decks[deck].sync {
                 let playing = self.engine.as_ref().is_some_and(|e| e.is_playing(deck));
                 self.follow_master(deck, check_drift && playing);
+            }
+        }
+        // For recorded sessions, so an edited one can be synced again: who
+        // leads, who follows, and the phase each keeps.
+        let synced = std::array::from_fn(|d| self.decks[d].sync);
+        let offsets: [f64; DECKS] = std::array::from_fn(|d| self.decks[d].phase_offset);
+        let Some(engine) = self.engine.as_mut() else { return };
+        if self.sync_sent != Some((master, synced))
+            && engine.send(Command::SyncState { master, synced })
+        {
+            self.sync_sent = Some((master, synced));
+        }
+        for (deck, offset) in offsets.into_iter().enumerate() {
+            if self.offsets_sent[deck] != Some(offset)
+                && engine.send(Command::SyncOffset { deck, beats: offset })
+            {
+                self.offsets_sent[deck] = Some(offset);
             }
         }
     }
@@ -1452,9 +1493,12 @@ impl DeckhandApp {
 
 impl eframe::App for DeckhandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let performing = self.mode == mix_editor::Mode::Performance;
         // Before anything is drawn, so focused widgets don't take the arrows.
-        self.mixing_keys(ctx);
-        self.library_keys(ctx);
+        if performing {
+            self.mixing_keys(ctx);
+            self.library_keys(ctx);
+        }
         // winit's window teardown can trip an AppKit exception on recent macOS;
         // nothing needs cleaning up, so leave directly.
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1503,6 +1547,7 @@ impl eframe::App for DeckhandApp {
         self.poll_stems(ctx);
         self.poll_explorer(ctx);
         self.poll_usb(ctx);
+        self.poll_replay(ctx);
         self.check_controllers(ctx);
         self.save_session(false);
         self.finish_doubles();
@@ -1527,7 +1572,8 @@ impl eframe::App for DeckhandApp {
         }
 
         self.top_bar(ctx);
-        if self.config.show_waveforms {
+        let performing = self.mode == mix_editor::Mode::Performance;
+        if performing && self.config.show_waveforms {
             let vertical = self.config.vertical_waveforms;
             egui::TopBottomPanel::top("waveforms").show(ctx, |ui| {
                 if !vertical {
@@ -1536,7 +1582,7 @@ impl eframe::App for DeckhandApp {
                 self.waveform_toolbar(ui);
             });
         }
-        if self.config.show_fx {
+        if performing && self.config.show_fx {
             egui::TopBottomPanel::top("fx").show(ctx, |ui| self.fx_panel(ui));
         }
         self.update_status();
@@ -1575,14 +1621,18 @@ impl eframe::App for DeckhandApp {
             });
         }
         self.status_bar(ctx);
-        if self.config.show_library {
+        if performing && self.config.show_library {
             egui::TopBottomPanel::bottom("library")
                 .resizable(true)
                 .default_height(if self.config.four_decks { 200.0 } else { 300.0 })
                 .show(ctx, |ui| self.library_ui(ui, ctx));
             self.reveal_playlist = false;
         }
-        egui::CentralPanel::default().show(ctx, |ui| self.central(ui));
+        if performing {
+            egui::CentralPanel::default().show(ctx, |ui| self.central(ui));
+        } else {
+            egui::CentralPanel::default().show(ctx, |ui| self.edit_view(ui));
+        }
         if self.show_controller {
             self.controller_window(ctx);
         }
@@ -1612,6 +1662,12 @@ impl DeckhandApp {
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(crate::APP_NAME).on_hover_text(format!("Version {}", crate::VERSION));
+                ui.separator();
+                use mix_editor::Mode;
+                ui.selectable_value(&mut self.mode, Mode::Performance, "PERFORMANCE")
+                    .on_hover_text("Play: decks, mixer and library");
+                ui.selectable_value(&mut self.mode, Mode::Edit, "EDIT")
+                    .on_hover_text("Change a recorded set: its tracks and every knob and fader");
                 ui.separator();
 
                 let device = self

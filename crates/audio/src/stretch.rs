@@ -8,6 +8,8 @@
 //! grain would have continued with, within a small window around the
 //! playback position, which avoids phase cancellation in the cross-fade.
 
+use serde::{Deserialize, Serialize};
+
 use crate::decode::Frames;
 
 /// Grain length in seconds; grains overlap by half.
@@ -18,6 +20,14 @@ const SEARCH_SECS: f64 = 0.012;
 const COMPARE_STRIDE: usize = 4;
 /// Candidate starts tried in the coarse pass, before refining around the best.
 const COARSE_STEP: i64 = 8;
+
+/// Where a [`Stretcher`] is in its grains.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct StretchState {
+    current: Option<f64>,
+    previous: f64,
+    offset: usize,
+}
 
 #[derive(Debug)]
 pub struct Stretcher {
@@ -45,6 +55,15 @@ impl Stretcher {
             })
             .collect();
         Self { hop, rise, current: None, previous: 0.0, offset: 0 }
+    }
+
+    /// Where it is in its grains.
+    pub(crate) fn state(&self) -> StretchState {
+        StretchState { current: self.current, previous: self.previous, offset: self.offset }
+    }
+
+    pub(crate) fn restore(&mut self, state: StretchState) {
+        (self.current, self.previous, self.offset) = (state.current, state.previous, state.offset);
     }
 
     /// Forgets the grain in progress, e.g. after the stretcher was bypassed.

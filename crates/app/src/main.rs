@@ -39,6 +39,10 @@ fn main() -> eframe::Result {
         .with_inner_size([1440.0, 920.0])
         .with_title(format!("{APP_NAME} {VERSION}"))
         .with_icon(window_icon());
+    // Test aid: start in full screen.
+    if std::env::var_os("DECKHAND_FULLSCREEN").is_some() {
+        viewport = viewport.with_fullscreen(true);
+    }
     // Test aid: open the window at "x,y" (for example on another monitor).
     if let Some((x, y)) = std::env::var("DECKHAND_WINDOW_POS")
         .ok()

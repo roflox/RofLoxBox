@@ -328,8 +328,9 @@ impl Effects {
                 .iter()
                 .filter_map(|&(slot, ref path)| {
                     let name = path.file_stem()?.to_string_lossy().into_owned();
-                    let audio = decode_file(path).ok()?;
-                    Some((slot, name, Arc::new(audio)))
+                    let audio = Arc::new(decode_file(path).ok()?);
+                    deckhand_audio::remember_track(&audio, path);
+                    Some((slot, name, audio))
                 })
                 .collect();
             let _ = tx.send(loaded);

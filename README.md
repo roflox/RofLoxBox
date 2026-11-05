@@ -98,6 +98,30 @@ the deck plays the original exactly.
 Dragging a running waveform stops the deck under the mouse, and it plays on
 from there when let go. Preferences → Appearance has dark and light themes.
 
+### Recording and EDIT mode (work in progress)
+
+> **EDIT mode is a work in progress.** It is new, not finished and not yet
+> tested much in real use: expect rough edges and changes, and keep your
+> original recordings (edits are saved as new files and never change them).
+
+**REC** records the master to a folder of its own in `Music/RofLoxBox
+Recordings`: the 24-bit WAV, a `.session` file with everything played (the
+tracks, every knob, fader, button and jog movement, sync, beat grids) and the
+stems the decks used. Preferences → Audio → **Replay a session…** plays a
+session through the mixer again; it comes out identical to the recording,
+sample for sample.
+
+**EDIT** in the top bar turns the app into a little DAW for a recorded set:
+open a session and each deck shows what it played (waveform and beat grid),
+with a lane of automation for each knob and fader (volume, trim, EQ, filter,
+tempo, crossfader, master) and the Beat FX as blocks. Drag, add or delete
+points, draw them as steps, lines or curves, flatten or ramp a stretch;
+move a track's audio (or the whole clip, by its title), shrink it by its
+edges, split it with a double click and cut pieces out with a right click;
+**Bass clashes** marks where two decks' low end plays together. Undo, Redo
+and History keep the last 100 changes; **Save edit…** writes a new session
+and **Render** plays it into a new WAV.
+
 ### Installers
 
 Each script leaves its results in `target/dist/`:
@@ -108,7 +132,9 @@ Each script leaves its results in `target/dist/`:
 - `scripts/build-windows.sh` (on macOS or Linux): a self-contained 64-bit
   Windows 10/11 `RofLoxBox.exe` in a `.zip` and, with NSIS
   (`brew install makensis`), a `-setup.exe` installer. Needs
-  `cargo install cargo-xwin` and `rustup target add x86_64-pc-windows-msvc`.
+  `cargo install cargo-xwin`, `rustup target add x86_64-pc-windows-msvc` and
+  `brew install innoextract` (it unpacks a ready-built OpenSSL for Windows,
+  downloaded once and checked against its published hash).
 - `scripts/build-linux.sh` (on Linux, with `libasound2-dev`): a `.tar.gz`
   and, with `appimagetool`, an AppImage.
 

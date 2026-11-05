@@ -6,6 +6,8 @@
 
 use std::f32::consts::PI;
 
+use serde::{Deserialize, Serialize};
+
 use crate::eq::{Biquad, Filter};
 
 /// Longest delay a Beat FX can use, in seconds.
@@ -169,7 +171,7 @@ impl PitchShifter {
 }
 
 /// First-order all-pass stage of a phaser.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct PhaseStage {
     x1: [f32; 2],
     y1: [f32; 2],
@@ -185,7 +187,7 @@ impl PhaseStage {
 }
 
 /// Six-stage phaser with its notches at `freq`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 struct Phaser {
     stages: [PhaseStage; 6],
     feedback: [f32; 2],
@@ -207,7 +209,7 @@ impl Phaser {
 }
 
 /// The Beat FX types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum BeatFxKind {
     Delay,
     #[default]
@@ -273,14 +275,14 @@ impl BeatFxKind {
 }
 
 /// Where the Beat FX is inserted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FxTarget {
     Channel(usize),
     Master,
     Sampler,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BeatFxParams {
     pub kind: BeatFxKind,
     pub on: bool,
@@ -351,6 +353,38 @@ impl BeatFx {
 
     pub fn params(&self) -> BeatFxParams {
         self.params
+    }
+
+    /// All but the echo, reverb and pitch buffers.
+    pub(crate) fn state(&self) -> BeatFxState {
+        BeatFxState {
+            params: self.params,
+            delay_frames: self.delay_frames,
+            phasers: self.phasers,
+            filter: self.filter,
+            tone: self.tone,
+            lfo: self.lfo,
+            roll_filled: self.roll_filled,
+            tick: self.tick,
+            was_on: self.was_on,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, state: &BeatFxState) {
+        let BeatFxState {
+            params,
+            delay_frames,
+            phasers,
+            filter,
+            tone,
+            lfo,
+            roll_filled,
+            tick,
+            was_on,
+        } = *state;
+        (self.params, self.delay_frames, self.phasers) = (params, delay_frames, phasers);
+        (self.filter, self.tone, self.lfo) = (filter, tone, lfo);
+        (self.roll_filled, self.tick, self.was_on) = (roll_filled, tick, was_on);
     }
 
     pub fn set(&mut self, params: BeatFxParams) {
@@ -490,7 +524,7 @@ impl BeatFx {
 }
 
 /// The Color FX types; the knob of each channel controls the one selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ColorFxKind {
     #[default]
     Filter,
@@ -550,6 +584,25 @@ impl ColorFx {
             hold_count: 0.0,
             noise: 0x1234_5678,
         }
+    }
+
+    /// All but the echo, reverb and pitch buffers.
+    pub(crate) fn state(&self) -> ColorFxState {
+        ColorFxState {
+            kind: self.kind,
+            position: self.position,
+            filter: self.filter,
+            tone: self.tone,
+            held: self.held,
+            hold_count: self.hold_count,
+            noise: self.noise,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, state: &ColorFxState) {
+        let ColorFxState { kind, position, filter, tone, held, hold_count, noise } = *state;
+        (self.kind, self.position, self.filter, self.tone) = (kind, position, filter, tone);
+        (self.held, self.hold_count, self.noise) = (held, hold_count, noise);
     }
 
     pub fn set_kind(&mut self, kind: ColorFxKind) {
@@ -620,6 +673,49 @@ impl ColorFx {
             }
             ColorFxKind::Pitch => self.pitch.process(x, 2f32.powf(self.position)),
         }
+    }
+}
+
+/// What a [`BeatFx`] carries from frame to frame, apart from its buffers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct BeatFxState {
+    params: BeatFxParams,
+    delay_frames: f32,
+    phasers: [Phaser; 2],
+    filter: Biquad,
+    tone: Biquad,
+    lfo: f32,
+    roll_filled: f32,
+    tick: u32,
+    was_on: bool,
+}
+
+/// What a [`ColorFx`] carries from frame to frame, apart from its buffers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct ColorFxState {
+    kind: ColorFxKind,
+    position: f32,
+    filter: Filter,
+    tone: Biquad,
+    held: [f32; 2],
+    hold_count: f32,
+    noise: u32,
+}
+
+impl BeatFxState {
+    pub(crate) fn params(&self) -> BeatFxParams {
+        self.params
+    }
+}
+
+impl ColorFxState {
+    pub(crate) fn kind(&self) -> ColorFxKind {
+        self.kind
+    }
+
+    /// The channel knob.
+    pub(crate) fn position(&self) -> f32 {
+        self.position
     }
 }
 

@@ -1013,6 +1013,30 @@ fn live_loop(queue: &Receiver<LiveMessage>, events: &Sender<Event>, cache: &Path
     }
 }
 
+/// Where a recorded session finds a live job's stems again.
+fn session_source(job: &LiveJob, dir: &Path) -> deckhand_audio::StemsSource {
+    deckhand_audio::StemsSource {
+        track: job.input.clone(),
+        dir: dir.to_path_buf(),
+        stems: job.model.stems.clone(),
+    }
+}
+
+/// The stems a recorded session names, from the stem cache, for `track` as
+/// decoded from their file.
+pub fn session_stems(
+    source: &deckhand_audio::StemsSource,
+    track: &deckhand_audio::TrackAudio,
+) -> Result<deckhand_audio::StemLayers> {
+    // Kept with the recording.
+    if deckhand_audio::StemLayers::saved_in(&source.dir) {
+        return deckhand_audio::StemLayers::load(&source.dir);
+    }
+    let stems = find_stems(&source.dir, &source.stems, &BTreeMap::new())
+        .map_err(|_| anyhow!("they are no longer in the stem cache"))?;
+    layers(&stems, track)
+}
+
 /// Plays the cached stems of a track separated before, else gives the deck
 /// silent stems at once (its parts can be switched straight away) and lines
 /// the track up for separating piece by piece.
@@ -1031,10 +1055,12 @@ fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut V
         touch(&dir);
         match layers(&stems, &job.audio) {
             Ok(layers) => {
+                let layers = Arc::new(layers);
+                deckhand_audio::remember_stems(&layers, session_source(&job, &dir));
                 let _ = events.send(Event::Live {
                     deck: job.deck,
                     input: job.input.clone(),
-                    stems: Arc::new(layers),
+                    stems: layers,
                 });
             }
             Err(err) => fail(err),
@@ -1047,6 +1073,8 @@ fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut V
     let block = (BLOCK_SECS * f64::from(track.sample_rate)) as usize;
     let frames = track.frames();
     let layers = Arc::new(deckhand_audio::StemLayers::empty(has, frames, block));
+    // Kept in `dir` once separated, where a replayed session finds them.
+    deckhand_audio::remember_stems(&layers, session_source(&job, &dir));
     let _ = events.send(Event::Live {
         deck: job.deck,
         input: job.input.clone(),
