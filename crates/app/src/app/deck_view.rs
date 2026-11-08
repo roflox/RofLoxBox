@@ -58,6 +58,8 @@ struct Parts<'a> {
     stem_model: bool,
     /// Stems on the decks are on in Preferences.
     live_stems: bool,
+    /// The pads are in the layout: GRID edits the grid in their place.
+    pads_shown: bool,
     out: DeckOut,
 }
 
@@ -103,6 +105,7 @@ impl DeckhandApp {
             tempo_ranges: self.config.prefs.tempo_ranges.clone(),
             stem_model,
             live_stems: self.config.prefs.live_stems,
+            pads_shown: layout.is_shown(DeckElement::Pads),
             out: DeckOut::default(),
         };
         let area = ui.horizontal_top(|ui| {
@@ -595,12 +598,15 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for mode in PadMode::ALL {
                     let label = if compact { pad_mode_short(mode) } else { mode.label() };
-                    if ui.selectable_label(deck.pad_mode == mode, RichText::new(label).small()).clicked() {
+                    if ui.selectable_label(deck.pad_mode == mode && !deck.grid_edit, RichText::new(label).small()).clicked() {
+                        deck.grid_edit = false;
                         deck.set_pad_mode(mode);
                     }
                 }
             });
         }
+        // Its ◀ ▶ are for the pads, which the grid editor covers.
+        E::PadShift if deck.grid_edit => {}
         E::PadShift => {
             // SHIFT works like the controller's: latch it on screen or hold
             // the keyboard's Shift key.
@@ -630,6 +636,10 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                     p.out.pad_events.extend([(action, true), (action, false)]);
                 }
             });
+        }
+        E::Pads if deck.grid_edit => {
+            let pads = PadBox::new(ui, compact);
+            pads.show(ui, |ui| grid_editor(ui, deck, position, index, compact, &mut p.out));
         }
         E::Pads if deck.pad_mode == PadMode::PadFx => {
             let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
@@ -721,76 +731,16 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             });
         }
         E::GridEdit => {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if toggle(ui, deck.grid_edit, "GRID")
-                    .on_hover_text("Edit the beat grid: move it, set the BPM, set the downbeat")
-                    .clicked()
-                {
-                    deck.grid_edit = !deck.grid_edit;
-                }
-                if !deck.grid_edit {
-                    return;
-                }
-                let Some(track) = &deck.track else { return };
-                let (straight, old_bpm) = (track.grid_is_straight(), track.grid_bpm());
-                let mut bpm = old_bpm;
-                ui.add_enabled_ui(straight, |ui| {
-                    // Shift-click for bigger steps.
-                    let step = if ui.input(|i| i.modifiers.shift) { 0.010 } else { 0.001 };
-                    let mut edited = false;
-                    if ui.small_button("◀").on_hover_text("Move the grid 1 ms earlier (Shift: 10 ms)").clicked() {
-                        edited |= deck.shift_grid(-step);
-                    }
-                    if ui.small_button("▶").on_hover_text("Move the grid 1 ms later (Shift: 10 ms)").clicked() {
-                        edited |= deck.shift_grid(step);
-                    }
-                    ui.separator();
-                    let mut changed = false;
-                    if ui.small_button("−").on_hover_text("BPM −0.01").clicked() {
-                        (bpm, changed) = (bpm - 0.01, true);
-                    }
-                    // Only a drag or typing counts: a BPM the field merely
-                    // shows (even one outside its range) is no edit.
-                    let field = ui
-                        .add(
-                            egui::DragValue::new(&mut bpm)
-                                .speed(0.01)
-                                .fixed_decimals(2)
-                                .range(20.0..=999.0)
-                                .clamp_existing_to_range(false),
-                        )
-                        .on_hover_text("The track's BPM: drag, or click and type");
-                    changed |= field.changed()
-                        && (field.dragged() || field.has_focus() || field.lost_focus());
-                    if ui.small_button("+").on_hover_text("BPM +0.01").clicked() {
-                        (bpm, changed) = (bpm + 0.01, true);
-                    }
-                    if ui.small_button("÷2").on_hover_text("Halve the BPM").clicked() {
-                        (bpm, changed) = (bpm / 2.0, true);
-                    }
-                    if ui.small_button("×2").on_hover_text("Double the BPM").clicked() {
-                        (bpm, changed) = (bpm * 2.0, true);
-                    }
-                    // Kept to two decimals, like the display.
-                    if changed && (bpm - old_bpm).abs() > 1e-9 {
-                        edited |= deck.set_grid_bpm((bpm * 100.0).round() / 100.0);
-                    }
-                    ui.separator();
-                    if ui.small_button("1.1 here").on_hover_text("Put a downbeat exactly at the playhead").clicked() {
-                        edited |= deck.downbeat_here(position);
-                    }
-                    if ui.small_button("1 ↻").on_hover_text("Make the beat nearest the playhead beat 1 of its bar (no beat moves)").clicked() {
-                        edited |= deck.renumber_here(position);
-                    }
-                    if edited {
-                        let bpm = deck.track.as_ref().map_or(0.0, |t| t.bpm);
-                        p.out.status = Some(format!("Deck {}: beat grid edited ({bpm:.2} BPM)", index + 1));
-                    }
-                })
-                .response
-                .on_disabled_hover_text("This track's grid changes tempo; only one-tempo grids can be edited for now");
-            });
+            if toggle(ui, deck.grid_edit, "GRID")
+                .on_hover_text("Edit the beat grid in place of the pads: set where it starts, move it, set the BPM")
+                .clicked()
+            {
+                deck.grid_edit = !deck.grid_edit;
+            }
+            // Without the pads on screen, the editor opens under the button.
+            if deck.grid_edit && !p.pads_shown {
+                ui.vertical(|ui| grid_editor(ui, deck, position, index, compact, &mut p.out));
+            }
         }
         E::TempoFader => {
             // Like on a CDJ, pulling the fader down makes the track faster.
@@ -820,6 +770,98 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 }
             });
         }
+    }
+}
+
+/// The beat-grid editor, shown in the pads' box while GRID is on.
+fn grid_editor(ui: &mut Ui, deck: &mut Deck, position: f64, index: usize, compact: bool, out: &mut DeckOut) {
+    let Some(track) = &deck.track else {
+        ui.label(RichText::new("Load a track to edit its beat grid").weak());
+        return;
+    };
+    let (straight, old_bpm) = (track.grid_is_straight(), track.grid_bpm());
+    let size = if compact { 12.0 } else { 14.0 };
+    let width = ui.available_width();
+    let row_height = if compact { 24.0 } else { 30.0 };
+    let wide = |ui: &mut Ui, n: f32| vec2((ui.available_width() - (n - 1.0) * PAD_GAP) / n, row_height);
+    let mut edited = false;
+    ui.add_enabled_ui(straight, |ui| {
+        ui.set_width(width);
+        ui.horizontal(|ui| {
+            // The main one: the grid's beat 1 goes where the needle is.
+            let renumber = wide(ui, 4.0);
+            let start = egui::Button::new(RichText::new("GRID STARTS HERE").strong().size(size))
+                .fill(CUE_COLOR.gamma_multiply(0.35))
+                .min_size(vec2(ui.available_width() - renumber.x - PAD_GAP, row_height));
+            if ui
+                .add(start)
+                .on_hover_text("Put beat 1 (a downbeat) exactly at the needle; the grid runs on from it at the same BPM")
+                .clicked()
+            {
+                edited |= deck.downbeat_here(position);
+            }
+            if ui
+                .add(egui::Button::new("1 ↻").min_size(renumber))
+                .on_hover_text("Make the beat nearest the needle beat 1 of its bar (no beat moves)")
+                .clicked()
+            {
+                edited |= deck.renumber_here(position);
+            }
+        });
+        // Moving the grid: 1, 10 and 100 ms a click.
+        ui.horizontal(|ui| {
+            let w = wide(ui, 6.0);
+            for (label, ms) in [("◀◀◀", -100), ("◀◀", -10), ("◀", -1), ("▶", 1), ("▶▶", 10), ("▶▶▶", 100_i32)] {
+                let way = if ms < 0 { "earlier" } else { "later" };
+                if ui
+                    .add(egui::Button::new(label).min_size(w))
+                    .on_hover_text(format!("Move the grid {} ms {way}", ms.abs()))
+                    .clicked()
+                {
+                    edited |= deck.shift_grid(f64::from(ms) / 1000.0);
+                }
+            }
+        });
+        let mut bpm = old_bpm;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            let w = wide(ui, 5.0);
+            if ui.add(egui::Button::new("−").min_size(w)).on_hover_text("BPM −0.01").clicked() {
+                (bpm, changed) = (bpm - 0.01, true);
+            }
+            // Only a drag or typing counts: a BPM the field merely
+            // shows (even one outside its range) is no edit.
+            let field = ui
+                .add_sized(
+                    w,
+                    egui::DragValue::new(&mut bpm)
+                        .speed(0.01)
+                        .fixed_decimals(2)
+                        .range(20.0..=999.0)
+                        .clamp_existing_to_range(false),
+                )
+                .on_hover_text("The track's BPM: drag, or click and type");
+            changed |= field.changed() && (field.dragged() || field.has_focus() || field.lost_focus());
+            if ui.add(egui::Button::new("+").min_size(w)).on_hover_text("BPM +0.01").clicked() {
+                (bpm, changed) = (bpm + 0.01, true);
+            }
+            if ui.add(egui::Button::new("÷2").min_size(w)).on_hover_text("Halve the BPM").clicked() {
+                (bpm, changed) = (bpm / 2.0, true);
+            }
+            if ui.add(egui::Button::new("×2").min_size(w)).on_hover_text("Double the BPM").clicked() {
+                (bpm, changed) = (bpm * 2.0, true);
+            }
+        });
+        // Kept to two decimals, like the display.
+        if changed && (bpm - old_bpm).abs() > 1e-9 {
+            edited |= deck.set_grid_bpm((bpm * 100.0).round() / 100.0);
+        }
+    })
+    .response
+    .on_disabled_hover_text("This track's grid changes tempo; only one-tempo grids can be edited for now");
+    if edited {
+        let bpm = deck.track.as_ref().map_or(0.0, |t| t.bpm);
+        out.status = Some(format!("Deck {}: beat grid edited ({bpm:.2} BPM)", index + 1));
     }
 }
 
