@@ -225,7 +225,8 @@ Each script leaves its results in `target/dist/`:
   and, with `appimagetool`, an AppImage.
 
 Every commit is a new version, `0.<number of commits>.0`
-(`scripts/version.sh`; shown in the window title). Each push to `main` runs
+(`scripts/version.sh`; shown in the window title). A build with uncommitted
+changes is marked as the version they will become: `0.<commits + 1>.0-dev`. Each push to `main` runs
 `.github/workflows/release.yml`, which builds all three on GitHub's machines
 and publishes them as the release `v0.<n>.0`, with their SHA-256 sums.
 `scripts/publish-release.sh [--draft]` uploads the builds of this version
