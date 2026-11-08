@@ -6,6 +6,12 @@ DJ library tooling in Rust, compatible with Pioneer DJ hardware. No
 subscriptions, accounts, telemetry or ads. See [PLAN.md](PLAN.md) for scope,
 ground rules and roadmap.
 
+![Performance view: two decks with waveforms, pads and the library](docs/screenshots/performance.png)
+*Performance view*
+
+![EDIT view](docs/screenshots/edit.png)
+*EDIT view*
+
 ## Disclaimer: back up your rekordbox library first
 
 RofLoxBox can read and **change rekordbox's own library** (`master.db`, its
