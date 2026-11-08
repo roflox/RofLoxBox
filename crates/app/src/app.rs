@@ -147,6 +147,8 @@ pub struct DeckhandApp {
     editing_layout: bool,
     /// Name typed for saving the deck layout as a preset.
     preset_name: String,
+    /// How the last preset export or import went.
+    preset_note: Option<String>,
     moved_window: bool,
     hotplug: hotplug::Hotplug,
     /// Each deck's jog bend at the last frame, to notice it ending.
@@ -226,7 +228,7 @@ impl DeckhandApp {
         if !config.prefs.keep_stems {
             crate::stems::clear_cache();
         }
-        crate::widgets::apply_theme(&cc.egui_ctx, config.prefs.theme);
+        crate::widgets::apply_theme(&cc.egui_ctx, config.prefs.theme, config.prefs.text_scale);
         let keyboard = keyboard::KeyboardMixer::new(&config.prefs.key_bindings);
         if let Some(root) = std::env::var_os("DECKHAND_LIBRARY") {
             config.library_root = Some(root.into());
@@ -356,6 +358,7 @@ impl DeckhandApp {
             }),
             autoplay: std::env::var_os("DECKHAND_AUTOPLAY").is_some(),
             preset_name: String::new(),
+            preset_note: None,
             config,
         };
         app.restore_session();
@@ -679,6 +682,7 @@ impl DeckhandApp {
                 analysis: p.analysis,
                 analyze_on_load: p.analyze_on_load,
                 auto_gain: p.auto_gain,
+                waveform_detail: p.waveform_detail,
             };
         }
         let Some(engine) = self.engine.as_mut() else { return };
@@ -740,6 +744,41 @@ impl DeckhandApp {
                 self.config.save();
             }
         });
+        ui.horizontal(|ui| {
+            let any = !self.config.layout_presets.is_empty();
+            if ui
+                .add_enabled(any, egui::Button::new("Export presets…"))
+                .on_hover_text("Saves your presets to a file, to keep or use on another computer")
+                .clicked()
+            {
+                self.preset_note = Some(export_presets(&self.config.layout_presets));
+            }
+            if ui
+                .button("Import presets…")
+                .on_hover_text("Adds the presets in a file; ones with the same name are replaced")
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import view presets")
+                    .add_filter("RofLoxBox presets", &["json"])
+                    .pick_file()
+            {
+                self.preset_note = Some(match import_presets(&path) {
+                    Ok(presets) => {
+                        let count = presets.len();
+                        for preset in presets {
+                            self.config.layout_presets.retain(|p| p.name != preset.name);
+                            self.config.layout_presets.push(preset);
+                        }
+                        self.config.save();
+                        format!("Imported {count} preset{}", if count == 1 { "" } else { "s" })
+                    }
+                    Err(err) => format!("Not imported: {err:#}"),
+                });
+            }
+        });
+        if let Some(note) = &self.preset_note {
+            ui.label(RichText::new(note).small().weak());
+        }
         if let Some(i) = delete {
             self.config.layout_presets.remove(i);
             self.config.save();
@@ -1494,9 +1533,14 @@ impl DeckhandApp {
 impl eframe::App for DeckhandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let performing = self.mode == mix_editor::Mode::Performance;
-        // Before anything is drawn, so focused widgets don't take the arrows.
         if performing {
-            self.mixing_keys(ctx);
+            self.edit_view.stop_playing();
+        }
+        // Before anything is drawn, so focused widgets don't take the arrows.
+        // Mixing keys only when performing; changing keys in Preferences
+        // works in EDIT mode too.
+        self.mixing_keys(ctx, performing);
+        if performing {
             self.library_keys(ctx);
         }
         // winit's window teardown can trip an AppKit exception on recent macOS;
@@ -2870,6 +2914,15 @@ impl DeckhandApp {
                 added: t.track.date_added.clone(),
                 bitrate: Some(t.track.bitrate).filter(|b| *b > 0),
                 comment: t.track.comment.clone(),
+                artwork: t.artwork_path.as_deref().map(|p| {
+                    crate::artwork::Cover::File(library.root.join(p.trim_start_matches('/')))
+                }),
+                preview: Some(crate::preview::Source {
+                    audio: library.resolve(&t.track.file_path),
+                    analysis: (!t.track.analyze_path.is_empty())
+                        .then(|| library.resolve(&t.track.analyze_path)),
+                }),
+                cues: None,
             })
             .collect();
         sort_rows(&mut rows, self.config.sort);
@@ -3019,7 +3072,7 @@ impl DeckhandApp {
         );
         self.show_prefs = open;
         if prefs_changed {
-            crate::widgets::apply_theme(ctx, self.config.prefs.theme);
+            crate::widgets::apply_theme(ctx, self.config.prefs.theme, self.config.prefs.text_scale);
             self.config.save();
             self.apply_preferences();
         }
@@ -3543,4 +3596,52 @@ mod tests {
         assert_eq!(loudest_in_mix(&[None, Some(1.0), Some(1.0)], 0), Some(1));
         assert_eq!(loudest_in_mix(&[Some(1.0), Some(1.0)], 0), Some(1));
     }
+}
+
+/// A file of view presets, as exported.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PresetFile {
+    rofloxbox_view_presets: u32,
+    presets: Vec<crate::layout::LayoutPreset>,
+}
+
+/// Writes `presets` where the user picks; says how it went.
+fn export_presets(presets: &[crate::layout::LayoutPreset]) -> String {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Export view presets")
+        .set_file_name("RofLoxBox view presets.json")
+        .add_filter("RofLoxBox presets", &["json"])
+        .save_file()
+    else {
+        return "Not exported".into();
+    };
+    let file = PresetFile { rofloxbox_view_presets: 1, presets: presets.to_vec() };
+    let written = serde_json::to_string_pretty(&file)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| Ok(std::fs::write(&path, text)?));
+    match written {
+        Ok(()) => format!(
+            "Exported {} preset{} to {}",
+            presets.len(),
+            if presets.len() == 1 { "" } else { "s" },
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        Err(err) => format!("Not exported: {err:#}"),
+    }
+}
+
+/// The presets in an exported file, their layouts repaired for this
+/// version.
+fn import_presets(path: &std::path::Path) -> anyhow::Result<Vec<crate::layout::LayoutPreset>> {
+    let text = std::fs::read_to_string(path)?;
+    let file: PresetFile = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("not a RofLoxBox presets file ({e})"))?;
+    Ok(file
+        .presets
+        .into_iter()
+        .map(|mut preset| {
+            preset.layout.repair();
+            preset
+        })
+        .collect())
 }

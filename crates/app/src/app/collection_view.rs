@@ -1374,6 +1374,12 @@ impl DeckhandApp {
                 added: date(t.added),
                 bitrate: t.bitrate,
                 comment: t.comment.clone(),
+                artwork: t.has_artwork.then(|| crate::artwork::Cover::Embedded(t.path.clone())),
+                preview: Some(crate::preview::Source {
+                    audio: t.path.clone(),
+                    analysis: t.analysis.clone(),
+                }),
+                cues: Some(crate::preview::track_marks(t)),
             })
             .collect();
         sort_rows(&mut rows, self.config.sort);

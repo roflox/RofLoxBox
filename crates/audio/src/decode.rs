@@ -154,7 +154,12 @@ pub fn decode_file(path: &Path) -> Result<TrackAudio> {
 /// Peak amplitude per 1/150 s, the resolution of rekordbox's detail
 /// waveforms; used when a track has no analysis files.
 pub fn peak_waveform(audio: &TrackAudio) -> Vec<f32> {
-    let step = (audio.sample_rate as usize / 150).max(1);
+    peak_waveform_at(audio, 150)
+}
+
+/// Peak level per `1 / per_second` s.
+pub fn peak_waveform_at(audio: &TrackAudio, per_second: u32) -> Vec<f32> {
+    let step = (audio.sample_rate / per_second.max(1)).max(1) as usize;
     audio
         .samples
         .chunks(step * 2)
@@ -166,12 +171,17 @@ pub fn peak_waveform(audio: &TrackAudio) -> Vec<f32> {
 /// 1/150 s, each 0.0–1.0 relative to the loudest column; used for 3-band
 /// waveforms when a track has no such analysis.
 pub fn band_waveform(audio: &TrackAudio) -> Vec<[f32; 3]> {
+    band_waveform_at(audio, 150)
+}
+
+/// [`band_waveform`] with `per_second` columns a second.
+pub fn band_waveform_at(audio: &TrackAudio, per_second: u32) -> Vec<[f32; 3]> {
     // One-pole low-passes are enough for a display.
     let coefficient =
         |cutoff: f32| 1.0 - (-2.0 * std::f32::consts::PI * cutoff / audio.sample_rate as f32).exp();
     let (a_low, a_high) = (coefficient(200.0), coefficient(2_500.0));
     let (mut low, mut below_high) = (0f32, 0f32);
-    let step = (audio.sample_rate as usize / 150).max(1);
+    let step = (audio.sample_rate / per_second.max(1)).max(1) as usize;
     let mut columns = Vec::with_capacity(audio.frames() / step + 1);
     let mut peak = [0f32; 3];
     for (i, frame) in audio.samples.chunks_exact(2).enumerate() {

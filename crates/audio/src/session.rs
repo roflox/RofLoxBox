@@ -464,6 +464,7 @@ fn deck_of(event: &Logged) -> Option<usize> {
             | C::SetTrim { deck, .. }
             | C::SetEq { deck, .. }
             | C::SetFilter { deck, .. }
+            | C::SetColorAmount { deck, .. }
             | C::SetCrossfaderAssign { deck, .. }
             | C::SetHeadphoneCue { deck, .. }
             | C::SyncTempo { deck, .. }
@@ -683,11 +684,13 @@ impl Repeats {
             | C::SetCrossfaderAssign { deck, .. }
             | C::SetHeadphoneCue { deck, .. } => (deck, 0),
             C::SetEq { deck, band, .. } => (deck, band),
+            C::SetColorAmount { deck, kind, .. } => (deck, kind.index()),
             C::SetQuality(_)
             | C::SetMasterCue(_)
             | C::SetColorFx(_)
             | C::SetColorFxOn(_)
             | C::SetBeatFx(_)
+            | C::SetBeatFxDepth(_)
             | C::SetSamplerVolume(_)
             | C::SetEqSettings(_)
             | C::SetBendSensitivity(_)
@@ -712,11 +715,16 @@ pub enum Setting {
     Trim(usize),
     /// Band 0 = low, 1 = mid, 2 = high.
     Eq(usize, usize),
-    /// The channel's Color FX knob.
+    /// The channel's Color FX knob as played live (sessions are given
+    /// [`Setting::ColorFx`] lanes instead when edited).
     Filter(usize),
+    /// One Color FX type's amount on a channel.
+    ColorFx(usize, crate::fx::ColorFxKind),
     Tempo(usize),
     Crossfader,
     Master,
+    /// The Beat FX depth (wet/dry), shown inside the effects' blocks.
+    BeatFxDepth,
 }
 
 impl Setting {
@@ -730,9 +738,9 @@ impl Setting {
                 Self::Eq(d, 2),
                 Self::Eq(d, 1),
                 Self::Eq(d, 0),
-                Self::Filter(d),
-                Self::Tempo(d),
             ]);
+            all.extend(crate::fx::ColorFxKind::ALL.map(|kind| Self::ColorFx(d, kind)));
+            all.push(Self::Tempo(d));
         }
         all.extend([Self::Crossfader, Self::Master]);
         all
@@ -745,11 +753,15 @@ impl Setting {
             Command::SetTrim { deck, gain } => (Self::Trim(deck), f64::from(gain)),
             Command::SetEq { deck, band, db } => (Self::Eq(deck, band.min(2)), f64::from(db)),
             Command::SetFilter { deck, position } => (Self::Filter(deck), f64::from(position)),
+            Command::SetColorAmount { deck, kind, position } => {
+                (Self::ColorFx(deck, kind), f64::from(position))
+            }
             Command::SetTempo { deck, ratio } | Command::SyncTempo { deck, ratio } => {
                 (Self::Tempo(deck), ratio)
             }
             Command::SetCrossfader(position) => (Self::Crossfader, f64::from(position)),
             Command::SetMasterVolume(level) => (Self::Master, f64::from(level)),
+            Command::SetBeatFxDepth(depth) => (Self::BeatFxDepth, f64::from(depth)),
             _ => return None,
         })
     }
@@ -762,18 +774,23 @@ impl Setting {
             Self::Trim(deck) => Command::SetTrim { deck, gain: v },
             Self::Eq(deck, band) => Command::SetEq { deck, band, db: v },
             Self::Filter(deck) => Command::SetFilter { deck, position: v },
+            Self::ColorFx(deck, kind) => Command::SetColorAmount { deck, kind, position: v },
             Self::Tempo(deck) => Command::SetTempo { deck, ratio: value },
             Self::Crossfader => Command::SetCrossfader(v),
             Self::Master => Command::SetMasterVolume(v),
+            Self::BeatFxDepth => Command::SetBeatFxDepth(v),
         }
     }
 
     pub fn deck(self) -> Option<usize> {
         match self {
-            Self::Volume(d) | Self::Trim(d) | Self::Eq(d, _) | Self::Filter(d) | Self::Tempo(d) => {
-                Some(d)
-            }
-            Self::Crossfader | Self::Master => None,
+            Self::Volume(d)
+            | Self::Trim(d)
+            | Self::Eq(d, _)
+            | Self::Filter(d)
+            | Self::ColorFx(d, _)
+            | Self::Tempo(d) => Some(d),
+            Self::Crossfader | Self::Master | Self::BeatFxDepth => None,
         }
     }
 
@@ -784,20 +801,29 @@ impl Setting {
             Self::Eq(_, 2) => "EQ high",
             Self::Eq(_, 1) => "EQ mid",
             Self::Eq(_, _) => "EQ low",
-            Self::Filter(_) => "Filter",
+            Self::Filter(_) => "Color FX",
+            Self::ColorFx(_, kind) => match kind {
+                crate::fx::ColorFxKind::Filter => "Filter intensity",
+                crate::fx::ColorFxKind::Space => "Space intensity",
+                crate::fx::ColorFxKind::DubEcho => "Dub Echo intensity",
+                crate::fx::ColorFxKind::Crush => "Crush intensity",
+                crate::fx::ColorFxKind::Noise => "Noise intensity",
+                crate::fx::ColorFxKind::Pitch => "Pitch intensity",
+            },
             Self::Tempo(_) => "Tempo",
             Self::Crossfader => "Crossfader",
             Self::Master => "Master",
+            Self::BeatFxDepth => "Beat FX depth",
         }
     }
 
     /// The knob's travel, bottom to top.
     pub fn range(self) -> (f64, f64) {
         match self {
-            Self::Volume(_) | Self::Master => (0.0, 1.0),
+            Self::Volume(_) | Self::Master | Self::BeatFxDepth => (0.0, 1.0),
             Self::Trim(_) => (0.0, 4.0),
             Self::Eq(..) => (f64::from(crate::eq::EQ_MIN_DB), f64::from(crate::eq::EQ_MAX_DB)),
-            Self::Filter(_) | Self::Crossfader => (-1.0, 1.0),
+            Self::Filter(_) | Self::ColorFx(..) | Self::Crossfader => (-1.0, 1.0),
             Self::Tempo(_) => (0.84, 1.16),
         }
     }
@@ -806,17 +832,19 @@ impl Setting {
     pub fn neutral(self) -> f64 {
         match self {
             Self::Volume(_) | Self::Master | Self::Trim(_) | Self::Tempo(_) => 1.0,
-            Self::Eq(..) | Self::Filter(_) | Self::Crossfader => 0.0,
+            Self::Eq(..) | Self::Filter(_) | Self::ColorFx(..) | Self::Crossfader => 0.0,
+            Self::BeatFxDepth => 0.5,
         }
     }
 
     /// A value as the knob shows it.
     pub fn display(self, value: f64) -> String {
         match self {
-            Self::Volume(_) | Self::Master => format!("{:.0}%", value * 100.0),
+            Self::Volume(_) | Self::Master | Self::BeatFxDepth => format!("{:.0}%", value * 100.0),
             Self::Trim(_) => format!("{:+.1} dB", 20.0 * value.max(1e-6).log10()),
             Self::Eq(..) => format!("{value:+.1} dB"),
             Self::Filter(_) | Self::Crossfader => format!("{value:+.2}"),
+            Self::ColorFx(..) => format!("{:+.0}%", value * 100.0),
             Self::Tempo(_) => format!("{:+.2}%", (value - 1.0) * 100.0),
         }
     }
@@ -1229,6 +1257,60 @@ impl Session {
         changes
     }
 
+    /// Gives each Color FX type of each channel its own lane: the knobs,
+    /// the type switch and the on switch as played become every type's
+    /// amount over time ([`Command::SetColorAmount`]), which sounds the
+    /// same. Returns whether there was anything to change.
+    pub fn split_color_fx(&mut self) -> bool {
+        use crate::fx::ColorFxKind;
+        let played = |event: &Logged| {
+            matches!(
+                event,
+                Logged::Command(
+                    Command::SetFilter { .. } | Command::SetColorFx(_) | Command::SetColorFxOn(_)
+                )
+            )
+        };
+        if !self.events.iter().any(|(_, event)| played(event)) {
+            return false;
+        }
+        const DECKS: usize = crate::engine::DECKS;
+        let snapshot = &self.snapshot;
+        let (mut kind, mut on) = (snapshot.color_kind(), snapshot.color_on());
+        let mut knobs: [f32; DECKS] = std::array::from_fn(|d| snapshot.color_knob(d));
+        let mut amounts: [[f32; 6]; DECKS] = std::array::from_fn(|d| {
+            std::array::from_fn(|k| snapshot.color_amount(d, ColorFxKind::ALL[k]))
+        });
+        let mut events = Vec::with_capacity(self.events.len());
+        for (at, event) in std::mem::take(&mut self.events) {
+            match event {
+                Logged::Command(Command::SetFilter { deck, position }) => {
+                    knobs[deck.min(DECKS - 1)] = position.clamp(-1.0, 1.0);
+                }
+                Logged::Command(Command::SetColorFx(k)) => kind = k,
+                Logged::Command(Command::SetColorFxOn(o)) => on = o,
+                other => {
+                    events.push((at, other));
+                    continue;
+                }
+            }
+            for (deck, knob) in knobs.iter().enumerate() {
+                for (k, unit) in ColorFxKind::ALL.into_iter().enumerate() {
+                    let amount = if on && unit == kind { *knob } else { 0.0 };
+                    if amounts[deck][k] != amount {
+                        amounts[deck][k] = amount;
+                        let command =
+                            Command::SetColorAmount { deck, kind: unit, position: amount };
+                        events.push((at, Logged::Command(command)));
+                    }
+                }
+            }
+        }
+        self.events = events;
+        self.curves.retain(|setting, _| !matches!(setting, Setting::Filter(_)));
+        true
+    }
+
     /// Replaces the Beat FX unit's changes with `changes` (as
     /// [`Session::beat_fx`] gives them), each moved to a buffer start.
     pub fn set_beat_fx(&mut self, changes: &[(u64, BeatFxParams)]) {
@@ -1244,6 +1326,7 @@ impl Session {
             }
         }
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        self.fit_fx_depth();
     }
 
     /// The pieces of `span` heard, between the editor's cuts (all of it
@@ -1427,6 +1510,57 @@ impl Session {
         // Stable: at one moment the order holds, and the end stays last.
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         self.curves.insert(setting, points);
+        if setting == Setting::BeatFxDepth {
+            self.fit_fx_depth();
+        }
+    }
+
+    /// Gives the Beat FX depth a lane of its own ([`Setting::BeatFxDepth`]):
+    /// each depth the Beat FX changes set as played becomes a point of it,
+    /// which sounds the same. Returns whether there was anything to do.
+    pub fn split_fx_depth(&mut self) -> bool {
+        if self.events.iter().any(|(_, e)| matches!(e, Logged::Command(Command::SetBeatFxDepth(_))))
+        {
+            return false;
+        }
+        let mut depth = self.snapshot.beat_fx().depth;
+        let mut events = Vec::with_capacity(self.events.len());
+        let mut changed = false;
+        for (at, event) in std::mem::take(&mut self.events) {
+            let new = match &event {
+                Logged::Command(Command::SetBeatFx(params)) if params.depth != depth => {
+                    Some(params.depth)
+                }
+                _ => None,
+            };
+            events.push((at, event));
+            if let Some(new) = new {
+                depth = new;
+                changed = true;
+                events.push((at, Logged::Command(Command::SetBeatFxDepth(new))));
+            }
+        }
+        self.events = events;
+        changed
+    }
+
+    /// Every Beat FX change takes the depth its lane has there, so moving,
+    /// adding or restyling an effect doesn't undo the lane.
+    fn fit_fx_depth(&mut self) {
+        if !self
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Logged::Command(Command::SetBeatFxDepth(_))))
+        {
+            return;
+        }
+        let start = self.snapshot.clock;
+        let lane = self.lane(Setting::BeatFxDepth);
+        for (at, event) in &mut self.events {
+            if let Logged::Command(Command::SetBeatFx(params)) = event {
+                params.depth = lane_value(&lane, at.saturating_sub(start)) as f32;
+            }
+        }
     }
 
     /// The buffer size in force at `at` (frames from the start), and where
@@ -2791,6 +2925,56 @@ mod tests {
         let rendered = session.render_to_wav(&file.with_file_name("again.wav"), Some(&wav), |_| {});
         let comparison = rendered.unwrap().comparison.unwrap();
         assert_eq!(comparison.differing, 0, "{comparison:?}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// The Beat FX depth gets a lane: sounding the same at first, then
+    /// followed by the effect's changes when edited.
+    #[test]
+    fn beat_fx_depth_lane() {
+        let a = track(48_000, 3.0, 0);
+        let path = PathBuf::from("/music/fx.wav");
+        remember_track(&a, &path);
+        let echo = BeatFxParams {
+            kind: crate::fx::BeatFxKind::Echo,
+            on: true,
+            depth: 0.3,
+            ..BeatFxParams::default()
+        };
+        let file = record(
+            "depth",
+            vec![
+                Command::Load { deck: 0, audio: a.clone() },
+                Command::SetPlaying { deck: 0, playing: true },
+                Command::SetBeatFx(echo),
+            ],
+            2.0,
+        );
+        let mut session = Session::read(&file, Tracks([(path, a)].into_iter().collect())).unwrap();
+        let render = |s: &Session| {
+            let mut out = Vec::new();
+            s.render(|b| Ok(out.extend_from_slice(b))).unwrap();
+            out
+        };
+        let before = render(&session);
+        assert!(session.split_fx_depth());
+        assert_eq!(render(&session), before, "the lane sounds the same");
+        let lane = session.lane(Setting::BeatFxDepth);
+        assert!(lane.iter().any(|p| (p.value - 0.3).abs() < 1e-6), "{lane:?}");
+        // Full depth from a second in: heard, and the effect's own change
+        // there takes the lane's depth.
+        let half = session.snap(48_000);
+        session.set_lane(
+            Setting::BeatFxDepth,
+            &[Point::step(0, 0.3), Point { at: half, value: 1.0, curve: Curve::Step }],
+        );
+        let mut changes = session.beat_fx();
+        changes.push((half, BeatFxParams { beat_secs: 0.25, ..echo }));
+        session.set_beat_fx(&changes);
+        let later: Vec<f32> =
+            session.beat_fx().iter().filter(|c| c.0 >= half).map(|c| c.1.depth).collect();
+        assert_eq!(later, [1.0]);
+        assert_ne!(render(&session), before);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 

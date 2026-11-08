@@ -58,17 +58,35 @@ fn lock(ui: &mut Ui, locked: &mut bool) -> bool {
     *locked != before
 }
 
-/// Dark or light; returns whether it changed.
+/// Dark, light or the system's, and the text size; returns whether
+/// anything changed.
 pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
-    let before = p.theme;
+    let before = (p.theme, p.text_scale);
     section(ui, "Theme", |ui| {
         ui.radio_value(&mut p.theme, Theme::Dark, "Dark");
         ui.radio_value(&mut p.theme, Theme::Light, "Light");
+        ui.radio_value(&mut p.theme, Theme::System, "System")
+            .on_hover_text("Follows the system's light or dark appearance.");
         ui.label(
             RichText::new("Waveforms stay dark, so their colors keep reading.").small().weak(),
         );
     });
-    p.theme != before
+    section(ui, "Text size", |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut p.text_scale, 50..=200).suffix(" %").step_by(5.0));
+            if ui.add_enabled(p.text_scale != 100, egui::Button::new("Reset")).clicked() {
+                p.text_scale = 100;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Text in lists, menus and windows. Deck and waveform labels keep their size.",
+            )
+            .small()
+            .weak(),
+        );
+    });
+    (p.theme, p.text_scale) != before
 }
 
 /// Deck settings; returns whether anything changed.
@@ -115,6 +133,20 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
             ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
             ui.label(RichText::new("On the decks and in the track lists, whatever the tags say.").small().weak());
+        });
+        section(ui, "Waveform detail", |ui| {
+            use crate::waveform::WaveformDetail;
+            ui.radio_value(&mut p.waveform_detail, WaveformDetail::Standard, "Standard (rekordbox's)");
+            ui.radio_value(&mut p.waveform_detail, WaveformDetail::High, "High (4× finer)");
+            ui.label(
+                RichText::new(
+                    "High works the decks' waveforms out from the audio at 600 columns a second \
+                     instead of 150: sharper when zoomed in, a finer overview, colours from the \
+                     bands. For tracks loaded from now on.",
+                )
+                .small()
+                .weak(),
+            );
         });
         section(ui, "Analysis", |ui| {
             use crate::deck::AnalysisMethod;
@@ -219,6 +251,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
             p.analysis = defaults.analysis;
+            p.waveform_detail = defaults.waveform_detail;
             p.auto_master = defaults.auto_master;
             p.tempo_ranges = defaults.tempo_ranges.clone();
             p.analyze_on_load = defaults.analyze_on_load;

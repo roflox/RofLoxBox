@@ -13,7 +13,7 @@ pub use collection::{
     Track, TrackEdit,
 };
 pub use rekordbox_xml::{XmlLibrary, XmlNode, XmlTrack, path_from_location};
-pub use scan::{AUDIO_EXTENSIONS, Scan, ScannedFile, file_stamp, read_file};
+pub use scan::{AUDIO_EXTENSIONS, Scan, ScannedFile, embedded_artwork, file_stamp, read_file};
 
 use std::path::PathBuf;
 

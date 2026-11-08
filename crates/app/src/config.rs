@@ -42,6 +42,12 @@ pub struct Config {
     /// The # column was added to saved column sets once (later removals stick).
     #[serde(default)]
     pub number_column_added: bool,
+    /// The Preview column was added to saved column sets once.
+    #[serde(default)]
+    pub preview_column_added: bool,
+    /// Beat grid edit was moved next to GATE in saved layouts once.
+    #[serde(default)]
+    pub grid_moved: bool,
     #[serde(default)]
     pub prefs: Preferences,
     /// Collection folders shown closed in the sidebar.
@@ -169,6 +175,8 @@ pub enum Theme {
     #[default]
     Dark,
     Light,
+    /// Follows the system's light or dark appearance.
+    System,
 }
 
 /// How decks and the mixer behave (Preferences window), like rekordbox's
@@ -179,6 +187,8 @@ pub struct Preferences {
     /// How keys are written on the decks and in the lists.
     pub key_notation: crate::deck::KeyNotation,
     pub theme: Theme,
+    /// Text size in percent of the normal size.
+    pub text_scale: u32,
     /// The stem separation model (its folder's name in `models/`).
     pub stem_model: String,
     /// Decks can play stems (separating, mixing parts); off, decks play
@@ -213,6 +223,8 @@ pub struct Preferences {
     pub key_bindings: std::collections::BTreeMap<String, String>,
     /// How tracks without rekordbox's analysis are analysed.
     pub analysis: crate::deck::AnalysisMethod,
+    /// How finely the decks' waveforms are drawn.
+    pub waveform_detail: crate::waveform::WaveformDetail,
     /// A loaded track without a beat grid or key gets them detected.
     pub analyze_on_load: bool,
     /// No loading onto a playing deck.
@@ -298,6 +310,7 @@ impl Default for Preferences {
             memory_call_lock: true,
             key_notation: Default::default(),
             theme: Theme::Dark,
+            text_scale: 100,
             stem_model: String::new(),
             stems_folder: None,
             live_stems: true,
@@ -312,6 +325,7 @@ impl Default for Preferences {
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),
+            waveform_detail: Default::default(),
             analyze_on_load: true,
             call_resizes_loop: false,
             gate_while_playing: false,
@@ -446,6 +460,8 @@ impl Default for Config {
             columns: crate::browser::TrackColumn::default_set(),
             sort: None,
             number_column_added: true,
+            preview_column_added: true,
+            grid_moved: true,
             prefs: Preferences::default(),
             recordings_dir: None,
             collapsed_folders: Vec::new(),
@@ -491,6 +507,18 @@ impl Config {
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default();
+        if !config.preview_column_added {
+            config.preview_column_added = true;
+            let preview = crate::browser::TrackColumn::Preview;
+            if !config.columns.contains(&preview) {
+                let at = config
+                    .columns
+                    .iter()
+                    .position(|c| *c == crate::browser::TrackColumn::Title)
+                    .map_or(config.columns.len(), |i| i + 1);
+                config.columns.insert(at, preview);
+            }
+        }
         if !config.number_column_added {
             config.number_column_added = true;
             if !config.columns.contains(&crate::browser::TrackColumn::Number) {
@@ -499,6 +527,11 @@ impl Config {
         }
         config.layout_two.repair();
         config.layout_four.repair();
+        if !config.grid_moved {
+            config.grid_moved = true;
+            config.layout_two.grid_next_to_gate();
+            config.layout_four.grid_next_to_gate();
+        }
         config.screen_layout.repair();
         config
     }

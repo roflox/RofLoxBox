@@ -108,6 +108,8 @@ enum KeyAction {
     Zoom(i32),
     ZoomReset,
     Record,
+    /// EDIT mode: 0 Normal tool, 1 Select tool, 2 split at the selection.
+    Edit(u8),
 }
 
 impl KeyAction {
@@ -285,9 +287,43 @@ fn bindings() -> Vec<Binding> {
     all
 }
 
+/// EDIT mode's keys: apart from the mixing keys (they never both apply),
+/// so the same keys can be used.
+const EDIT: &str = "EDIT: ";
+
+fn edit_bindings() -> Vec<Binding> {
+    // Cmd + E on a Mac, Ctrl + E elsewhere.
+    let ctrl = Mods::COMMAND;
+    [
+        (Mods::PLAIN, Key::Num1, 0, "Normal tool"),
+        (Mods::PLAIN, Key::Num2, 1, "Select tool"),
+        (ctrl, Key::E, 2, "Split clips at the selection"),
+    ]
+    .into_iter()
+    .map(|(mods, key, edit, label)| Binding {
+        combo: Some(Combo { key, mods }),
+        side: None,
+        action: KeyAction::Edit(edit),
+        label: format!("{EDIT}{label}"),
+    })
+    .collect()
+}
+
+/// The defaults of the list `id` is in.
+fn defaults_for(id: &str) -> Vec<Binding> {
+    if id.starts_with(EDIT) { edit_bindings() } else { bindings() }
+}
+
 /// The defaults with the user's changes (an empty one takes the key away).
 fn effective(changes: &BTreeMap<String, String>) -> Vec<Binding> {
-    let mut all = bindings();
+    with_changes(bindings(), changes)
+}
+
+fn effective_edit(changes: &BTreeMap<String, String>) -> Vec<Binding> {
+    with_changes(edit_bindings(), changes)
+}
+
+fn with_changes(mut all: Vec<Binding>, changes: &BTreeMap<String, String>) -> Vec<Binding> {
     for binding in &mut all {
         match changes.get(&binding.id()).map(String::as_str) {
             Some("") => binding.combo = None,
@@ -305,14 +341,14 @@ fn assign(
     id: &str,
     combo: Option<Combo>,
 ) -> Option<String> {
-    let taken = effective(changes)
+    let taken = with_changes(defaults_for(id), changes)
         .into_iter()
         .find(|b| combo.is_some() && b.combo == combo && b.id() != id);
     if let Some(taken) = &taken {
         changes.insert(taken.id(), String::new());
     }
     changes.insert(id.to_owned(), combo.map(Combo::stored).unwrap_or_default());
-    for default in bindings() {
+    for default in bindings().into_iter().chain(edit_bindings()) {
         let text = default.combo.map(Combo::stored).unwrap_or_default();
         if changes.get(&default.id()) == Some(&text) {
             changes.remove(&default.id());
@@ -341,6 +377,8 @@ enum Step {
 /// Which keys are down, so each press gets its release.
 pub(super) struct KeyboardMixer {
     bindings: Vec<Binding>,
+    /// EDIT mode's keys.
+    edit: Vec<Binding>,
     held: HashMap<Key, (usize, KeyAction)>,
     /// The binding waiting for its new key.
     capturing: Option<String>,
@@ -348,7 +386,39 @@ pub(super) struct KeyboardMixer {
 
 impl KeyboardMixer {
     pub(super) fn new(changes: &BTreeMap<String, String>) -> Self {
-        Self { bindings: effective(changes), held: HashMap::new(), capturing: None }
+        Self {
+            bindings: effective(changes),
+            edit: effective_edit(changes),
+            held: HashMap::new(),
+            capturing: None,
+        }
+    }
+
+    /// The EDIT mode tool whose key was pressed (not while typing).
+    pub(super) fn edit_tool(&self, ctx: &egui::Context) -> Option<u8> {
+        if ctx.wants_keyboard_input() || self.capturing.is_some() {
+            return None;
+        }
+        ctx.input(|i| {
+            i.events.iter().find_map(|event| match *event {
+                Event::Key { key, physical_key, pressed: true, repeat: false, modifiers } => {
+                    let combo =
+                        Combo { key: physical_key.unwrap_or(key), mods: Mods::of(modifiers) };
+                    self.edit.iter().find(|b| b.combo == Some(combo)).and_then(|b| match b.action {
+                        KeyAction::Edit(edit) => Some(edit),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+        })
+    }
+
+    /// The EDIT mode tools' keys, as shown ("" for none).
+    pub(super) fn tool_labels(&self) -> [String; 2] {
+        std::array::from_fn(|i| {
+            self.edit.get(i).and_then(|b| b.combo).map(Combo::label).unwrap_or_default()
+        })
     }
 
     /// The Keyboard page of Preferences; returns whether anything changed
@@ -368,6 +438,7 @@ impl KeyboardMixer {
         if ui.add_enabled(!prefs.key_bindings.is_empty(), reset).clicked() {
             prefs.key_bindings.clear();
             self.bindings = bindings();
+            self.edit = edit_bindings();
             self.capturing = None;
             changed = true;
         }
@@ -391,6 +462,18 @@ impl KeyboardMixer {
                         ui.end_row();
                     }
                 });
+            ui.add_space(10.0);
+            ui.label(RichText::new("EDIT mode").strong());
+            egui::Grid::new("edit keys").num_columns(2).striped(true).spacing([24.0, 3.0]).show(
+                ui,
+                |ui| {
+                    for binding in &self.edit {
+                        ui.label(binding.label.trim_start_matches(EDIT));
+                        key_button(ui, binding, &mut self.capturing);
+                        ui.end_row();
+                    }
+                },
+            );
         });
         changed
     }
@@ -463,11 +546,11 @@ fn key_button(ui: &mut egui::Ui, binding: &Binding, capturing: &mut Option<Strin
 
 impl DeckhandApp {
     /// Mixing keys, before the library's so that Shift + arrows load tracks.
-    pub(super) fn mixing_keys(&mut self, ctx: &egui::Context) {
+    pub(super) fn mixing_keys(&mut self, ctx: &egui::Context, performing: bool) {
         if !self.show_prefs || self.prefs_tab != PrefsTab::Keyboard {
             self.keyboard.capturing = None;
         }
-        let live = self.config.prefs.keyboard_mixing && !ctx.wants_keyboard_input();
+        let live = performing && self.config.prefs.keyboard_mixing && !ctx.wants_keyboard_input();
         let decks = if self.config.four_decks { self.active_decks } else { [0, 1] };
         let steps = ctx.input_mut(|i| self.keyboard.read(&mut i.events, live, decks));
         for step in steps {
@@ -483,6 +566,7 @@ impl DeckhandApp {
                         self.status = Some(format!("{taken} no longer has a key"));
                     }
                     self.keyboard.bindings = effective(changes);
+                    self.keyboard.edit = effective_edit(changes);
                     self.config.save();
                 }
             }
@@ -521,6 +605,8 @@ impl DeckhandApp {
             }
             KeyAction::ZoomReset => self.seconds_visible = DEFAULT_SECONDS_VISIBLE,
             KeyAction::Record => self.toggle_recording(),
+            // EDIT mode reads its own keys.
+            KeyAction::Edit(_) => {}
         }
     }
 }
@@ -548,6 +634,20 @@ mod tests {
     }
 
     const CUE: KeyAction = KeyAction::Deck(DeckAction::Cue);
+
+    /// EDIT mode's keys are their own: giving one a mixing key takes
+    /// nothing away from mixing.
+    #[test]
+    fn edit_keys_are_apart_from_mixing_keys() {
+        let mut changes = BTreeMap::new();
+        let hot_cue = Combo { key: Key::Num1, mods: Mods::PLAIN };
+        assert!(effective(&changes).iter().any(|b| b.combo == Some(hot_cue)));
+        let taken = assign(&mut changes, "EDIT: Select tool", Some(hot_cue));
+        // Only the Normal tool (also on 1) lost it.
+        assert_eq!(taken.as_deref(), Some("EDIT: Normal tool"));
+        assert!(effective(&changes).iter().any(|b| b.combo == Some(hot_cue)));
+        assert_eq!(effective_edit(&changes)[1].combo, Some(hot_cue));
+    }
 
     #[test]
     fn no_two_bindings_share_a_key() {

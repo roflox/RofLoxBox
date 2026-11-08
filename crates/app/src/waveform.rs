@@ -7,7 +7,21 @@ use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, 
 
 /// Columns per second in rekordbox's detail waveforms.
 pub const COLUMNS_PER_SECOND: f64 = 150.0;
+/// Columns per second of a High detail waveform.
+pub const HIGH_COLUMNS_PER_SECOND: u32 = 600;
 const OVERVIEW_COLUMNS: usize = 800;
+
+/// How finely the decks' waveforms are drawn (Preferences).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum WaveformDetail {
+    /// rekordbox's resolution: 150 columns a second, its own colours when
+    /// it analysed the track.
+    #[default]
+    Standard,
+    /// Worked out from the audio at 600 columns a second: sharper when
+    /// zoomed in, and a finer overview.
+    High,
+}
 
 const BLUE: Color32 = Color32::from_rgb(40, 120, 230);
 const LOW: Color32 = Color32::from_rgb(32, 83, 217);
@@ -44,9 +58,28 @@ pub struct WaveformData {
     /// Low, mid, high heights, 150 per second.
     pub bands: Vec<[f32; 3]>,
     pub overview: Vec<Column>,
+    /// Columns a second in `detail` and `bands` (0 means 150).
+    pub per_second: f64,
 }
 
 impl WaveformData {
+    /// Columns a second in `detail` and `bands`.
+    pub fn columns_per_second(&self) -> f64 {
+        if self.per_second > 0.0 { self.per_second } else { COLUMNS_PER_SECOND }
+    }
+
+    /// High detail: from peaks and bands at `per_second` columns a second,
+    /// coloured by the bands, with an overview as fine.
+    pub fn high_detail(peaks: &[f32], bands: Vec<[f32; 3]>, per_second: u32) -> Self {
+        let mut data = Self::from_peaks(peaks, bands);
+        data.shape_from_bands();
+        let factor = f64::from(per_second) / COLUMNS_PER_SECOND;
+        let columns = (OVERVIEW_COLUMNS as f64 * factor.min(3.0)) as usize;
+        data.overview = overview(&data.detail, columns);
+        data.per_second = f64::from(per_second);
+        data
+    }
+
     /// From the analysis files: colored detail (PWV5) or monochrome (PWV3)
     /// from `.EXT`, three bands (PWV7) from `.2EX`.
     pub fn from_analysis(ext: Option<&AnlzFile>, two_ex: Option<&AnlzFile>) -> Option<Self> {
@@ -100,19 +133,25 @@ impl WaveformData {
     }
 
     fn with_detail(detail: Vec<Column>, bands: Vec<[f32; 3]>) -> Self {
-        let step = detail.len().div_ceil(OVERVIEW_COLUMNS).max(1);
-        let overview = detail
-            .chunks(step)
-            .map(|chunk| {
-                *chunk.iter().max_by(|a, b| a.height.total_cmp(&b.height)).expect("non-empty chunk")
-            })
-            .collect();
-        Self { detail, colored: false, bands, overview }
+        let overview = overview(&detail, OVERVIEW_COLUMNS);
+        Self { detail, colored: false, bands, overview, per_second: COLUMNS_PER_SECOND }
     }
 
     pub fn has_bands(&self) -> bool {
         !self.bands.is_empty()
     }
+}
+
+/// About `columns` columns for the whole track, each the loudest of its
+/// stretch.
+fn overview(detail: &[Column], columns: usize) -> Vec<Column> {
+    let step = detail.len().div_ceil(columns.max(1)).max(1);
+    detail
+        .chunks(step)
+        .map(|chunk| {
+            *chunk.iter().max_by(|a, b| a.height.total_cmp(&b.height)).expect("non-empty chunk")
+        })
+        .collect()
 }
 
 /// The colour of a column from its low, mid and high levels: the loudest
@@ -386,6 +425,7 @@ pub fn draw_detail(
 
     let use_bands = style == WaveformStyle::ThreeBand && data.has_bands();
     let columns = if use_bands { data.bands.len() } else { data.detail.len() };
+    let per_second = data.columns_per_second();
     for step in 0..length as usize {
         let t = start + step as f64 / px_per_sec;
         if t < 0.0 {
@@ -393,12 +433,11 @@ pub fn draw_detail(
         }
         // Every column under this pixel counts, the loudest showing (as in
         // the overview), so zoomed out nothing falls between pixels.
-        let first = (t * COLUMNS_PER_SECOND) as usize;
+        let first = (t * per_second) as usize;
         if first >= columns {
             break;
         }
-        let end =
-            (((t + 1.0 / px_per_sec) * COLUMNS_PER_SECOND) as usize).clamp(first + 1, columns);
+        let end = (((t + 1.0 / px_per_sec) * per_second) as usize).clamp(first + 1, columns);
         let a = step as f32;
         let bar = |height: f32, color: Color32| {
             let h = height.min(1.0) * half;

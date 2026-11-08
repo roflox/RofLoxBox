@@ -165,6 +165,19 @@ pub fn read_file(path: &Path) -> Result<ScannedFile> {
     Ok(file)
 }
 
+/// The picture embedded in an audio file's tags (the front cover when
+/// there are several), as stored: JPEG or PNG bytes.
+pub fn embedded_artwork(path: &Path) -> Option<Vec<u8>> {
+    let file = lofty::read_from_path(path).ok()?;
+    let tag = file.primary_tag().or_else(|| file.first_tag())?;
+    let pictures = tag.pictures();
+    let front = pictures
+        .iter()
+        .find(|p| p.pic_type() == lofty::picture::PictureType::CoverFront)
+        .or_else(|| pictures.first())?;
+    Some(front.data().to_vec())
+}
+
 /// Audio files below `folder`, recursively, skipping hidden entries.
 fn audio_files(folder: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(folder) else { return };

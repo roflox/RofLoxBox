@@ -774,7 +774,14 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
 }
 
 /// The beat-grid editor, shown in the pads' box while GRID is on.
-fn grid_editor(ui: &mut Ui, deck: &mut Deck, position: f64, index: usize, compact: bool, out: &mut DeckOut) {
+fn grid_editor(
+    ui: &mut Ui,
+    deck: &mut Deck,
+    position: f64,
+    index: usize,
+    compact: bool,
+    out: &mut DeckOut,
+) {
     let Some(track) = &deck.track else {
         ui.label(RichText::new("Load a track to edit its beat grid").weak());
         return;
@@ -783,7 +790,8 @@ fn grid_editor(ui: &mut Ui, deck: &mut Deck, position: f64, index: usize, compac
     let size = if compact { 12.0 } else { 14.0 };
     let width = ui.available_width();
     let row_height = if compact { 24.0 } else { 30.0 };
-    let wide = |ui: &mut Ui, n: f32| vec2((ui.available_width() - (n - 1.0) * PAD_GAP) / n, row_height);
+    let wide =
+        |ui: &mut Ui, n: f32| vec2((ui.available_width() - (n - 1.0) * PAD_GAP) / n, row_height);
     let mut edited = false;
     ui.add_enabled_ui(straight, |ui| {
         ui.set_width(width);

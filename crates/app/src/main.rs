@@ -10,6 +10,7 @@ pub const VERSION: &str = env!("ROFLOXBOX_VERSION");
 
 mod analyze;
 mod app;
+mod artwork;
 mod browser;
 mod config;
 mod controller;
@@ -19,6 +20,7 @@ mod layout;
 mod library;
 mod parts;
 mod prefs_view;
+mod preview;
 mod rekordbox_db;
 mod rekordbox_save;
 mod screen_layout;

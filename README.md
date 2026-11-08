@@ -2,9 +2,12 @@
 
 (Working name in the code: deckhand.)
 
-DJ library tooling in Rust, compatible with Pioneer DJ hardware. No
-subscriptions, accounts, telemetry or ads. See [PLAN.md](PLAN.md) for scope,
-ground rules and roadmap.
+A DJ app for macOS, Windows and Linux, written in Rust: two or four decks,
+a full mixer with effects, live stems, a library that works with rekordbox
+and Pioneer DJ / AlphaTheta gear, and a recorder that keeps every move of a
+set so you can fix it afterwards in a small DAW. No subscriptions,
+accounts, telemetry or ads. See [PLAN.md](PLAN.md) for scope, ground rules
+and roadmap.
 
 ![Performance view: two decks with waveforms, pads and the library](docs/screenshots/performance.png)
 *Performance view*
@@ -33,11 +36,163 @@ changes back to rekordbox**, make a backup of the library in rekordbox:
   rekordbox is their trademark. Don't ask them for help with a library
   RofLoxBox changed.
 
-## Status
+## Features
 
-Reads and writes everything rekordbox puts on a USB/SD export:
-`export.pdb`, `exportExt.pdb`, analysis files (`ANLZ*.DAT/.EXT/.2EX`) and the
-settings files. New databases are byte-identical to the ones rekordbox writes.
+### Decks
+
+- Two or four decks with scrolling and overview waveforms (rekordbox's RGB
+  look, or CDJ-style 3-band), beat grids, hot cues, memory cues and loops.
+  **Preferences → Waveform detail → High** draws the deck waveforms four
+  times finer than rekordbox's analysis.
+- CUE / PLAY, SYNC with a master deck, quantize, slip, vinyl mode, beat
+  loops and loop resizing, beat jump, GATE (hot cues play only while held)
+  and **Beat grid edit** for fixing a grid by hand.
+- Tempo fader with selectable ranges, **MT** (Master Tempo: the key stays
+  when the tempo changes), key shift, key sync and TAP BPM.
+- Pads: hot cues, Pad FX, Beat Loop, Beat Jump, Sampler, Key Shift, Keyboard and
+  Stems modes, as on rekordbox-compatible controllers.
+- Drag a running waveform to scrub: the deck stops under the mouse and plays
+  on from there when you let go.
+
+### Mixer and effects
+
+- EQ (or isolator), trim with automatic track gain, faders and crossfader
+  with selectable curves, master and headphone cue, a master limiter.
+- **Color FX** on every channel: Filter, Space, Dub Echo, Crush, Noise and
+  Pitch. Played live, the channel knob drives the type selected on the
+  mixer; the filter glides, so fast moves and switches don't click.
+- **Beat FX**: 14 beat-synced effects (Delay, Echo, Reverb, Roll, Flanger,
+  Phaser, Trans, Filter, …) on a channel, the master or the sampler, with
+  TAP and Release FX. The depth knob is wet/dry: 0% leaves the sound alone,
+  50% is half each, 100% is only the effect.
+- An 8-slot sampler playing the first eight audio files in the `samples`
+  folder next to the settings.
+
+### Stems
+
+- **Live stems**: loaded tracks are separated in the background, the part
+  around the playhead first (instantly when done before). VOCAL, INST, BASS
+  and DRUMS switch parts off; ISO turns the EQ knobs into vocal, instrument
+  and drum levels. With every part on, the deck plays the original exactly.
+  Load the same track on a second deck and it shares the separation already
+  running.
+- **Make** (right-click a track): an acapella, an instrumental, the track
+  without drums or one stem alone, as a new 24-bit WAV that keeps the
+  original's cues, loops, beat grid and key.
+- Any separation model works: Preferences → Stems takes a folder with a
+  `model.toml` naming its stems and the command that separates a track;
+  Demucs and audio-separator come as presets.
+
+### Library
+
+- **Collection**: RofLoxBox's own library. Add folders or files (or drop
+  them on the window), make playlists and folders, drag tracks onto
+  playlists, edit tags, ratings and colours.
+- **rekordbox**: import your rekordbox library (its `master.db` directly,
+  or an XML export) with playlists, beat grids, cues and ratings. RofLoxBox
+  can also write changes back into rekordbox's own library, if you turn it
+  on (read the disclaimer above first).
+- **USB / SD exports**: play straight from a rekordbox export, or export
+  playlists to a stick for CDJs and XDJs. `export.pdb`, `exportExt.pdb`, the
+  analysis files and the settings files are written byte-identical to
+  rekordbox's.
+- The track lists show each track's cover and a **Preview** column: the
+  whole waveform with its hot cues and memory cues. Columns can be chosen,
+  moved and sorted.
+- BPM, beat grid and key are worked out on load for tracks that have none.
+
+### Layout editing
+
+The screen is yours to arrange, all from the **View** menu:
+
+- **Waveforms** horizontal at the top, or vertical between the decks; show
+  or hide the waveforms, the mixer, the library and the FX strip, and pick
+  which parts of the mixer and FX strip appear.
+- **Deck elements**: tick which controls each deck shows (separately for
+  the 2-deck and 4-deck layouts).
+- **Edit deck layout (drag elements)**: drag a control onto another (left or
+  right half), onto **+** at the end of a row or the side column, onto
+  **New row**, or onto **Hide**. In the same mode, drag the decks, the
+  waveforms or the mixer by their bar onto an edge of another block to
+  rearrange the whole screen (or pick one under **Screen arrangement**).
+- **View presets**: save the current view under a name and switch between
+  views in one click. **Export presets…** writes them to a file and
+  **Import presets…** reads them back, to keep them safe or take them to
+  another computer.
+- **Preferences → Appearance**: dark, light, or following the system, and
+  the text size in percent.
+
+### Controllers and keyboard
+
+- Pioneer DJ / AlphaTheta controllers (built around the DDJ-GRV6) work out
+  of the box and report their fader and knob positions when they connect,
+  so the software starts where the hardware is.
+- Any MIDI controller can be mapped: open **Controller**, pick its port,
+  press **Learn** next to a function and move the control. Mappings are
+  saved in `mappings/` next to the settings.
+- The computer keyboard mixes too, with the keys of rekordbox's
+  Performance 1 preset (`Z`/`N` play, `A`/`H` cue, `Q`/`Y` sync, `1`–`4` /
+  `6`–`9` hot cues, …). Preferences → Keyboard lists and moves them.
+
+### Recording and EDIT mode (work in progress)
+
+> **EDIT mode is a work in progress.** It is new and not yet tested much in
+> real use: expect rough edges and changes, and keep your original
+> recordings (edits are saved as new files and never change them).
+
+**REC** records the master to a folder of its own in `Music/RofLoxBox
+Recordings`: the 24-bit WAV, a `.session` file with everything that was
+played (the tracks, every knob, fader, button and jog movement, sync, beat
+grids) and the stems the decks used. Preferences → Audio → **Replay a
+session…** plays a session through the mixer again, and it comes out
+identical to the recording, sample for sample.
+
+**EDIT** in the top bar turns the app into a little DAW for a recorded set.
+Open a session:
+
+- **Decks**: each deck shows what it played, its waveform bright where it
+  reached the mix, with the beat grid. Drag a clip by its title to move it,
+  drag inside it to slide its audio (to fix a beatmatch), shrink it by its
+  edges, double-click to split it and right-click a piece to cut it out or
+  bring it back. After a split, dragging moves the piece you grab.
+- **Lanes**: a lane of automation for each knob and fader: volume, trim, EQ,
+  tempo, crossfader, master, and an **intensity** lane for every Color FX
+  type on every deck (Filter, Space, Dub Echo, Crush, Noise, Pitch). The
+  types are separate, so you can add a Space on deck 2 for eight bars
+  afterwards, alongside the filter you played, even if you never touched
+  Space live. Press **+** under a deck (or the mixer, or Effects) to show
+  more lanes. Double-click to add a point, drag to move it, right-click to
+  delete it; points step, run in lines or ease in curves; select a stretch
+  to flatten or ramp it, or right-click it to **reset it to the original**
+  recording.
+- **Effects**: a Color FX row shows where each deck's Color FX were on.
+  The Beat FX play as blocks: right-click or double-click an empty spot in
+  their row to open **Add Beat FX** (type, what it is on, length in beats,
+  depth), drag a block or its edges to move or stretch it, and right-click
+  it to change its type, target or depth, or remove it. The line inside a
+  block is its depth (wet/dry), a lane like the others: double-click to add
+  a point (Step, Line or Smooth, as chosen in the toolbar), drag points up,
+  down and along, right-click one to delete it.
+- **Tools**: **Normal** (key `1`) moves and edits; **Select** (key `2`)
+  drags a stretch over a deck's clips, the Beat FX or a lane, and
+  **Delete** cuts it out of the clips, takes the effects off through it, or
+  flattens the lane. **Cmd + E** (Ctrl + E on Windows and Linux) splits the clips at both edges of the
+  selection instead, so the selected part becomes a piece of its own. The keys can be changed in Preferences → Keyboard →
+  EDIT mode.
+- **Play** (Space) listens to the edited set from the cursor (click the
+  ruler to place it); edits are heard as you make them. **Bass clashes**
+  marks where two decks' low end plays together. Undo, Redo and History keep
+  the last 100 changes; **Save edit…** writes a new session and **Render**
+  plays it into a new WAV.
+
+## Building and running
+
+```sh
+cargo run --release -p deckhand-app   # the app
+cargo test
+```
+
+The `deckhand` command-line tool reads and rewrites Pioneer formats:
 
 ```sh
 cargo run -- pdb info      /Volumes/USB/PIONEER/rekordbox/export.pdb
@@ -47,86 +202,11 @@ cargo run -- pdb tags      /Volumes/USB/PIONEER/rekordbox/exportExt.pdb
 cargo run -- anlz          /Volumes/USB/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.EXT
 cargo run -- settings      /Volumes/USB/PIONEER/MYSETTING.DAT
 cargo run -- usb rewrite   /Volumes/USB /Volumes/OTHER_USB   # rewrite an export with deckhand's writers
-cargo test
 ```
 
-## Playing
-
-```sh
-cargo run --release -p deckhand-app
-```
-
-Pick **Collection** in the top bar to use deckhand's own library: add a
-folder of music or single files (or drop them on the window), import your
-rekordbox library (in rekordbox: File → Export Collection in xml format, then
-**Import rekordbox XML…** here — tracks, playlists, beat grids, hot cues,
-memory cues/loops, ratings and colours come along), make playlists
-and folders, drag tracks onto playlists, right-click tracks for more. Or plug
-in a rekordbox USB export (or pick its folder) to play from it. Load tracks
-by double-clicking, and mix. Connect a controller by USB, open
-**Controller**, pick its MIDI port and press **Learn** next to each
-function, then move that control. Mappings are saved in
-`~/Library/Application Support/deckhand/mappings/` (`%APPDATA%\deckhand\mappings\`
-on Windows). **MT** next to the tempo fader is Master Tempo: the key stays
-the same when the tempo changes. **⚙ Audio** sets the output, sample rate,
-buffer size (latency) and interpolation quality. Pioneer DJ / AlphaTheta
-controllers are asked for their fader and knob positions when they connect,
-so the software starts where the hardware is.
-
-The strip under the waveforms holds Beat FX (14 types, beat-synced to the
-master deck, assignable to a channel, the master or the sampler, with tap
-and Release FX), Color FX for the channel knobs (Filter, Space, Dub Echo,
-Crush, Noise, Pitch), Master Cue and an 8-slot sampler that plays the first
-eight audio files in the `samples` folder next to the config. Decks have
-SLIP, key shift / key sync and TAP BPM; controller pads also cover Pad FX,
-Key Shift and Keyboard modes.
-
-The computer keyboard mixes too, with the keys of rekordbox's Performance 1
-preset: `Z`/`N` play, `A`/`H` cue, `Q`/`Y` sync, `W` `E`/`U` `I` pitch bend,
-`1`–`4`/`6`–`9` hot cues, `D` `F` `G`/`K` `L` `;` loops, Shift + arrows load.
-Preferences → Keyboard lists them all, lets you move any of them and turns
-them off.
-
-Right-click tracks → Make: an acapella, an instrumental, the track without
-drums, or one stem alone, as a new 24-bit WAV track carrying the original's
-cues, memory cues, loops, beat grid and key, next to it in its playlists.
-Separation runs any model you add (Preferences → Stems: a folder with a
-`model.toml` naming its stems and the command that separates a track), with
-presets for Demucs and audio-separator; results are cached per track.
-
-Live stems: loaded tracks are separated in the background (instantly when
-cached) and the deck's VOCAL, INST, BASS and DRUMS buttons, the Stems pad
-mode and the GRV6's part buttons turn parts off; ISO (Part Isolator, Shift +
-headphone CUE on the GRV6) makes the HI, MID and LOW knobs the vocal,
-instrument and drum levels. INST is whatever remains, so with every part on
-the deck plays the original exactly.
-
-Dragging a running waveform stops the deck under the mouse, and it plays on
-from there when let go. Preferences → Appearance has dark and light themes.
-
-### Recording and EDIT mode (work in progress)
-
-> **EDIT mode is a work in progress.** It is new, not finished and not yet
-> tested much in real use: expect rough edges and changes, and keep your
-> original recordings (edits are saved as new files and never change them).
-
-**REC** records the master to a folder of its own in `Music/RofLoxBox
-Recordings`: the 24-bit WAV, a `.session` file with everything played (the
-tracks, every knob, fader, button and jog movement, sync, beat grids) and the
-stems the decks used. Preferences → Audio → **Replay a session…** plays a
-session through the mixer again; it comes out identical to the recording,
-sample for sample.
-
-**EDIT** in the top bar turns the app into a little DAW for a recorded set:
-open a session and each deck shows what it played (waveform and beat grid),
-with a lane of automation for each knob and fader (volume, trim, EQ, filter,
-tempo, crossfader, master) and the Beat FX as blocks. Drag, add or delete
-points, draw them as steps, lines or curves, flatten or ramp a stretch;
-move a track's audio (or the whole clip, by its title), shrink it by its
-edges, split it with a double click and cut pieces out with a right click;
-**Bass clashes** marks where two decks' low end plays together. Undo, Redo
-and History keep the last 100 changes; **Save edit…** writes a new session
-and **Render** plays it into a new WAV.
+Settings, mappings, caches and backups live in
+`~/Library/Application Support/deckhand/` on macOS and `%APPDATA%\deckhand\`
+on Windows.
 
 ### Installers
 

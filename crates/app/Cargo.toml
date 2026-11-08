@@ -16,6 +16,7 @@ deckhand-library = { version = "0.1.0", path = "../library" }
 eframe = "0.33.3"
 egui_extras = "0.33"
 png = "0.18.1"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

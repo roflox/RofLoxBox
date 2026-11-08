@@ -414,6 +414,9 @@ impl BeatFx {
         self.lfo = (self.lfo + 1.0 / beat) % 1.0;
         self.tick = self.tick.wrapping_add(1);
         let sweep = self.tick.is_multiple_of(SWEEP_EVERY);
+        // The depth knob is the wet/dry balance: 0 the sound as it is, a
+        // half each, 1 only what the effect makes (echoes and reverb ring
+        // over the sound, as on the mixer).
         let d = p.depth.clamp(0.0, 1.0);
         let dry = if p.release { [0.0; 2] } else { x };
         // What goes into echo-like effects: nothing once switched off, so the tail fades.
@@ -428,35 +431,35 @@ impl BeatFx {
                 let glide = if p.kind == BeatFxKind::Spiral { 0.00005 } else { 0.01 };
                 self.delay_frames += (beat - self.delay_frames) * glide;
                 let echo = self.delay.read(self.delay_frames);
-                let (feedback, level) = match p.kind {
-                    BeatFxKind::Delay => (0.15, d),
-                    BeatFxKind::Spiral => (0.55 + 0.4 * d, 0.8),
-                    _ => (0.35 + 0.4 * d, 0.6 + 0.4 * d),
+                let feedback = match p.kind {
+                    BeatFxKind::Delay => 0.15,
+                    BeatFxKind::Spiral => 0.75,
+                    _ => 0.55,
                 };
                 let mut fed = [send[0] + echo[0] * feedback, send[1] + echo[1] * feedback];
                 if p.kind == BeatFxKind::LowCutEcho {
                     if sweep || self.tick == 1 {
-                        self.tone.high_pass(self.rate, 300.0 + 1200.0 * d, 0.7);
+                        self.tone.high_pass(self.rate, 900.0, 0.7);
                     }
                     fed = [self.tone.process(0, fed[0]), self.tone.process(1, fed[1])];
                 }
                 self.delay.push(fed);
-                add(dry, echo, level)
+                add(dry, echo, d)
             }
             BeatFxKind::Helix => {
                 // Holds one beat and keeps repeating it, fading new sound in less.
                 let held = self.delay.read(beat);
-                let input = if on { 1.0 - 0.9 * d } else { 0.0 };
+                let input = if on { 0.4 } else { 0.0 };
                 let feedback = if on { 0.97 } else { 0.6 };
                 self.delay.push([
                     send[0] * input + held[0] * feedback,
                     send[1] * input + held[1] * feedback,
                 ]);
-                add([dry[0] * (1.0 - 0.5 * d), dry[1] * (1.0 - 0.5 * d)], held, d)
+                mix(dry, held, d)
             }
             BeatFxKind::Reverb => {
-                let wet = self.reverb.process(send, d);
-                add(dry, wet, 0.3 + 0.7 * d)
+                let wet = self.reverb.process(send, 0.7);
+                add(dry, wet, d)
             }
             _ if !on => x,
             BeatFxKind::Flanger => {
@@ -486,10 +489,10 @@ impl BeatFx {
             BeatFxKind::Filter => {
                 if sweep || self.tick == 1 {
                     let lfo = 0.5 - 0.5 * (2.0 * PI * self.lfo).cos();
-                    self.filter.low_pass(self.rate, 150.0 * 60f32.powf(lfo), 1.0 + 4.0 * d);
+                    self.filter.low_pass(self.rate, 150.0 * 60f32.powf(lfo), 3.0);
                 }
                 let y = [self.filter.process(0, x[0]), self.filter.process(1, x[1])];
-                mix(x, y, 0.3 + 0.7 * d)
+                mix(x, y, d)
             }
             BeatFxKind::Trans => {
                 // Cuts the sound for the second half of each beat, with 2 ms edges.
@@ -503,8 +506,9 @@ impl BeatFx {
                 [x[0] * gain, x[1] * gain]
             }
             BeatFxKind::Pitch => {
-                let ratio = 2f32.powf(d);
-                self.pitch.process(x, ratio)
+                // An octave up.
+                let pitched = self.pitch.process(x, 2.0);
+                mix(x, pitched, d)
             }
             BeatFxKind::Roll => {
                 // Records one beat after switching on, then repeats it.
@@ -517,14 +521,16 @@ impl BeatFx {
                     self.delay.push(repeat);
                     repeat
                 };
-                mix(x, looped, 0.5 + 0.5 * d)
+                mix(x, looped, d)
             }
         }
     }
 }
 
 /// The Color FX types; the knob of each channel controls the one selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub enum ColorFxKind {
     #[default]
     Filter,
@@ -549,6 +555,100 @@ impl ColorFxKind {
             Self::Pitch => "PITCH",
         }
     }
+
+    /// The name in ordinary case ("Dub Echo").
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Filter => "Filter",
+            Self::Space => "Space",
+            Self::DubEcho => "Dub Echo",
+            Self::Crush => "Crush",
+            Self::Noise => "Noise",
+            Self::Pitch => "Pitch",
+        }
+    }
+
+    /// Where it is in [`ColorFxKind::ALL`].
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|k| *k == self).unwrap_or(0)
+    }
+}
+
+/// A channel's Color FX: a unit of every type, each with its own amount
+/// (−1.0 … 1.0, 0 is off), played one after another. Played live, the
+/// channel knob drives the type the mixer has selected (with Color FX on);
+/// an edited set can give every type its own amount over time.
+#[derive(Debug)]
+pub struct ChannelColor {
+    knob: f32,
+    units: [ColorFx; 6],
+}
+
+/// What a [`ChannelColor`] carries from frame to frame, apart from its
+/// buffers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct ChannelColorState {
+    pub(crate) knob: f32,
+    pub(crate) units: [ColorFxState; 6],
+}
+
+impl ChannelColor {
+    pub fn new(rate: u32) -> Self {
+        Self {
+            knob: 0.0,
+            units: std::array::from_fn(|i| ColorFx::with_kind(rate, ColorFxKind::ALL[i])),
+        }
+    }
+
+    /// The channel knob, driving `kind` when `on`.
+    pub(crate) fn set_knob(&mut self, position: f32, kind: ColorFxKind, on: bool) {
+        self.knob = position.clamp(-1.0, 1.0);
+        self.follow_knob(kind, on);
+    }
+
+    /// Every type at the knob's amount if it is `kind` and `on`, else 0.
+    pub(crate) fn follow_knob(&mut self, kind: ColorFxKind, on: bool) {
+        for unit in &mut self.units {
+            let amount = if on && unit.kind == kind { self.knob } else { 0.0 };
+            if unit.position != amount {
+                unit.set_position(amount);
+            }
+        }
+    }
+
+    /// One type's amount, apart from the knob (an edited set).
+    pub(crate) fn set_amount(&mut self, kind: ColorFxKind, position: f32) {
+        self.units[kind.index()].set_position(position);
+    }
+
+    pub fn process(&mut self, mut x: [f32; 2]) -> [f32; 2] {
+        for unit in &mut self.units {
+            let on = unit.position != 0.0;
+            x = unit.process_switched(x, on);
+        }
+        x
+    }
+
+    pub(crate) fn state(&self) -> ChannelColorState {
+        ChannelColorState { knob: self.knob, units: std::array::from_fn(|i| self.units[i].state()) }
+    }
+
+    pub(crate) fn restore(&mut self, state: &ChannelColorState) {
+        self.knob = state.knob;
+        for (unit, saved) in self.units.iter_mut().zip(&state.units) {
+            if saved.kind == unit.kind {
+                unit.restore(saved);
+            }
+        }
+    }
+
+    /// From a session recorded with one Color FX a channel: its state goes
+    /// to its type's unit, and the knob drives the mixer's type.
+    pub(crate) fn restore_single(&mut self, state: &ColorFxState, kind: ColorFxKind, on: bool) {
+        self.knob = state.position;
+        self.units[state.kind.index()].restore(state);
+        self.follow_knob(kind, on);
+    }
 }
 
 /// One channel's Color FX. The knob runs −1.0 … 1.0 with no effect at the
@@ -566,9 +666,25 @@ pub struct ColorFx {
     held: [f32; 2],
     hold_count: f32,
     noise: u32,
+    /// How much of the effect is heard, 0.0 … 1.0: switching it on or off,
+    /// or to another type, fades instead of cutting.
+    mix: f32,
+    /// The type to switch to once the current one has faded out.
+    next_kind: Option<ColorFxKind>,
 }
 
+/// How long switching a Color FX on, off or to another type fades.
+const COLOR_FADE_SECS: f32 = 0.005;
+
 impl ColorFx {
+    /// A unit of one type.
+    pub fn with_kind(rate: u32, kind: ColorFxKind) -> Self {
+        let mut unit = Self::new(rate);
+        unit.kind = kind;
+        unit.mix = 0.0;
+        unit
+    }
+
     pub fn new(rate: u32) -> Self {
         let rate = rate as f32;
         Self {
@@ -583,6 +699,8 @@ impl ColorFx {
             held: [0.0; 2],
             hold_count: 0.0,
             noise: 0x1234_5678,
+            mix: 1.0,
+            next_kind: None,
         }
     }
 
@@ -596,21 +714,54 @@ impl ColorFx {
             held: self.held,
             hold_count: self.hold_count,
             noise: self.noise,
+            mix: self.mix,
+            next_kind: self.next_kind,
         }
     }
 
     pub(crate) fn restore(&mut self, state: &ColorFxState) {
-        let ColorFxState { kind, position, filter, tone, held, hold_count, noise } = *state;
+        let ColorFxState { kind, position, filter, tone, held, hold_count, noise, mix, next_kind } =
+            *state;
         (self.kind, self.position, self.filter, self.tone) = (kind, position, filter, tone);
         (self.held, self.hold_count, self.noise) = (held, hold_count, noise);
+        (self.mix, self.next_kind) = (mix, next_kind);
+        // States saved before the filter glided only know the knob.
+        self.filter.set(position);
     }
 
+    /// Switches to another type once the current one has faded out.
     pub fn set_kind(&mut self, kind: ColorFxKind) {
-        if kind != self.kind {
-            self.kind = kind;
-            self.delay.clear();
-            self.reverb.clear();
-            self.set_position(self.position);
+        self.next_kind = (kind != self.kind).then_some(kind);
+    }
+
+    fn switch_kind(&mut self, kind: ColorFxKind) {
+        self.kind = kind;
+        self.delay.clear();
+        self.reverb.clear();
+        self.set_position(self.position);
+    }
+
+    /// The effect when `on`, the dry sound when not, fading between them
+    /// (and through the dry sound when the type changes).
+    pub fn process_switched(&mut self, x: [f32; 2], on: bool) -> [f32; 2] {
+        let target = if on && self.next_kind.is_none() { 1.0 } else { 0.0 };
+        if self.mix != target {
+            let step = 1.0 / (COLOR_FADE_SECS * self.rate);
+            self.mix = (self.mix + (target - self.mix).clamp(-step, step)).clamp(0.0, 1.0);
+        }
+        if self.mix == 0.0 {
+            if let Some(kind) = self.next_kind.take() {
+                self.switch_kind(kind);
+            }
+            if !on {
+                return x;
+            }
+        }
+        let wet = self.process(x);
+        if self.mix == 1.0 {
+            wet
+        } else {
+            [x[0] + (wet[0] - x[0]) * self.mix, x[1] + (wet[1] - x[1]) * self.mix]
         }
     }
 
@@ -700,6 +851,14 @@ pub(crate) struct ColorFxState {
     held: [f32; 2],
     hold_count: f32,
     noise: u32,
+    #[serde(default = "one")]
+    mix: f32,
+    #[serde(default)]
+    next_kind: Option<ColorFxKind>,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl BeatFxState {
@@ -709,8 +868,9 @@ impl BeatFxState {
 }
 
 impl ColorFxState {
+    /// The type chosen (switched to once the old one has faded).
     pub(crate) fn kind(&self) -> ColorFxKind {
-        self.kind
+        self.next_kind.unwrap_or(self.kind)
     }
 
     /// The channel knob.
@@ -736,7 +896,8 @@ mod tests {
         fx.set(BeatFxParams {
             kind: BeatFxKind::Echo,
             on: true,
-            depth: 0.5,
+            // Full depth: the echoes at their full level.
+            depth: 1.0,
             beat_secs: 0.1,
             ..Default::default()
         });
@@ -803,6 +964,49 @@ mod tests {
         assert!(power(440.0) > 10.0 * power(220.0));
     }
 
+    /// Depth is the wet/dry balance: at 0 every Beat FX leaves the sound
+    /// exactly as it is.
+    #[test]
+    fn beat_fx_at_zero_depth_is_dry() {
+        for kind in BeatFxKind::ALL {
+            let mut fx = BeatFx::new(RATE);
+            fx.set(BeatFxParams {
+                kind,
+                on: true,
+                depth: 0.0,
+                beat_secs: 0.05,
+                ..Default::default()
+            });
+            for i in 0..RATE as usize / 2 {
+                let x = tone(i, 330.0);
+                let y = fx.process(x);
+                assert!(
+                    (y[0] - x[0]).abs() < 1e-6 && (y[1] - x[1]).abs() < 1e-6,
+                    "{kind:?} at frame {i}: {y:?} for {x:?}"
+                );
+            }
+        }
+    }
+
+    /// Each type of a channel has its own amount: Filter and Space at once,
+    /// and all at 0 leaves the sound alone.
+    #[test]
+    fn channel_color_types_play_together() {
+        let mut color = ChannelColor::new(RATE);
+        for i in 0..RATE as usize / 10 {
+            let x = tone(i, 330.0);
+            assert_eq!(color.process(x), x);
+        }
+        color.set_amount(ColorFxKind::Filter, -0.8);
+        color.set_amount(ColorFxKind::Space, 0.5);
+        let active: Vec<bool> = color.units.iter().map(|u| u.position != 0.0).collect();
+        assert_eq!(active, [true, true, false, false, false, false]);
+        // The knob as played live drives only the mixer's type.
+        color.set_knob(0.3, ColorFxKind::Crush, true);
+        let active: Vec<bool> = color.units.iter().map(|u| u.position != 0.0).collect();
+        assert_eq!(active, [false, false, false, true, false, false]);
+    }
+
     #[test]
     fn every_effect_stays_finite_and_bounded() {
         for kind in BeatFxKind::ALL {
@@ -820,8 +1024,7 @@ mod tests {
             }
         }
         for kind in ColorFxKind::ALL {
-            let mut fx = ColorFx::new(RATE);
-            fx.set_kind(kind);
+            let mut fx = ColorFx::with_kind(RATE, kind);
             for position in [-1.0, -0.5, 0.0, 0.5, 1.0] {
                 fx.set_position(position);
                 for i in 0..RATE as usize / 4 {

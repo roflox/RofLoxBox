@@ -21,7 +21,7 @@ use crate::library::UsbLibrary;
 use crate::waveform::WaveformData;
 
 pub const HOT_CUES: usize = 8;
-const HOT_CUE_DEFAULT: Color32 = Color32::from_rgb(40, 200, 80);
+pub(crate) const HOT_CUE_DEFAULT: Color32 = Color32::from_rgb(40, 200, 80);
 
 /// Audio moved by one turn of the jog, paused or scratching: like a
 /// 33⅓ rpm record, 1.8 s.
@@ -522,6 +522,7 @@ impl Deck {
                 .then(|| library.resolve(&track.track.analyze_path)),
             known: None,
             auto_cue_db: self.prefs.auto_cue_db,
+            waveform_detail: self.prefs.waveform_detail,
             analysis: self.prefs.analysis,
         };
         self.start_request(request, ctx);
@@ -542,6 +543,7 @@ impl Deck {
             analysis_path: track.analysis.clone(),
             known: Some(Known::from_track(track)),
             auto_cue_db: self.prefs.auto_cue_db,
+            waveform_detail: self.prefs.waveform_detail,
             analysis: self.prefs.analysis,
         };
         self.start_request(request, ctx);
@@ -572,6 +574,7 @@ impl Deck {
             analysis_path: None,
             known: None,
             auto_cue_db: self.prefs.auto_cue_db,
+            waveform_detail: self.prefs.waveform_detail,
             analysis: self.prefs.analysis,
         };
         self.start_request(request, ctx);
@@ -1625,6 +1628,7 @@ pub struct DeckPrefs {
     pub analyze_on_load: bool,
     /// Tracks play at their track gain.
     pub auto_gain: bool,
+    pub waveform_detail: crate::waveform::WaveformDetail,
 }
 
 /// How tracks without rekordbox's analysis are analysed.
@@ -1655,6 +1659,7 @@ impl Default for DeckPrefs {
             analysis: AnalysisMethod::default(),
             analyze_on_load: true,
             auto_gain: true,
+            waveform_detail: Default::default(),
         }
     }
 }
@@ -1780,6 +1785,7 @@ impl Known {
 
 struct LoadRequest {
     id: u32,
+    waveform_detail: crate::waveform::WaveformDetail,
     known: Option<Known>,
     auto_cue_db: Option<f32>,
     from_collection: bool,
@@ -1823,13 +1829,23 @@ impl LoadRequest {
             }
             AnalysisMethod::Deckhand => None,
         };
-        let mut waveform = WaveformData::from_analysis(ext.as_ref(), two_ex.as_ref())
-            .or_else(worked_out)
-            .unwrap_or_else(|| WaveformData::from_peaks(&peak_waveform(&audio), Vec::new()));
-        if !waveform.has_bands() {
-            waveform.bands = band_waveform(&audio);
-        }
-        waveform.shape_from_bands();
+        let waveform = if self.waveform_detail == crate::waveform::WaveformDetail::High {
+            let per_second = crate::waveform::HIGH_COLUMNS_PER_SECOND;
+            WaveformData::high_detail(
+                &deckhand_audio::peak_waveform_at(&audio, per_second),
+                deckhand_audio::band_waveform_at(&audio, per_second),
+                per_second,
+            )
+        } else {
+            let mut waveform = WaveformData::from_analysis(ext.as_ref(), two_ex.as_ref())
+                .or_else(worked_out)
+                .unwrap_or_else(|| WaveformData::from_peaks(&peak_waveform(&audio), Vec::new()));
+            if !waveform.has_bands() {
+                waveform.bands = band_waveform(&audio);
+            }
+            waveform.shape_from_bands();
+            waveform
+        };
         let mut beats: Vec<(f64, u16)> = dat
             .as_ref()
             .and_then(AnlzFile::beat_grid)

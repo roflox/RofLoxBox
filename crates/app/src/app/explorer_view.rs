@@ -265,6 +265,9 @@ impl DeckhandApp {
                 added: String::new(),
                 bitrate: f.bitrate,
                 comment: f.comment.clone(),
+                artwork: f.has_artwork.then(|| crate::artwork::Cover::Embedded(f.path.clone())),
+                preview: Some(crate::preview::Source { audio: f.path.clone(), analysis: None }),
+                cues: None,
             })
             .collect();
         sort_rows(&mut rows, self.config.sort);

@@ -321,15 +321,37 @@ pub fn round_button(
     response
 }
 
-/// Dark, flat look in the spirit of rekordbox's performance screen.
-pub fn apply_theme(ctx: &eframe::egui::Context, theme: crate::config::Theme) {
+/// Dark, flat look in the spirit of rekordbox's performance screen, or its
+/// light version, or whichever the system uses; text at `text_scale`
+/// percent.
+pub fn apply_theme(ctx: &eframe::egui::Context, theme: crate::config::Theme, text_scale: u32) {
     use crate::config::Theme;
-    use eframe::egui::{ThemePreference, Visuals};
+    use eframe::egui::ThemePreference;
+    // Both looks are set; egui picks one, following the system for System.
+    ctx.set_visuals_of(eframe::egui::Theme::Dark, visuals(true));
+    ctx.set_visuals_of(eframe::egui::Theme::Light, visuals(false));
+    ctx.set_theme(match theme {
+        Theme::Dark => ThemePreference::Dark,
+        Theme::Light => ThemePreference::Light,
+        Theme::System => ThemePreference::System,
+    });
+    let scale = text_scale.clamp(50, 300) as f32 / 100.0;
+    let normal = eframe::egui::Style::default().text_styles;
+    ctx.all_styles_mut(|style| {
+        style.spacing.button_padding = vec2(5.0, 2.0);
+        // Labels are not text to select; no I-beam cursor over the library.
+        style.interaction.selectable_labels = false;
+        style.text_styles = normal
+            .iter()
+            .map(|(name, font)| (name.clone(), FontId::new(font.size * scale, font.family.clone())))
+            .collect();
+    });
+}
+
+fn visuals(dark: bool) -> eframe::egui::Visuals {
+    use eframe::egui::Visuals;
     let gray = Color32::from_gray;
     let corner = CornerRadius::same(3);
-    let dark = theme == Theme::Dark;
-    // Fixed either way, so that the system's theme does not get a say.
-    ctx.set_theme(if dark { ThemePreference::Dark } else { ThemePreference::Light });
     let mut v = if dark { Visuals::dark() } else { Visuals::light() };
     if dark {
         v.panel_fill = gray(20);
@@ -369,12 +391,7 @@ pub fn apply_theme(ctx: &eframe::egui::Context, theme: crate::config::Theme) {
     v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, gray(if dark { 195 } else { 40 }));
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, gray(if dark { 45 } else { 200 }));
     v.widgets.noninteractive.corner_radius = corner;
-    ctx.set_visuals(v);
-    ctx.style_mut(|style| {
-        style.spacing.button_padding = vec2(5.0, 2.0);
-        // Labels are not text to select; no I-beam cursor over the library.
-        style.interaction.selectable_labels = false;
-    });
+    v
 }
 
 /// A small triangle for folders: pointing right when closed, down when

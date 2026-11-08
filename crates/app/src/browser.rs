@@ -28,10 +28,12 @@ pub enum TrackColumn {
     Added,
     Bitrate,
     Comment,
+    /// The whole waveform, small, with the cues.
+    Preview,
 }
 
 impl TrackColumn {
-    pub const ALL: [TrackColumn; 15] = [
+    pub const ALL: [TrackColumn; 16] = [
         Self::Number,
         Self::Title,
         Self::Artist,
@@ -47,12 +49,14 @@ impl TrackColumn {
         Self::Added,
         Self::Bitrate,
         Self::Comment,
+        Self::Preview,
     ];
 
     pub fn default_set() -> Vec<TrackColumn> {
         vec![
             Self::Number,
             Self::Title,
+            Self::Preview,
             Self::Artist,
             Self::Bpm,
             Self::Key,
@@ -79,6 +83,7 @@ impl TrackColumn {
             Self::Added => "Added",
             Self::Bitrate => "Bitrate",
             Self::Comment => "Comment",
+            Self::Preview => "Preview",
         }
     }
 
@@ -92,7 +97,13 @@ impl TrackColumn {
             Self::Added => 84.0,
             Self::Bpm | Self::Time | Self::Bitrate => 58.0,
             Self::Key | Self::Year | Self::Plays => 46.0,
+            Self::Preview => 160.0,
         }
+    }
+
+    /// Clicking the header sorts by it.
+    fn sortable(self) -> bool {
+        self != Self::Preview
     }
 
     /// Numbers start with the highest when first clicked, text with A.
@@ -134,6 +145,12 @@ pub struct Row {
     /// kbit/s.
     pub bitrate: Option<u32>,
     pub comment: String,
+    /// Where its cover picture is, if it has one.
+    pub artwork: Option<crate::artwork::Cover>,
+    /// Where its preview waveform comes from, and its cues when the list
+    /// has its own (else the analysis's are shown).
+    pub preview: Option<crate::preview::Source>,
+    pub cues: Option<Vec<crate::preview::Mark>>,
 }
 
 impl Row {
@@ -154,6 +171,7 @@ impl Row {
             TrackColumn::Added => self.added.clone(),
             TrackColumn::Bitrate => self.bitrate.map_or_else(String::new, |b| b.to_string()),
             TrackColumn::Comment => self.comment.clone(),
+            TrackColumn::Preview => String::new(),
         }
     }
 
@@ -275,7 +293,9 @@ pub fn track_table(
     let mut table = TableBuilder::new(ui)
         .striped(true)
         .sense(if options.draggable { Sense::click_and_drag() } else { Sense::click() })
-        .resizable(true);
+        .resizable(true)
+        // The covers, before the columns (not sorted, not moved).
+        .column(Column::exact(20.0).resizable(false));
     for (i, column) in shown.iter().enumerate() {
         table = table.column(if i == 0 {
             Column::initial(column.width()).at_least(column.width().min(120.0)).clip(true)
@@ -296,6 +316,7 @@ pub fn track_table(
     }
     table
         .header(20.0, |mut header| {
+            header.col(|_| {});
             for &column in &shown {
                 header.col(|ui| {
                     let direction = sort.filter(|s| s.column == column).map(|s| s.descending);
@@ -311,7 +332,11 @@ pub fn track_table(
                             label
                         })
                         .inner
-                        .on_hover_text("Click to sort; again to reverse; a third time for playlist order. Drag to move the column. Right-click to choose columns.");
+                        .on_hover_text(if column.sortable() {
+                            "Click to sort; again to reverse; a third time for playlist order. Drag to move the column. Right-click to choose columns."
+                        } else {
+                            "Drag to move the column. Right-click to choose columns."
+                        });
                     // Dragging a header onto another moves it there (in front
                     // of it, or behind it on its right half).
                     response.dnd_set_drag_payload(column);
@@ -331,7 +356,7 @@ pub fn track_table(
                         columns.insert(at, *dragged);
                         output.layout_changed = true;
                     }
-                    if response.clicked() {
+                    if response.clicked() && column.sortable() {
                         // Unsorted → first direction → reversed → unsorted.
                         *sort = match *sort {
                             Some(s) if s.column == column && s.descending != column.starts_descending() => None,
@@ -371,8 +396,39 @@ pub fn track_table(
                     options.marked.contains(&row.id)
                 };
                 table_row.set_selected(highlighted);
+                table_row.col(|ui| {
+                    let texture = row
+                        .artwork
+                        .as_ref()
+                        .and_then(|cover| crate::artwork::thumbnail_texture(ui.ctx(), cover));
+                    if let Some(texture) = texture {
+                        ui.add(
+                            egui::Image::new(&texture)
+                                .fit_to_exact_size(vec2(18.0, 18.0))
+                                .corner_radius(2.0),
+                        );
+                    }
+                });
                 for &column in &shown {
                     table_row.col(|ui| {
+                        if column == TrackColumn::Preview {
+                            let rect = ui.max_rect().shrink2(vec2(1.0, 2.0));
+                            let preview = row
+                                .preview
+                                .as_ref()
+                                .and_then(|source| crate::preview::get(ui.ctx(), source));
+                            if let Some(preview) = preview {
+                                let cues = row.cues.as_deref().unwrap_or(&preview.cues);
+                                crate::preview::draw(
+                                    &ui.painter_at(rect),
+                                    rect,
+                                    &preview,
+                                    cues,
+                                    row.duration,
+                                );
+                            }
+                            return;
+                        }
                         if column == TrackColumn::Rating {
                             if let Some(stars) = rating(ui, row.rating, options.editable_rating) {
                                 output.rated = Some((row.id, stars));

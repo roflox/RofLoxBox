@@ -240,14 +240,6 @@ impl Equalizer {
     }
 }
 
-/// One-knob DJ filter: low-pass left of center, high-pass right of center.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Filter {
-    rate: f32,
-    biquad: Biquad,
-    active: bool,
-}
-
 impl Biquad {
     pub(crate) fn low_pass(&mut self, rate: f32, freq: f32, q: f32) {
         let w = 2.0 * PI * freq / rate;
@@ -270,36 +262,150 @@ impl Biquad {
     }
 }
 
+/// One-knob DJ filter: low-pass left of center, high-pass right of center.
+///
+/// A state-variable filter (Simper's trapezoidal SVF): its low- and
+/// high-pass come from the same state and stay stable while the cutoff
+/// moves, so the knob can sweep and cross the center without clicks. The
+/// knob glides to its new place over a few milliseconds (no steps from a
+/// 7-bit controller), and near the center the filter fades into the dry
+/// signal instead of switching off.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Filter {
+    rate: f32,
+    /// Where the knob is, −1.0 … 1.0.
+    target: f32,
+    /// Where the filter is, gliding to `target`.
+    position: f32,
+    /// Per-channel state `[ic1eq, ic2eq]`.
+    state: [[f32; 2]; 2],
+    /// The coefficients for `position`: `[a1, a2, a3, k]`.
+    coefficients: [f32; 4],
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::new(48_000.0)
+    }
+}
+
+/// Resonance at the cutoff, as before (Q 0.9).
+const FILTER_Q: f32 = 0.9;
+/// How long the filter takes to follow the knob (to about 63 %).
+const FILTER_GLIDE_SECS: f32 = 0.008;
+/// Knob values this close to the center fade into the dry signal.
+const FILTER_DEAD_ZONE: f32 = 0.02;
+
 impl Filter {
     pub fn new(rate: f32) -> Self {
-        Self { rate, biquad: Biquad::default(), active: false }
+        let mut filter =
+            Self { rate, target: 0.0, position: 0.0, state: [[0.0; 2]; 2], coefficients: [0.0; 4] };
+        filter.update();
+        filter
     }
 
-    /// `position` −1.0 … 1.0; values near 0 bypass the filter.
+    /// `position` −1.0 … 1.0; the center leaves the sound alone.
     pub fn set(&mut self, position: f32) {
-        let x = position.clamp(-1.0, 1.0);
-        self.active = x.abs() > 0.02;
-        let amount = (x.abs() - 0.02) / 0.98;
-        if x < 0.0 {
-            // 20 kHz down to 60 Hz, exponentially.
-            self.biquad.low_pass(self.rate, 20_000.0 * (60.0f32 / 20_000.0).powf(amount), 0.9);
+        self.target = position.clamp(-1.0, 1.0);
+    }
+
+    /// The cutoff for a knob position: 20 kHz down to 60 Hz to the left,
+    /// 20 Hz up to 8 kHz to the right, both exponential.
+    fn cutoff(&self, x: f32) -> f32 {
+        let amount = ((x.abs() - FILTER_DEAD_ZONE) / (1.0 - FILTER_DEAD_ZONE)).max(0.0);
+        let hz = if x < 0.0 {
+            20_000.0 * (60.0f32 / 20_000.0).powf(amount)
         } else {
-            // 20 Hz up to 8 kHz.
-            self.biquad.high_pass(self.rate, 20.0 * (8_000.0f32 / 20.0).powf(amount), 0.9);
-        }
+            20.0 * (8_000.0f32 / 20.0).powf(amount)
+        };
+        hz.min(self.rate * 0.45)
+    }
+
+    fn update(&mut self) {
+        let g = (PI * self.cutoff(self.position) / self.rate).tan();
+        let k = 1.0 / FILTER_Q;
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        self.coefficients = [a1, a2, g * a2, k];
     }
 
     pub fn process(&mut self, frame: [f32; 2]) -> [f32; 2] {
-        if !self.active {
-            return frame;
+        if self.position != self.target {
+            let step = 1.0 - (-1.0 / (FILTER_GLIDE_SECS * self.rate)).exp();
+            self.position += (self.target - self.position) * step;
+            if (self.target - self.position).abs() < 1e-4 {
+                self.position = self.target;
+            }
+            self.update();
         }
-        [self.biquad.process(0, frame[0]), self.biquad.process(1, frame[1])]
+        let [a1, a2, a3, k] = self.coefficients;
+        let low = self.position < 0.0;
+        // 0 at the center, 1 from the edge of the dead zone on.
+        let wet = (self.position.abs() / FILTER_DEAD_ZONE).min(1.0);
+        let mut out = frame;
+        for (channel, sample) in out.iter_mut().enumerate() {
+            let [ic1, ic2] = self.state[channel];
+            let v0 = *sample;
+            let v3 = v0 - ic2;
+            let v1 = a1 * ic1 + a2 * v3;
+            let v2 = ic2 + a2 * ic1 + a3 * v3;
+            self.state[channel] = [2.0 * v1 - ic1, 2.0 * v2 - ic2];
+            let filtered = if low { v2 } else { v0 - k * v1 - v2 };
+            *sample = v0 + (filtered - v0) * wet;
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod eq_tests {
     use super::*;
+
+    /// The largest jump between neighbouring samples of a slow sine sent
+    /// through the filter while the knob jumps across the center and back.
+    #[test]
+    fn filter_does_not_click_when_switched_fast() {
+        let rate = 48_000.0;
+        let mut filter = Filter::new(rate);
+        let mut last = 0.0f32;
+        let mut worst = 0.0f32;
+        for i in 0..48_000 {
+            // Hard left, hard right, center, every 20 ms.
+            if i % 960 == 0 {
+                filter.set([-1.0, 1.0, 0.0, 0.6, -0.4][(i / 960) % 5]);
+            }
+            let x = (2.0 * PI * 100.0 * i as f32 / rate).sin() * 0.5;
+            let y = filter.process([x, x])[0];
+            worst = worst.max((y - last).abs());
+            last = y;
+        }
+        // A 100 Hz sine at 0.5 moves at most 0.0066 per sample.
+        assert!(worst < 0.05, "jump of {worst}");
+    }
+
+    #[test]
+    fn filter_center_is_dry_and_ends_cut() {
+        let rate = 48_000.0;
+        let level = |position: f32, hz: f32| {
+            let mut filter = Filter::new(rate);
+            filter.set(position);
+            let (mut input, mut output) = (0f32, 0f32);
+            for i in 0..48_000 {
+                let x = (2.0 * PI * hz * i as f32 / rate).sin();
+                let y = filter.process([x, x])[0];
+                if i > 24_000 {
+                    input += x * x;
+                    output += y * y;
+                }
+            }
+            10.0 * (output / input).log10()
+        };
+        assert!(level(0.0, 1_000.0).abs() < 0.01);
+        assert!(level(-1.0, 5_000.0) < -30.0, "low-pass cuts highs");
+        assert!(level(1.0, 200.0) < -30.0, "high-pass cuts lows");
+        assert!(level(-1.0, 30.0) > -3.0, "low-pass keeps lows");
+    }
 
     /// Level of a sine at `hz` after the EQ, relative to before, in dB.
     fn response(eq: &mut Equalizer, hz: f32) -> f32 {

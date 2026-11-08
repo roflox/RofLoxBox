@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use deckhand_audio::{
-    BeatFxKind, BeatFxParams, Curve, FxTarget, Point, Session, Setting, SyncSpan, TrackMove,
-    TrackSpan, fx_spans, lane_value, move_fx, remove_fx, restyle_fx,
+    BeatFxKind, BeatFxParams, ColorFxKind, Curve, FxTarget, Point, Session, Setting, SyncSpan,
+    TrackMove, TrackSpan, fx_spans, lane_value, move_fx, remove_fx, restyle_fx,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 
@@ -19,6 +19,8 @@ use super::{DECK_COLORS, DeckhandApp, WARN};
 
 /// Bass clashes.
 const CLASH: Color32 = Color32::from_rgb(235, 60, 60);
+/// The playhead.
+const PLAY: Color32 = Color32::from_rgb(255, 200, 60);
 /// Width of the names left of the timeline.
 const LABELS: f32 = 150.0;
 const RULER: f32 = 22.0;
@@ -26,7 +28,7 @@ const DECK_ROW: f32 = 26.0;
 /// A deck's row with its waveform.
 const TRACK_ROW: f32 = 52.0;
 const LANE_ROW: f32 = 56.0;
-const FX_ROW: f32 = 40.0;
+const FX_ROW: f32 = 56.0;
 /// How close (points) the pointer has to be to take hold of a point.
 const GRAB: f32 = 7.0;
 
@@ -83,12 +85,35 @@ struct MixEditor {
     chosen_move: Option<(usize, u64)>,
     /// Each track's BPM, by file.
     bpms: HashMap<PathBuf, f64>,
-    /// The Color FX type of the channel knobs.
-    color_fx: deckhand_audio::ColorFxKind,
+    /// The Beat FX row and the Color FX overview are shown.
+    show_beat_fx: bool,
+    show_color_fx: bool,
+    /// The lanes as recorded, to go back to.
+    original: BTreeMap<Setting, Vec<Point>>,
+    /// Listening: the player, where playing starts, and the output device.
+    player: Option<deckhand_audio::SessionPlayer>,
+    cursor: u64,
+    device: Option<String>,
+    /// Changed while playing: play again from where it is, with the change.
+    replay_edit: bool,
     /// The Beat FX's changes, the block chosen and one being dragged.
     fx: Vec<(u64, BeatFxParams)>,
     chosen_fx: Option<usize>,
     fx_drag: Option<FxDrag>,
+    /// The Add Beat FX dialog, when open; and what was last added (the
+    /// dialog starts with it).
+    adding_fx: Option<AddFx>,
+    last_fx: AddFx,
+    /// A Beat FX depth point being dragged.
+    depth_drag: Option<DepthDrag>,
+    /// The tool, and the stretches selected with it: of a deck's clips, of
+    /// the Beat FX (and where the drag started).
+    tool: Tool,
+    /// The keys of the tools, as Preferences name them.
+    pub(super) tool_keys: [String; 2],
+    clip_selection: Option<(usize, u64, u64)>,
+    fx_selection: Option<(u64, u64)>,
+    range_from: u64,
     /// Where the pointer is on the timeline, for the values.
     hover: Option<u64>,
     /// What each deck played (levels and beats), being worked out again
@@ -208,6 +233,42 @@ struct FxDrag {
     to: u64,
 }
 
+/// The Add Beat FX dialog: where the effect starts, where the dialog is,
+/// and the choices.
+#[derive(Clone, Copy)]
+struct AddFx {
+    at: u64,
+    pos: Pos2,
+    kind: BeatFxKind,
+    target: FxTarget,
+    beats: u32,
+    depth: f32,
+}
+
+/// A Beat FX depth point being dragged: which point of the depth lane, the
+/// block it is in, and the lane as it is now.
+struct DepthDrag {
+    index: usize,
+    block: Rect,
+    points: Vec<Point>,
+}
+
+/// The editing tool: Normal moves and edits; Select drags stretches to
+/// delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tool {
+    Normal,
+    Select,
+}
+
+/// Which kind of selection is made (one at a time).
+#[derive(Clone, Copy)]
+enum Selected {
+    Lane,
+    Clip,
+    Fx,
+}
+
 #[derive(Clone, Copy)]
 enum FxGrip {
     Start,
@@ -237,6 +298,15 @@ struct Render {
     done: Receiver<Result<String>>,
 }
 
+impl EditView {
+    /// Stops listening (leaving EDIT mode).
+    pub(super) fn stop_playing(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.player = None;
+        }
+    }
+}
+
 impl MixEditor {
     fn new(path: PathBuf, session: Session) -> Self {
         let rate = f64::from(session.sample_rate());
@@ -248,18 +318,25 @@ impl MixEditor {
             .filter_map(|t| Some((t.path.clone(), session.grid(&t.path)?.bpm)))
             .filter(|(_, bpm)| *bpm > 0.0)
             .collect();
-        let (moves, fx, color_fx) = (session.moves(), session.beat_fx(), session.color_fx());
+        let (moves, fx) = (session.moves(), session.beat_fx());
         let pieces = tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
         let key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
         let decks = tracks.iter().map(|t| t.deck + 1).max().unwrap_or(0);
-        let lanes: BTreeMap<_, _> =
-            Setting::all(deckhand_audio::DECKS).into_iter().map(|s| (s, session.lane(s))).collect();
+        let lanes: BTreeMap<_, _> = Setting::all(deckhand_audio::DECKS)
+            .into_iter()
+            .chain([Setting::BeatFxDepth])
+            .map(|s| (s, session.lane(s)))
+            .collect();
         // The lanes that move, else the decks' faders.
-        let mut shown: Vec<Setting> =
-            lanes.iter().filter(|(_, points)| points.len() > 1).map(|(s, _)| *s).collect();
+        let mut shown: Vec<Setting> = lanes
+            .iter()
+            .filter(|(s, points)| points.len() > 1 && **s != Setting::BeatFxDepth)
+            .map(|(s, _)| *s)
+            .collect();
         if shown.is_empty() {
             shown = (0..decks).map(Setting::Volume).collect();
         }
+        let original = lanes.clone();
         shown.sort_by_key(lane_order);
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         // Test aid: "from,seconds" on view.
@@ -293,9 +370,30 @@ impl MixEditor {
             move_drag: None,
             chosen_move: None,
             bpms,
-            color_fx,
+            show_beat_fx: true,
+            show_color_fx: true,
+            original,
+            player: None,
+            cursor: 0,
+            device: None,
+            replay_edit: false,
             fx,
             chosen_fx: None,
+            adding_fx: None,
+            last_fx: AddFx {
+                at: 0,
+                pos: Pos2::ZERO,
+                kind: BeatFxKind::Echo,
+                target: FxTarget::Master,
+                beats: 8,
+                depth: 0.5,
+            },
+            depth_drag: None,
+            tool: Tool::Normal,
+            tool_keys: Default::default(),
+            clip_selection: None,
+            fx_selection: None,
+            range_from: 0,
             fx_drag: None,
             hover: None,
             played: Vec::new(),
@@ -413,6 +511,7 @@ impl MixEditor {
         self.redo.clear();
         self.edited = true;
         self.played_stale = true;
+        self.replay_edit = true;
     }
 
     /// Goes to `edit`'s state; returns the edit that comes back.
@@ -452,6 +551,7 @@ impl MixEditor {
             }
         };
         self.played_stale = true;
+        self.replay_edit = true;
         Some(back)
     }
 
@@ -556,6 +656,250 @@ impl MixEditor {
         self.playing_out = Some(rx);
     }
 
+    /// Plays the set as it is now from `from` (frames from the start).
+    fn play_from(&mut self, from: u64) {
+        self.player = None;
+        let Ok(session) = self.session.try_lock() else {
+            self.note = Some("Busy; play again in a moment".into());
+            return;
+        };
+        let started = session.duplicate().and_then(|copy| {
+            deckhand_audio::SessionPlayer::start(
+                copy,
+                from.min(self.length),
+                self.device.as_deref(),
+            )
+        });
+        drop(session);
+        match started {
+            Ok(player) => self.player = Some(player),
+            Err(err) => self.note = Some(format!("Could not play: {err:#}")),
+        }
+    }
+
+    /// Space: plays from the cursor, or stops (the cursor stays, so
+    /// playing again starts at the same place).
+    fn toggle_play(&mut self) {
+        if self.player.take().is_none() {
+            self.play_from(self.cursor);
+        }
+    }
+
+    /// Where it is playing, in frames from the start.
+    fn playhead(&self) -> Option<u64> {
+        self.player.as_ref().map(|p| p.position().min(self.length))
+    }
+
+    /// Keeps playing going: plays edits made meanwhile, follows the
+    /// playhead off the screen, notices the end.
+    fn poll_player(&mut self, ctx: &egui::Context) {
+        let replay = std::mem::take(&mut self.replay_edit);
+        let Some(player) = &self.player else { return };
+        if player.finished() {
+            if let Some(err) = player.error() {
+                self.note = Some(format!("Playing stopped: {err}"));
+            }
+            self.player = None;
+            return;
+        }
+        let at = player.position().min(self.length);
+        if replay && !self.busy() {
+            self.play_from(at);
+        }
+        let secs = at as f64 / self.rate;
+        if secs > self.view_from + self.view_secs || secs < self.view_from {
+            self.view_from = secs - self.view_secs * 0.05;
+            self.clamp_view();
+        }
+        ctx.request_repaint();
+    }
+
+    /// The cursor (where playing starts) and the playhead, down `area`.
+    fn play_marks(&self, painter: &egui::Painter, area: Rect) {
+        let x = self.x_of(area, self.cursor);
+        painter.line_segment(
+            [pos2(x, area.top()), pos2(x, area.bottom())],
+            Stroke::new(1.0_f32, PLAY.gamma_multiply(0.45)),
+        );
+        if let Some(at) = self.playhead() {
+            let x = self.x_of(area, at);
+            painter.line_segment(
+                [pos2(x, area.top()), pos2(x, area.bottom())],
+                Stroke::new(1.5_f32, PLAY),
+            );
+        }
+    }
+
+    /// Puts `from`..`to` of a lane back as it was recorded; after it, the
+    /// lane goes on as edited.
+    fn reset(&mut self, setting: Setting, from: u64, to: u64) {
+        let before = self.lanes[&setting].clone();
+        let original = &self.original[&setting];
+        let curve_at = |points: &[Point], at: u64| {
+            points[points.partition_point(|p| p.at <= at).saturating_sub(1)].curve
+        };
+        let mut lane: Vec<Point> = before.iter().filter(|p| p.at < from).copied().collect();
+        lane.push(Point {
+            at: from,
+            value: lane_value(original, from),
+            curve: curve_at(original, from),
+        });
+        lane.extend(original.iter().filter(|p| p.at > from && p.at < to).copied());
+        if to < self.length {
+            lane.push(Point {
+                at: to,
+                value: lane_value(&before, to),
+                curve: curve_at(&before, to),
+            });
+            lane.extend(before.iter().filter(|p| p.at > to).copied());
+        }
+        self.lanes.insert(setting, lane);
+        let what = if from == 0 && to >= self.length { "reset lane" } else { "reset to original" };
+        self.commit(setting, before, what);
+    }
+
+    /// The decks whose Color FX were on somewhere.
+    fn color_decks(&self) -> Vec<usize> {
+        (0..deckhand_audio::DECKS)
+            .filter(|&d| {
+                ColorFxKind::ALL
+                    .iter()
+                    .any(|&k| self.lanes[&Setting::ColorFx(d, k)].iter().any(|p| p.value != 0.0))
+            })
+            .collect()
+    }
+
+    /// Where each deck's Color FX were on, and which: a strip a deck, in
+    /// its colour, named by type (only to see; they are changed on the
+    /// decks' intensity lanes). A click shows that type's lane.
+    fn color_overview(&mut self, ui: &Ui, row: Rect, response: &egui::Response, decks: &[usize]) {
+        let visuals = ui.visuals().clone();
+        ui.painter().text(
+            pos2(row.left() + 4.0, row.top() + 4.0),
+            egui::Align2::LEFT_TOP,
+            "Color FX",
+            egui::FontId::proportional(13.0),
+            visuals.strong_text_color(),
+        );
+        let area = Rect::from_min_max(pos2(row.left() + LABELS, row.top() + 1.0), row.max);
+        let painter = ui.painter_at(area);
+        painter.rect_filled(area, 2.0, visuals.extreme_bg_color);
+        if decks.is_empty() {
+            painter.text(
+                area.left_center() + vec2(6.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                "No Color FX in this set",
+                egui::FontId::proportional(11.0),
+                visuals.weak_text_color(),
+            );
+            return;
+        }
+        let mut stretches = Vec::new();
+        for (i, &deck) in decks.iter().enumerate() {
+            let color = DECK_COLORS[deck % DECK_COLORS.len()];
+            let top = area.top() + 3.0 + 14.0 * i as f32;
+            for kind in ColorFxKind::ALL {
+                let lane = &self.lanes[&Setting::ColorFx(deck, kind)];
+                // Stretches where the lane is off zero.
+                let mut from = None;
+                for (j, point) in lane.iter().enumerate() {
+                    let next = lane.get(j + 1).map_or(self.length, |p| p.at);
+                    let on = point.value != 0.0
+                        || point.curve != Curve::Step
+                            && lane.get(j + 1).is_some_and(|n| n.value != 0.0);
+                    match (on, from) {
+                        (true, None) => from = Some(point.at),
+                        (false, Some(start)) => {
+                            stretches.push((deck, kind, start, point.at, top, color));
+                            from = None;
+                        }
+                        _ => {}
+                    }
+                    if j + 1 == lane.len()
+                        && let Some(start) = from
+                    {
+                        stretches.push((deck, kind, start, next, top, color));
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        for &(deck, kind, from, to, top, color) in &stretches {
+            let block = Rect::from_x_y_ranges(
+                self.x_of(area, from)..=self.x_of(area, to).max(self.x_of(area, from) + 2.0),
+                top..=top + 12.0,
+            );
+            painter.rect_filled(block, 2.0, color.gamma_multiply(0.45));
+            let text = ui.painter().layout_no_wrap(
+                kind.title().to_owned(),
+                egui::FontId::proportional(10.0),
+                Color32::WHITE,
+            );
+            let clip = block.intersect(area).shrink2(vec2(2.0, 0.0));
+            ui.painter().with_clip_rect(clip).galley(
+                pos2(clip.left(), block.top()),
+                text,
+                Color32::WHITE,
+            );
+            hits.push((block, deck, kind));
+        }
+        self.play_marks(&painter, area);
+        if let Some(pos) = response.hover_pos()
+            && let Some(&(_, deck, kind)) = hits.iter().find(|h| h.0.contains(pos))
+        {
+            response.clone().on_hover_text_at_pointer(format!(
+                "Deck {} {} — click to show its lane",
+                deck + 1,
+                kind.title()
+            ));
+        }
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(&(_, deck, kind)) = hits.iter().find(|h| h.0.contains(pos))
+        {
+            let setting = Setting::ColorFx(deck, kind);
+            if !self.shown.contains(&setting) {
+                self.shown.push(setting);
+                self.shown.sort_by_key(lane_order);
+            }
+            self.collapsed.remove(&Some(deck));
+        }
+    }
+
+    /// A small + right under a group's row, opening `menu` (the lanes to
+    /// show).
+    fn add_button(&mut self, ui: &mut Ui, menu: impl FnOnce(&mut Self, &mut Ui)) {
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.menu_button(RichText::new("+").strong(), |ui| menu(self, ui))
+                .response
+                .on_hover_text("Add or remove lanes");
+        });
+    }
+
+    /// The lanes of a group (a deck, or the mixer's with `None`) to show or
+    /// hide; • marks the ones that move.
+    fn lane_menu(&mut self, ui: &mut Ui, group: Option<usize>) {
+        for setting in Setting::all(deckhand_audio::DECKS) {
+            if setting.deck() != group {
+                continue;
+            }
+            let moves = self.lanes[&setting].len() > 1;
+            let mut on = self.shown.contains(&setting);
+            let label =
+                if moves { format!("{} •", setting.label()) } else { setting.label().into() };
+            if ui.checkbox(&mut on, label).changed() {
+                if on {
+                    self.shown.push(setting);
+                    self.shown.sort_by_key(lane_order);
+                } else {
+                    self.shown.retain(|s| *s != setting);
+                }
+            }
+        }
+        ui.label(RichText::new("• it moves in the recording").small().weak());
+    }
+
     /// ← and → move the chosen track's move by a millisecond (a tenth
     /// with ⇧).
     fn nudge_move(&mut self, by: f64) {
@@ -623,6 +967,40 @@ impl MixEditor {
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
+        let playing = self.player.is_some();
+        let label = if playing { "⏹ Stop" } else { "▶ Play" };
+        if ui
+            .add(egui::Button::new(label).selected(playing))
+            .on_hover_text("Plays the set as edited from the cursor (Space). Click the ruler to put the cursor somewhere")
+            .clicked()
+        {
+            self.toggle_play();
+        }
+        let at = self.playhead().unwrap_or(self.cursor) as f64 / self.rate;
+        ui.label(RichText::new(format!("{}:{:05.2}", (at / 60.0) as u64, at % 60.0)).monospace());
+        if self.player.as_ref().is_some_and(|p| !p.ready()) {
+            ui.spinner().on_hover_text("Getting to the cursor…");
+        }
+        ui.separator();
+        for (tool, label, hint) in [
+            (Tool::Normal, "Normal", "Move and edit clips, points and effects"),
+            (
+                Tool::Select,
+                "Select",
+                "Drag a stretch of a deck's clips, the Beat FX or a lane; Delete removes it",
+            ),
+        ] {
+            let keys = &self.tool_keys;
+            let key = match tool {
+                Tool::Normal => &keys[0],
+                Tool::Select => &keys[1],
+            };
+            let hint = if key.is_empty() { hint.to_owned() } else { format!("{hint} ({key})") };
+            if ui.selectable_label(self.tool == tool, label).on_hover_text(hint).clicked() {
+                self.tool = tool;
+            }
+        }
+        ui.separator();
         ui.label(RichText::new(&self.name).strong());
         let secs = self.secs() as u64;
         ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).weak());
@@ -684,9 +1062,6 @@ impl MixEditor {
             "Marks where two decks' low end (bass, kick, below 150 Hz) goes into the mix at \
              the same time, as heard: after EQ, faders and crossfader",
         );
-        if idle {
-            self.fx_tools(ui);
-        }
         if !self.sync.is_empty() {
             ui.separator();
             ui.checkbox(&mut self.follow, "Synced decks follow").on_hover_text(
@@ -695,27 +1070,6 @@ impl MixEditor {
             );
         }
         ui.separator();
-        ui.menu_button("Lanes", |ui| {
-            let mut deck = None;
-            for setting in Setting::all(deckhand_audio::DECKS) {
-                if setting.deck() != deck {
-                    deck = setting.deck();
-                    ui.label(RichText::new(lane_group(setting)).small().weak());
-                }
-                let moves = self.lanes[&setting].len() > 1;
-                let mut on = self.shown.contains(&setting);
-                let label =
-                    if moves { format!("{} •", setting.label()) } else { setting.label().into() };
-                if ui.checkbox(&mut on, label).changed() {
-                    if on {
-                        self.shown.push(setting);
-                        self.shown.sort_by_key(lane_order);
-                    } else {
-                        self.shown.retain(|s| *s != setting);
-                    }
-                }
-            }
-        });
         if ui.button("Fit").on_hover_text("The whole set on view").clicked() {
             (self.view_from, self.view_secs) = (0.0, self.secs().max(1.0));
         }
@@ -724,9 +1078,19 @@ impl MixEditor {
     /// The timeline: ruler, the decks' tracks, then the lanes.
     fn timeline(&mut self, ui: &mut Ui) {
         let width = ui.available_width();
-        let (ruler, response) = ui.allocate_exact_size(vec2(width, RULER), Sense::hover());
+        let (ruler, response) = ui.allocate_exact_size(vec2(width, RULER), Sense::click_and_drag());
         let area = Rect::from_min_max(pos2(ruler.left() + LABELS, ruler.top()), ruler.max);
         self.ruler(ui, area);
+        // A click (or drag) on the ruler puts the cursor there; playing
+        // goes on from there.
+        if let Some(pos) = response.interact_pointer_pos().filter(|p| p.x >= area.left())
+            && (response.clicked() || response.dragged())
+        {
+            self.cursor = self.at_of(area, pos.x);
+            if response.clicked() && self.player.is_some() {
+                self.play_from(self.cursor);
+            }
+        }
         if self.show_clashes {
             self.clash_bands(ui, area, &response);
         }
@@ -757,9 +1121,6 @@ impl MixEditor {
             for (i, deck) in groups.enumerate() {
                 let lanes: Vec<Setting> =
                     self.shown.iter().copied().filter(|s| s.deck() == deck).collect();
-                if deck.is_none() && lanes.is_empty() {
-                    continue;
-                }
                 if i > 0 {
                     ui.add_space(10.0);
                 }
@@ -776,6 +1137,7 @@ impl MixEditor {
                 if folded {
                     continue;
                 }
+                self.add_button(ui, |editor, ui| editor.lane_menu(ui, deck));
                 for setting in lanes {
                     let (row, response) =
                         ui.allocate_exact_size(vec2(width, LANE_ROW), Sense::click_and_drag());
@@ -788,11 +1150,31 @@ impl MixEditor {
             let folded = self.fold(ui, row, &response, EFFECTS);
             self.group_name(ui, row, "Effects", ui.visuals().strong_text_color(), folded);
             if !folded {
-                let (row, response) =
-                    ui.allocate_exact_size(vec2(width, FX_ROW), Sense::click_and_drag());
-                self.fx_row(ui, row, &response);
+                self.add_button(ui, |editor, ui| {
+                    ui.checkbox(&mut editor.show_color_fx, "Color FX (where they were on)");
+                    ui.checkbox(&mut editor.show_beat_fx, "Beat FX");
+                    ui.label(
+                        RichText::new("Color FX are changed per deck: under each deck's +")
+                            .small()
+                            .weak(),
+                    );
+                });
+                if self.show_color_fx {
+                    let decks = self.color_decks();
+                    let height = 6.0 + 14.0 * decks.len().max(1) as f32;
+                    let (row, response) =
+                        ui.allocate_exact_size(vec2(width, height), Sense::click());
+                    self.color_overview(ui, row, &response, &decks);
+                    ui.add_space(2.0);
+                }
+                if self.show_beat_fx {
+                    let (row, response) =
+                        ui.allocate_exact_size(vec2(width, FX_ROW), Sense::click_and_drag());
+                    self.fx_row(ui, row, &response);
+                }
             }
         });
+        self.add_fx_dialog(ui.ctx());
     }
 
     /// A click on a group's name folds its lanes away or back; whether
@@ -886,6 +1268,14 @@ impl MixEditor {
             );
             t += step;
         }
+        self.play_marks(&painter, area);
+        // The cursor's handle.
+        let x = self.x_of(area, self.cursor);
+        painter.add(Shape::convex_polygon(
+            vec![pos2(x - 5.0, area.top()), pos2(x + 5.0, area.top()), pos2(x, area.top() + 7.0)],
+            PLAY,
+            Stroke::NONE,
+        ));
     }
 
     /// A deck's tracks. Dragging one moves its audio (from where it starts
@@ -913,6 +1303,11 @@ impl MixEditor {
             );
             let by = start as i64 - span.from as i64;
             let pieces = self.span_pieces(span);
+            // Split: the piece a drag would move.
+            let hovered = response
+                .hover_pos()
+                .filter(|p| area.contains(*p) && p.y > area.top() + 16.0 && pieces.len() > 1)
+                .map(|p| self.at_of(area, p.x));
             if pieces != [(span.from, span.to)] {
                 painter.rect_stroke(
                     block,
@@ -929,6 +1324,14 @@ impl MixEditor {
                 );
                 painter.rect_filled(piece, 3.0, color.gamma_multiply(0.25));
                 self.waveform(&painter, area, piece.intersect(area), deck, color);
+                if hovered.is_some_and(|at| from <= at && at < to) {
+                    painter.rect_stroke(
+                        piece,
+                        3.0,
+                        Stroke::new(1.5_f32, color),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 // Where it was split.
                 if i > 0 && pieces[i - 1].1 == from {
                     painter.line_segment(
@@ -1015,12 +1418,46 @@ impl MixEditor {
                 mark,
             );
         }
+        self.play_marks(&painter, area);
         let near_mark = |pos: Pos2| {
             marks.iter().find(|(_, x)| (x - pos.x).abs() <= GRAB).map(|(m, _)| (m.deck, m.at))
         };
         let pointer =
             response.interact_pointer_pos().or(response.hover_pos()).filter(|p| p.x >= area.left());
+        if let Some((d, from, to)) = self.clip_selection
+            && d == deck
+        {
+            let selected =
+                Rect::from_x_y_ranges(self.x_of(area, from)..=self.x_of(area, to), area.y_range());
+            painter.rect_filled(selected, 0.0, ui.visuals().selection.bg_fill.gamma_multiply(0.45));
+        }
         if self.busy() || pointer.is_none() && self.move_drag.is_none() {
+            return;
+        }
+        // Select: drag a stretch of the deck's clips (Delete cuts it out).
+        if self.tool == Tool::Select {
+            let pressed = ui.input(|i| i.pointer.press_origin()).filter(|p| p.x >= area.left());
+            if response.drag_started()
+                && let Some(pos) = pressed
+            {
+                let at = self.at_of(area, pos.x);
+                self.select_only(Selected::Clip);
+                self.clip_selection = Some((deck, at, at));
+                self.range_from = at;
+            }
+            if response.dragged()
+                && let Some(pos) = pointer
+                && self.clip_selection.is_some_and(|s| s.0 == deck)
+            {
+                let (a, b) = (self.range_from, self.at_of(area, pos.x));
+                self.clip_selection = Some((deck, a.min(b), a.max(b)));
+            }
+            if response.drag_stopped() && self.clip_selection.is_some_and(|s| s.1 >= s.2) {
+                self.clip_selection = None;
+            }
+            if response.clicked() {
+                self.clip_selection = None;
+            }
             return;
         }
         if response.secondary_clicked()
@@ -1083,7 +1520,13 @@ impl MixEditor {
                 self.tracks.iter().find(|t| t.deck == deck && t.from <= grabbed && grabbed < t.to);
             if let Some(span) = span {
                 let from_here = ui.input(|i| i.modifiers.alt);
-                let start = span.playing.first().map_or(span.from, |p| p.0);
+                // Split: the piece grabbed and what follows it; else the
+                // whole track, from where it starts playing.
+                let pieces = self.span_pieces(span);
+                let piece =
+                    pieces.iter().skip(1).find(|p| p.0 <= grabbed && grabbed < p.1).map(|p| p.0);
+                let start =
+                    piece.unwrap_or_else(|| span.playing.first().map_or(span.from, |p| p.0));
                 let at = match near_mark(pos) {
                     Some((_, at)) => at,
                     None if from_here => grabbed,
@@ -1438,11 +1881,21 @@ impl MixEditor {
         let painter = ui.painter_at(area);
         painter.rect_filled(area, 2.0, visuals.extreme_bg_color);
         let spans = fx_spans(&self.fx, self.length);
+        // The depth lane, as it is while a point is dragged.
+        let lane = match &self.depth_drag {
+            Some(drag) => drag.points.clone(),
+            None => self.lanes[&Setting::BeatFxDepth].clone(),
+        };
         let fx_color = |target: FxTarget| match target {
             FxTarget::Channel(d) => DECK_COLORS[d % DECK_COLORS.len()],
             _ => visuals.strong_text_color(),
         };
+        let y_in = |block: Rect, depth: f64| {
+            block.bottom() - 2.0 - (depth.clamp(0.0, 1.0) as f32) * (block.height() - 16.0)
+        };
         let mut blocks = Vec::new();
+        // Depth points inside the effects: where, the lane point, the block.
+        let mut dots: Vec<(Pos2, usize, usize)> = Vec::new();
         for (i, span) in spans.iter().enumerate() {
             let (from, to) = match &self.fx_drag {
                 Some(drag) if drag.index == i => (drag.from, drag.to),
@@ -1463,23 +1916,24 @@ impl MixEditor {
                     egui::StrokeKind::Inside,
                 );
             }
-            // The depth, bottom to top.
-            let y =
-                |depth: f32| block.bottom() - 2.0 - depth.clamp(0.0, 1.0) * (block.height() - 16.0);
-            let mut line = Vec::new();
-            for (k, &(at, depth)) in span.depth.iter().enumerate() {
-                let x = self.x_of(area, at).max(block.left());
-                if k > 0
-                    && let Some(&Pos2 { y: before, .. }) = line.last()
-                {
-                    line.push(pos2(x, before));
+            // The depth along it, curves and all.
+            let shown = block.intersect(area);
+            if shown.width() > 0.0 && self.fx_drag.as_ref().is_none_or(|d| d.index != i) {
+                let line: Vec<Pos2> = (0..=shown.width() as usize)
+                    .map(|k| {
+                        let x = shown.left() + k as f32;
+                        pos2(x, y_in(block, lane_value(&lane, self.at_of(area, x))))
+                    })
+                    .collect();
+                painter.add(Shape::line(line, Stroke::new(1.5_f32, color)));
+                for (k, point) in lane.iter().enumerate() {
+                    if point.at >= span.from && point.at < span.to {
+                        let dot = pos2(self.x_of(area, point.at), y_in(block, point.value));
+                        painter.circle_filled(dot, 2.5, color);
+                        dots.push((dot, k, i));
+                    }
                 }
-                line.push(pos2(x, y(depth)));
             }
-            if let Some(&Pos2 { y, .. }) = line.last() {
-                line.push(pos2(block.right(), y));
-            }
-            painter.add(Shape::line(line, Stroke::new(1.0_f32, color)));
             let label = format!("{} · {}", span.kind.label(), target_label(span.target));
             let text = ui.painter().layout_no_wrap(
                 label,
@@ -1493,20 +1947,149 @@ impl MixEditor {
                 Color32::WHITE,
             );
         }
+        if let Some((from, to)) = self.fx_selection {
+            let selected =
+                Rect::from_x_y_ranges(self.x_of(area, from)..=self.x_of(area, to), area.y_range());
+            painter.rect_filled(selected, 0.0, visuals.selection.bg_fill.gamma_multiply(0.45));
+        }
+        self.play_marks(&painter, area);
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         let under = |pos: Pos2| blocks.iter().position(|b| b.expand2(vec2(4.0, 0.0)).contains(pos));
+        let near = |pos: Pos2| {
+            dots.iter()
+                .filter(|d| d.0.distance(pos) <= GRAB)
+                .min_by(|a, b| a.0.distance(pos).total_cmp(&b.0.distance(pos)))
+                .copied()
+        };
+        let depth_of = |block: Rect, y: f32| {
+            f64::from(((block.bottom() - 2.0 - y) / (block.height() - 16.0)).clamp(0.0, 1.0))
+        };
         if self.busy() {
             return;
+        }
+        // Select: drag a stretch (Delete takes the effects off through it).
+        if self.tool == Tool::Select {
+            let pressed = ui.input(|i| i.pointer.press_origin()).or(pointer);
+            if response.drag_started()
+                && let Some(pos) = pressed
+            {
+                let at = self.at_of(area, pos.x);
+                self.select_only(Selected::Fx);
+                self.fx_selection = Some((at, at));
+                self.range_from = at;
+            }
+            if response.dragged()
+                && let Some(pos) = pointer
+                && self.fx_selection.is_some()
+            {
+                let (a, b) = (self.range_from, self.at_of(area, pos.x));
+                self.fx_selection = Some((a.min(b), a.max(b)));
+            }
+            if response.drag_stopped() && self.fx_selection.is_some_and(|(a, b)| a >= b) {
+                self.fx_selection = None;
+            }
+            if response.clicked() {
+                self.fx_selection = None;
+                self.chosen_fx = pointer.and_then(under);
+            }
+            return;
+        }
+        if let Some(pos) = response.hover_pos()
+            && let Some((dot, ..)) = near(pos)
+        {
+            painter.circle_stroke(dot, 5.0, Stroke::new(1.5_f32, Color32::WHITE));
         }
         if response.clicked() {
             self.chosen_fx = pointer.and_then(under);
         }
-        if response.secondary_clicked()
-            && let Some(i) = pointer.and_then(under)
+        if response.secondary_clicked() {
+            self.chosen_fx = pointer.and_then(under);
+        }
+        // Double-click inside an effect: a depth point there (in the shape
+        // chosen in the toolbar).
+        if response.double_clicked()
+            && let Some(pos) = pointer
+            && near(pos).is_none()
+            && let Some(i) = under(pos)
         {
-            let changes = remove_fx(&self.fx, &spans[i]);
-            self.set_fx(changes, "remove");
-            self.chosen_fx = None;
+            let at = self.session.lock().map_or(0, |s| s.snap(self.at_of(area, pos.x)));
+            let span = &spans[i];
+            if at > span.from && at < span.to {
+                let setting = Setting::BeatFxDepth;
+                let before = self.lanes[&setting].clone();
+                let point = Point { at, value: depth_of(blocks[i], pos.y), curve: self.shape };
+                let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
+                lane.retain(|p| p.at != at);
+                let index = lane.partition_point(|p| p.at < at);
+                lane.insert(index, point);
+                self.commit(setting, before, "add depth point");
+            }
+        }
+        // Right- or double-click off the effects: the Add Beat FX dialog.
+        if (response.secondary_clicked() || response.double_clicked())
+            && let Some(pos) = pointer.filter(|p| under(*p).is_none())
+        {
+            self.adding_fx = Some(AddFx { at: self.at_of(area, pos.x), pos, ..self.last_fx });
+        }
+        // Right-click on a depth point: gone (the lane's first stays).
+        if response.secondary_clicked()
+            && let Some(pos) = pointer
+            && let Some((_, index, _)) = near(pos).filter(|d| d.1 > 0)
+        {
+            let setting = Setting::BeatFxDepth;
+            let before = self.lanes[&setting].clone();
+            self.lanes.get_mut(&setting).expect("every setting has a lane").remove(index);
+            self.commit(setting, before, "delete depth point");
+            return;
+        }
+        // Dragging a depth point: up and down, and along between its
+        // neighbours.
+        if response.drag_started()
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+            && let Some((_, index, block)) = near(pos)
+        {
+            let points = self.lanes[&Setting::BeatFxDepth].clone();
+            self.depth_drag = Some(DepthDrag { index, block: blocks[block], points });
+            self.chosen_fx = Some(block);
+        }
+        if self.depth_drag.is_some() {
+            if let Some(pos) = pointer {
+                let at = self.at_of(area, pos.x);
+                if let Some(drag) = self.depth_drag.as_mut() {
+                    let i = drag.index;
+                    let low = if i == 0 { 0 } else { drag.points[i - 1].at + 1 };
+                    let high = drag.points.get(i + 1).map_or(u64::MAX, |p| p.at.saturating_sub(1));
+                    let value = depth_of(drag.block, pos.y);
+                    let point = &mut drag.points[i];
+                    point.value = value;
+                    if i > 0 {
+                        point.at = at.clamp(low, high.max(low));
+                    }
+                    painter.text(
+                        pos + vec2(10.0, -4.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("{:.0}%", value * 100.0),
+                        egui::FontId::monospace(11.0),
+                        Color32::WHITE,
+                    );
+                }
+            }
+            if response.drag_stopped()
+                && let Some(drag) = self.depth_drag.take()
+            {
+                let setting = Setting::BeatFxDepth;
+                let before = std::mem::replace(
+                    self.lanes.get_mut(&setting).expect("every setting has a lane"),
+                    drag.points,
+                );
+                self.commit(setting, before, "move depth point");
+            }
+            return;
+        }
+        // Right click on an effect: its type, what it is on, its depth.
+        let chosen = self.chosen_fx.and_then(|i| spans.get(i)).cloned();
+        if let Some(span) = &chosen {
+            response.context_menu(|ui| self.fx_menu(ui, span));
         }
         // Where the button went down, not where the drag began.
         let pressed = ui.input(|i| i.pointer.press_origin()).or(pointer);
@@ -1575,36 +2158,287 @@ impl MixEditor {
         }
     }
 
-    /// The chosen Beat FX block's type and what it is on.
-    fn fx_tools(&mut self, ui: &mut Ui) {
+    /// A new Beat FX from `add.at` for `add.beats` beats of the deck playing
+    /// there (else seconds), or up to the next effect; its edges can then
+    /// be dragged.
+    fn add_fx(&mut self, add: AddFx) {
+        let AddFx { at, kind, target, beats, depth, .. } = add;
         let spans = fx_spans(&self.fx, self.length);
-        let Some(span) = self.chosen_fx.and_then(|i| spans.get(i)).cloned() else { return };
-        ui.separator();
-        let mut kind = span.kind;
-        egui::ComboBox::from_id_salt("fx kind").selected_text(kind.label()).show_ui(ui, |ui| {
-            for k in BeatFxKind::ALL {
-                ui.selectable_value(&mut kind, k, k.label());
+        if spans.iter().any(|s| s.from <= at && at < s.to) {
+            return;
+        }
+        let at = self.session.lock().map_or(at, |s| s.snap(at));
+        let beat = self
+            .tracks
+            .iter()
+            .find(|t| t.from <= at && at < t.to)
+            .and_then(|t| {
+                self.bpm_at(t.deck, at).map(|bpm| bpm * self.value_at(Setting::Tempo(t.deck), at))
+            })
+            .filter(|bpm| *bpm > 0.0)
+            .map_or(1.0, |bpm| 60.0 / bpm);
+        let next = spans.iter().map(|s| s.from).filter(|&from| from > at).min();
+        let to = (at + (beat * f64::from(beats) * self.rate) as u64)
+            .min(next.map_or(self.length, |n| n.saturating_sub(1)))
+            .min(self.length);
+        if to <= at {
+            return;
+        }
+        let on =
+            BeatFxParams { kind, on: true, release: false, depth, beat_secs: beat as f32, target };
+        let off = BeatFxParams { on: false, ..on };
+        let mut changes: Vec<(u64, BeatFxParams)> =
+            self.fx.iter().copied().filter(|c| c.0 < at || c.0 > to).collect();
+        changes.push((at, on));
+        changes.push((to, off));
+        changes.sort_by_key(|c| c.0);
+        self.set_fx(changes, &format!("add {}", kind.label()));
+        self.set_depth_through(at, to, f64::from(depth));
+        self.chosen_fx =
+            fx_spans(&self.fx, self.length).iter().position(|s| s.from <= at && at < s.to);
+    }
+
+    /// One Beat FX depth from `from` to `to`; after it the depth goes on
+    /// as before.
+    fn set_depth_through(&mut self, from: u64, to: u64, depth: f64) {
+        let setting = Setting::BeatFxDepth;
+        let before = self.lanes[&setting].clone();
+        let curve_at =
+            |at: u64| before[before.partition_point(|p| p.at <= at).saturating_sub(1)].curve;
+        let mut lane: Vec<Point> = before.iter().filter(|p| p.at < from).copied().collect();
+        lane.push(Point { at: from, value: depth, curve: Curve::Step });
+        if to < self.length {
+            lane.push(Point { at: to, value: lane_value(&before, to), curve: curve_at(to) });
+            lane.extend(before.iter().filter(|p| p.at > to).copied());
+        }
+        self.lanes.insert(setting, lane);
+        self.commit(setting, before, &format!("depth {:.0}%", depth * 100.0));
+    }
+
+    /// Splits the clips at both edges of the selected stretch, so it is a
+    /// piece of its own (to move, cut out or keep); the selection stays.
+    fn split_selection(&mut self) {
+        let Some((deck, from, to)) = self.clip_selection else {
+            self.note = Some("Select part of a clip first (Select tool, key 2)".into());
+            return;
+        };
+        let spans: Vec<TrackSpan> = self
+            .tracks
+            .iter()
+            .filter(|t| t.deck == deck && t.from < to && from < t.to)
+            .cloned()
+            .collect();
+        for span in spans {
+            let mut pieces = Vec::new();
+            for (a, b) in self.span_pieces(&span) {
+                let mut cuts: Vec<u64> =
+                    [from, to].into_iter().filter(|&c| a < c && c < b).collect();
+                cuts.dedup();
+                let mut start = a;
+                for cut in cuts {
+                    pieces.push((start, cut));
+                    start = cut;
+                }
+                pieces.push((start, b));
+            }
+            self.set_pieces(&span, pieces, "split");
+        }
+    }
+
+    /// Clears the selections but one kind.
+    fn select_only(&mut self, keep: Selected) {
+        if !matches!(keep, Selected::Lane) {
+            self.selection = None;
+        }
+        if !matches!(keep, Selected::Clip) {
+            self.clip_selection = None;
+        }
+        if !matches!(keep, Selected::Fx) {
+            self.fx_selection = None;
+        }
+    }
+
+    /// Delete: cuts the selected stretch out of a deck's clips, takes the
+    /// Beat FX off through it, or flattens a lane's selection.
+    fn delete_selection(&mut self) {
+        if let Some((deck, from, to)) = self.clip_selection.take() {
+            let spans: Vec<TrackSpan> = self
+                .tracks
+                .iter()
+                .filter(|t| t.deck == deck && t.from < to && from < t.to)
+                .cloned()
+                .collect();
+            for span in spans {
+                let mut pieces = Vec::new();
+                for (a, b) in self.span_pieces(&span) {
+                    if b <= from || a >= to {
+                        pieces.push((a, b));
+                        continue;
+                    }
+                    if a < from {
+                        pieces.push((a, from));
+                    }
+                    if b > to {
+                        pieces.push((to, b));
+                    }
+                }
+                self.set_pieces(&span, pieces, "delete");
+            }
+        } else if let Some((from, to)) = self.fx_selection.take() {
+            let params_at = |at: u64| {
+                self.fx
+                    .iter()
+                    .take_while(|c| c.0 <= at)
+                    .last()
+                    .map_or_else(BeatFxParams::default, |c| c.1)
+            };
+            let (start, end) = (params_at(from), params_at(to));
+            let on = |p: &BeatFxParams| p.on || p.release;
+            let mut changes: Vec<(u64, BeatFxParams)> =
+                self.fx.iter().copied().filter(|c| c.0 < from || c.0 > to).collect();
+            if on(&start) {
+                changes.push((from, BeatFxParams { on: false, release: false, ..start }));
+            }
+            if on(&end) {
+                changes.push((to, end));
+            }
+            changes.sort_by_key(|c| c.0);
+            self.set_fx(changes, "delete");
+            self.chosen_fx = None;
+        } else {
+            self.flatten();
+        }
+    }
+
+    /// The Add Beat FX dialog, next to where it was asked for.
+    fn add_fx_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut add) = self.adding_fx else { return };
+        let (mut done, mut cancel) = (false, ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+        let secs = add.at as f64 / self.rate;
+        egui::Window::new("Add Beat FX")
+            .id(egui::Id::new("add beat fx"))
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(add.pos + vec2(8.0, 8.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("From {}:{:05.2}", (secs / 60.0) as u64, secs % 60.0))
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                egui::Grid::new("add fx kinds").spacing(vec2(4.0, 4.0)).show(ui, |ui| {
+                    for (i, kind) in BeatFxKind::ALL.into_iter().enumerate() {
+                        ui.selectable_value(&mut add.kind, kind, kind.label());
+                        if i % 4 == 3 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("On");
+                    for target in [
+                        FxTarget::Channel(0),
+                        FxTarget::Channel(1),
+                        FxTarget::Channel(2),
+                        FxTarget::Channel(3),
+                        FxTarget::Sampler,
+                        FxTarget::Master,
+                    ] {
+                        ui.selectable_value(&mut add.target, target, target_label(target));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Length");
+                    for beats in [1, 2, 4, 8, 16, 32] {
+                        ui.selectable_value(&mut add.beats, beats, beats.to_string());
+                    }
+                    ui.label("beats");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Depth");
+                    ui.add(
+                        egui::Slider::new(&mut add.depth, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .on_hover_text(
+                        "0%: the sound as it is · 50%: half each · 100%: only the effect",
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    done = ui.button(RichText::new("Add").strong()).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        if done {
+            self.last_fx = add;
+            self.adding_fx = None;
+            self.add_fx(add);
+        } else if cancel {
+            self.adding_fx = None;
+        } else {
+            self.adding_fx = Some(add);
+        }
+    }
+
+    /// An effect's menu: its type, what it is on, its depth (wet/dry)
+    /// through the stretch, or off.
+    fn fx_menu(&mut self, ui: &mut Ui, span: &deckhand_audio::FxSpan) {
+        ui.menu_button(format!("Type: {}", span.kind.label()), |ui| {
+            for kind in BeatFxKind::ALL {
+                if ui.selectable_label(kind == span.kind, kind.label()).clicked() {
+                    let changes = restyle_fx(&self.fx, span, Some(kind), None);
+                    self.set_fx(changes, kind.label());
+                    ui.close();
+                }
             }
         });
-        let mut target = span.target;
-        for t in [
-            FxTarget::Channel(0),
-            FxTarget::Channel(1),
-            FxTarget::Channel(2),
-            FxTarget::Channel(3),
-            FxTarget::Sampler,
-            FxTarget::Master,
-        ] {
-            ui.selectable_value(&mut target, t, target_label(t));
-        }
-        if (kind, target) != (span.kind, span.target) {
-            let changes = restyle_fx(&self.fx, &span, Some(kind), Some(target));
-            self.set_fx(changes, &format!("{} · {}", kind.label(), target_label(target)));
-        }
-        if ui.button("Remove").on_hover_text("The effect off through this stretch").clicked() {
-            let changes = remove_fx(&self.fx, &span);
+        ui.menu_button(format!("On: {}", target_label(span.target)), |ui| {
+            for target in [
+                FxTarget::Channel(0),
+                FxTarget::Channel(1),
+                FxTarget::Channel(2),
+                FxTarget::Channel(3),
+                FxTarget::Sampler,
+                FxTarget::Master,
+            ] {
+                let label = match target {
+                    FxTarget::Channel(d) => format!("Deck {}", d + 1),
+                    FxTarget::Sampler => "Sampler".into(),
+                    FxTarget::Master => "Master".into(),
+                };
+                if ui.selectable_label(target == span.target, label).clicked() {
+                    let changes = restyle_fx(&self.fx, span, None, Some(target));
+                    self.set_fx(changes, &format!("on {}", target_label(target)));
+                    ui.close();
+                }
+            }
+        });
+        // One depth through the stretch.
+        let now = self.value_at(Setting::BeatFxDepth, span.from) as f32;
+        let id = ui.id().with("fx depth");
+        let mut depth = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(now);
+        ui.horizontal(|ui| {
+            ui.label("Depth");
+            let slider = ui.add(
+                egui::Slider::new(&mut depth, 0.0..=1.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+            );
+            ui.data_mut(|d| d.insert_temp(id, depth));
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                self.set_depth_through(span.from, span.to, f64::from(depth));
+            }
+        })
+        .response
+        .on_hover_text("0%: the sound as it is · 50%: half each · 100%: only the effect");
+        ui.separator();
+        if ui.button("Remove").clicked() {
+            let changes = remove_fx(&self.fx, span);
             self.set_fx(changes, "remove");
             self.chosen_fx = None;
+            ui.close();
         }
     }
 
@@ -1644,7 +2478,7 @@ impl MixEditor {
                 Some(s) => format!("{:.0}% · {}", value * 100.0, db(s.master_gain(value))),
                 None => setting.display(value),
             },
-            Setting::Filter(_) if self.color_fx == deckhand_audio::ColorFxKind::Filter => {
+            Setting::ColorFx(_, ColorFxKind::Filter) => {
                 let amount = ((value.abs() - 0.02) / 0.98).max(0.0);
                 let hz = |hz: f64| {
                     if hz >= 1000.0 {
@@ -1661,8 +2495,13 @@ impl MixEditor {
                     format!("high-pass {}", hz(20.0 * (8_000.0f64 / 20.0).powf(amount)))
                 }
             }
-            Setting::Filter(_) => {
-                format!("{} {:+.0}%", self.color_fx.label(), value * 100.0)
+            Setting::ColorFx(_, ColorFxKind::Pitch) if value != 0.0 => {
+                format!("{:+.1} semitones", value * 12.0)
+            }
+            Setting::ColorFx(..) if value == 0.0 => "off".to_owned(),
+            Setting::ColorFx(..) => {
+                let side = if value < 0.0 { "dark" } else { "bright" };
+                format!("{:.0}% · {side}", value.abs() * 100.0)
             }
             Setting::Crossfader if value.abs() < 0.005 => "centre".to_owned(),
             Setting::Crossfader if value < 0.0 => format!("A side {:.0}%", -value * 100.0),
@@ -1774,6 +2613,7 @@ impl MixEditor {
             line.push(pos2(end, y));
         }
         painter.add(Shape::line(line, Stroke::new(1.5_f32, color)));
+        self.play_marks(&painter, area);
         let dense = dots.len() as f32 > area.width() / 6.0;
         if !dense {
             for (_, at) in &dots {
@@ -1822,10 +2662,11 @@ impl MixEditor {
         if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
         {
-            self.drag = Some(match near(pos) {
+            self.drag = Some(match near(pos).filter(|_| self.tool == Tool::Normal) {
                 Some(index) => Drag::Point { setting, index, before: self.lanes[&setting].clone() },
                 None => {
                     let from = self.at_of(area, pos.x);
+                    self.select_only(Selected::Lane);
                     self.selection = Some((setting, from, from));
                     Drag::Select { setting, from }
                 }
@@ -1886,13 +2727,50 @@ impl MixEditor {
             lane.insert(index, point);
             self.commit(setting, before, "add point");
         }
+        let on_point = pointer.and_then(near);
         if response.secondary_clicked()
-            && let Some(pos) = pointer
-            && let Some(index) = near(pos).filter(|i| *i > 0)
+            && let Some(index) = on_point.filter(|i| *i > 0)
         {
             let before = self.lanes[&setting].clone();
             self.lanes.get_mut(&setting).expect("every setting has a lane").remove(index);
             self.commit(setting, before, "delete point");
+        }
+        // Right click away from points: back to the recording, and more.
+        if on_point.is_none() {
+            let selected = self.selection.filter(|(s, ..)| *s == setting);
+            let changed = self.lanes[&setting] != self.original[&setting];
+            response.context_menu(|ui| {
+                if let Some((_, from, to)) = selected {
+                    if ui
+                        .button("Reset selection to original")
+                        .on_hover_text("The selection goes back to how it was recorded")
+                        .clicked()
+                    {
+                        self.reset(setting, from, to);
+                        ui.close();
+                    }
+                    if ui.button("Flatten").clicked() {
+                        self.flatten();
+                        ui.close();
+                    }
+                    if ui.button("Ramp").clicked() {
+                        self.ramp();
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                if ui
+                    .add_enabled(changed, egui::Button::new("Reset whole lane to original"))
+                    .clicked()
+                {
+                    self.reset(setting, 0, self.length);
+                    ui.close();
+                }
+                if ui.button("Hide lane").clicked() {
+                    self.shown.retain(|s| *s != setting);
+                    ui.close();
+                }
+            });
         }
     }
 
@@ -1954,14 +2832,6 @@ fn lane_order(setting: &Setting) -> usize {
     Setting::all(deckhand_audio::DECKS).iter().position(|s| s == setting).unwrap_or(usize::MAX)
 }
 
-/// The heading of a setting's group in the Lanes menu.
-fn lane_group(setting: Setting) -> String {
-    match setting.deck() {
-        Some(d) => format!("Deck {}", d + 1),
-        None => "Mixer".into(),
-    }
-}
-
 /// "<session> <suffix>.wav" next to the session, numbered if taken.
 pub(super) fn free_path(session: &Path, suffix: &str) -> PathBuf {
     let stem = session.file_stem().unwrap_or_default().to_string_lossy();
@@ -1984,6 +2854,14 @@ impl DeckhandApp {
             }
         }
         self.poll_edit_view(ui.ctx());
+        // Taken before the toolbar, so a focused button doesn't get it too.
+        let space = !ui.ctx().wants_keyboard_input()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        let device = self.engine.as_ref().map(|e| e.info().device.clone());
+        if let Some(editor) = self.edit_view.editor.as_mut() {
+            editor.device = device;
+            editor.poll_player(ui.ctx());
+        }
         let mut message = None;
         ui.horizontal(|ui| {
             let opening = self.edit_view.opening.is_some();
@@ -2053,6 +2931,16 @@ impl DeckhandApp {
             return;
         };
         let typing = ui.ctx().wants_keyboard_input();
+        if space {
+            editor.toggle_play();
+        }
+        editor.tool_keys = self.keyboard.tool_labels();
+        match self.keyboard.edit_tool(ui.ctx()) {
+            Some(0) => editor.tool = Tool::Normal,
+            Some(1) => editor.tool = Tool::Select,
+            Some(2) if !editor.busy() => editor.split_selection(),
+            _ => {}
+        }
         let (delete, undo, redo, nudge) = ui.input(|i| {
             let step = if i.modifiers.shift { 0.0001 } else { 0.001 };
             let nudge = if i.key_pressed(egui::Key::ArrowRight) {
@@ -2073,7 +2961,7 @@ impl DeckhandApp {
         });
         if !typing && !editor.busy() {
             if delete {
-                editor.flatten();
+                editor.delete_selection();
             }
             if undo {
                 editor.undo();
@@ -2123,6 +3011,10 @@ impl DeckhandApp {
                     if !warnings.is_empty() {
                         self.status = Some(format!("Opened with differences: {warnings}"));
                     }
+                    // A lane for each Color FX type of each deck.
+                    session.split_color_fx();
+                    // And the Beat FX depth one, with curves.
+                    session.split_fx_depth();
                     self.edit_view.editor = Some(MixEditor::new(path, session));
                 }
                 Err(err) => self.status = Some(format!("Could not open the session: {err:#}")),
@@ -2160,6 +3052,41 @@ impl DeckhandApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How much faster than real time `DECKHAND_SESSION` plays offline:
+    /// listening from a cursor plays everything before it first (read only).
+    /// `cargo test -p deckhand-app --release render_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn render_speed() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let session = Session::read(&path, super::super::recording::Sources).unwrap();
+        let started = std::time::Instant::now();
+        let frames = session.render(|_| Ok(())).unwrap();
+        let secs = frames as f64 / f64::from(session.sample_rate());
+        let took = started.elapsed().as_secs_f64();
+        println!("{secs:.0} s of set in {took:.1} s: {:.0}× real time", secs / took);
+    }
+
+    /// Giving `DECKHAND_SESSION` a lane per Color FX type changes nothing
+    /// heard (read only):
+    /// `cargo test -p deckhand-app --release color_lanes_sound_the_same -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn color_lanes_sound_the_same() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
+        let mut before = Vec::new();
+        session.render(|b| Ok(before.extend_from_slice(b))).unwrap();
+        println!("split: {}", session.split_color_fx());
+        println!("depth lane: {}", session.split_fx_depth());
+        let mut after = Vec::new();
+        session.render(|b| Ok(after.extend_from_slice(b))).unwrap();
+        assert_eq!(before.len(), after.len());
+        let worst = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("largest difference: {worst}");
+        assert!(worst < 1e-4, "{worst}");
+    }
 
     /// Dragging a track on `DECKHAND_SESSION` 100 points moves its audio
     /// as far as the pointer went (read only):

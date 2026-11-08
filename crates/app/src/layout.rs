@@ -282,11 +282,11 @@ impl DeckLayout {
             main: vec![
                 vec![E::Header],
                 vec![E::Title],
-                vec![E::Info, E::GridEdit],
+                vec![E::Info],
                 vec![E::Overview],
                 vec![E::Cue, E::Play, E::Sync, E::Master, E::Quantize, E::Vinyl, E::Slip],
                 vec![E::LoopInOut, E::LoopResize, E::BeatLoops, E::BeatJump],
-                vec![E::Gate, E::MemoryCall, E::MemorySet],
+                vec![E::Gate, E::GridEdit, E::MemoryCall, E::MemorySet],
                 vec![E::PadModes],
                 vec![E::PadShift],
                 vec![E::Pads],
@@ -341,9 +341,48 @@ impl DeckLayout {
         self.main.retain(|row| !row.is_empty());
         let missing: Vec<DeckElement> =
             DeckElement::ALL.into_iter().filter(|e| !seen.contains(e)).collect();
-        if !missing.is_empty() {
-            self.main.push(missing);
+        // Next to what they sit by in the full layout, else at the bottom.
+        let everything = Self::everything();
+        let mut left = Vec::new();
+        for element in missing {
+            let neighbours = everything.main.iter().find(|row| row.contains(&element));
+            let placed = neighbours.and_then(|row| {
+                let at = row.iter().position(|e| *e == element)?;
+                // The nearest neighbour before it, else after it.
+                row[..at].iter().rev().chain(&row[at + 1..]).find_map(|n| {
+                    let (r, i) = self.find(*n)?;
+                    Some((r, if row[..at].contains(n) { i + 1 } else { i }))
+                })
+            });
+            match placed {
+                Some((r, i)) => self.main[r].insert(i, element),
+                None => left.push(element),
+            }
         }
+        if !left.is_empty() {
+            self.main.push(left);
+        }
+    }
+
+    /// The row and place of an element in the main column.
+    fn find(&self, element: DeckElement) -> Option<(usize, usize)> {
+        self.main
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| row.iter().position(|e| *e == element).map(|i| (r, i)))
+    }
+
+    /// Puts Beat grid edit right after GATE (where the default has it), for
+    /// layouts saved when it sat elsewhere.
+    pub fn grid_next_to_gate(&mut self) {
+        let Some((row, at)) = self.find(DeckElement::Gate) else { return };
+        if self.find(DeckElement::GridEdit) == Some((row, at + 1)) {
+            return;
+        }
+        self.remove(DeckElement::GridEdit);
+        let (row, at) = self.find(DeckElement::Gate).expect("still there");
+        self.main[row].insert(at + 1, DeckElement::GridEdit);
+        self.main.retain(|row| !row.is_empty());
     }
 
     fn remove(&mut self, element: DeckElement) {
@@ -426,7 +465,30 @@ mod tests {
         let mut layout =
             DeckLayout { main: vec![vec![E::Play, E::Play]], side: vec![], hidden: vec![] };
         layout.repair();
-        assert_eq!(layout.main[0], vec![E::Play]);
-        assert_eq!(layout.main[1].len(), DeckElement::ALL.len() - 1);
+        // The duplicate went; Play's neighbours joined its row.
+        assert_eq!(layout.main[0].iter().filter(|e| **e == E::Play).count(), 1);
+        assert!(layout.main[0].contains(&E::Cue));
+        let all: usize = layout.main.iter().map(Vec::len).sum::<usize>() + layout.side.len();
+        assert_eq!(all, DeckElement::ALL.len());
+    }
+
+    #[test]
+    fn missing_elements_go_next_to_their_neighbours() {
+        let mut layout = DeckLayout::everything();
+        layout.remove(E::GridEdit);
+        layout.repair();
+        let (row, at) = layout.find(E::Gate).unwrap();
+        assert_eq!(layout.main[row][at + 1], E::GridEdit);
+    }
+
+    #[test]
+    fn grid_moves_next_to_gate() {
+        let mut layout = DeckLayout::everything();
+        layout.remove(E::GridEdit);
+        layout.main.push(vec![E::GridEdit]);
+        layout.grid_next_to_gate();
+        let (row, at) = layout.find(E::Gate).unwrap();
+        assert_eq!(layout.main[row][at + 1], E::GridEdit);
+        assert_eq!(layout.main.len(), DeckLayout::everything().main.len());
     }
 }

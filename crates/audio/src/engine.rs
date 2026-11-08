@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::decode::TrackAudio;
 use crate::eq::Equalizer;
-use crate::fx::{BeatFx, BeatFxParams, ColorFx, ColorFxKind, FxTarget};
+use crate::fx::{BeatFx, BeatFxParams, ChannelColor, ColorFxKind, FxTarget};
 use crate::stretch::Stretcher;
 
 pub const DECKS: usize = 4;
@@ -154,7 +154,17 @@ pub enum Command {
     SetColorFx(ColorFxKind),
     /// With Color FX off the channel knobs do nothing.
     SetColorFxOn(bool),
+    /// One Color FX type's amount on a channel, −1.0 … 1.0 (0 is off),
+    /// apart from the knob: each type of each channel has its own in an
+    /// edited set.
+    SetColorAmount {
+        deck: usize,
+        kind: ColorFxKind,
+        position: f32,
+    },
     SetBeatFx(BeatFxParams),
+    /// The Beat FX depth alone (an edited set's depth lane).
+    SetBeatFxDepth(f32),
     SamplerLoad {
         slot: usize,
         #[serde(with = "crate::session::track")]
@@ -404,7 +414,7 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    fn find_device(name: Option<&str>) -> Result<cpal::Device> {
+    pub(crate) fn find_device(name: Option<&str>) -> Result<cpal::Device> {
         let host = cpal::default_host();
         match name {
             Some(name) => host
@@ -629,7 +639,7 @@ struct DeckState {
     volume: f32,
     trim: f32,
     eq: Equalizer,
-    color: ColorFx,
+    color: ChannelColor,
     slip: bool,
     slip_hold: bool,
     was_slipping: bool,
@@ -677,6 +687,8 @@ struct Mixer {
     fader_curve: FaderCurve,
     limiter: bool,
     color_on: bool,
+    /// The Color FX type the channel knobs drive.
+    color_kind: ColorFxKind,
     beat_fx: BeatFx,
     sampler: [SamplerVoice; SAMPLER_SLOTS],
     sampler_volume: f32,
@@ -822,7 +834,7 @@ impl Mixer {
             volume: 1.0,
             trim: 1.0,
             eq: Equalizer::new(rate as f32),
-            color: ColorFx::new(rate),
+            color: ChannelColor::new(rate),
             slip: false,
             slip_hold: false,
             was_slipping: false,
@@ -863,6 +875,7 @@ impl Mixer {
             fader_curve: FaderCurve::default(),
             limiter: true,
             color_on: true,
+            color_kind: ColorFxKind::Filter,
             beat_fx: BeatFx::new(rate),
             sampler: std::array::from_fn(|_| SamplerVoice::default()),
             sampler_volume: 0.8,
@@ -973,7 +986,13 @@ impl Mixer {
             Command::SetVolume { deck, level } => self.decks[deck].volume = level,
             Command::SetTrim { deck, gain } => self.decks[deck].trim = gain,
             Command::SetEq { deck, band, db } => self.decks[deck].eq.set_gain(band.min(2), db),
-            Command::SetFilter { deck, position } => self.decks[deck].color.set_position(position),
+            Command::SetFilter { deck, position } => {
+                let (kind, on) = (self.color_kind, self.color_on);
+                self.decks[deck].color.set_knob(position, kind, on);
+            }
+            Command::SetColorAmount { deck, kind, position } => {
+                self.decks[deck].color.set_amount(kind, position.clamp(-1.0, 1.0));
+            }
             Command::SetSlip { deck, on } => self.decks[deck].slip = on,
             Command::SlipHold { deck, held } => self.decks[deck].slip_hold = held,
             Command::SetKeyShift { deck, semitones } => {
@@ -981,12 +1000,22 @@ impl Mixer {
             }
             Command::SetMasterCue(on) => self.master_cue = on,
             Command::SetColorFx(kind) => {
+                self.color_kind = kind;
                 for deck in &mut self.decks {
-                    deck.color.set_kind(kind);
+                    deck.color.follow_knob(kind, self.color_on);
                 }
             }
-            Command::SetColorFxOn(on) => self.color_on = on,
+            Command::SetColorFxOn(on) => {
+                self.color_on = on;
+                for deck in &mut self.decks {
+                    deck.color.follow_knob(self.color_kind, on);
+                }
+            }
             Command::SetBeatFx(params) => self.beat_fx.set(params),
+            Command::SetBeatFxDepth(depth) => {
+                let params = self.beat_fx.params();
+                self.beat_fx.set(BeatFxParams { depth: depth.clamp(0.0, 1.0), ..params });
+            }
             Command::SamplerLoad { slot, ref audio } => {
                 if let Some(voice) = self.sampler.get_mut(slot) {
                     if let Some(old) = voice.audio.replace(audio.clone()) {
@@ -1078,6 +1107,7 @@ impl Mixer {
             fader_curve: self.fader_curve,
             limiter: self.limiter,
             color_on: self.color_on,
+            color_kind: Some(self.color_kind),
             sampler: self.sampler.clone(),
             sampler_volume: self.sampler_volume,
             beat_fx: self.beat_fx.state(),
@@ -1110,7 +1140,8 @@ impl Mixer {
                     volume: d.volume,
                     trim: d.trim,
                     eq: d.eq,
-                    color: d.color.state(),
+                    color: None,
+                    colors: Some(d.color.state()),
                     slip: d.slip,
                     slip_hold: d.slip_hold,
                     was_slipping: d.was_slipping,
@@ -1140,6 +1171,7 @@ impl Mixer {
         self.fader_curve = s.fader_curve;
         self.limiter = s.limiter;
         self.color_on = s.color_on;
+        self.color_kind = s.color_kind();
         self.sampler = s.sampler.clone();
         self.sampler_volume = s.sampler_volume;
         self.beat_fx.restore(&s.beat_fx);
@@ -1172,6 +1204,7 @@ impl Mixer {
                 trim,
                 eq,
                 color,
+                colors,
                 slip,
                 slip_hold,
                 was_slipping,
@@ -1191,7 +1224,13 @@ impl Mixer {
             (d.target, d.held, d.velocity) = (*target, *held, *velocity);
             (d.start_secs, d.brake_secs, d.braking) = (*start_secs, *brake_secs, *braking);
             (d.loop_frames, d.volume, d.trim, d.eq) = (*loop_frames, *volume, *trim, *eq);
-            d.color.restore(color);
+            match (colors, color) {
+                (Some(colors), _) => d.color.restore(colors),
+                (None, Some(color)) => {
+                    d.color.restore_single(color, self.color_kind, self.color_on);
+                }
+                (None, None) => {}
+            }
             (d.slip, d.slip_hold, d.was_slipping) = (*slip, *slip_hold, *was_slipping);
             (d.shadow, d.key_ratio, d.side, d.cue) = (*shadow, *key_ratio, *side, *cue);
             (d.gate, d.gate_open) = (*gate, *gate_open);
@@ -1380,7 +1419,7 @@ impl Mixer {
                 deck.played_peak = deck.played_peak.max(raw[0].abs()).max(raw[1].abs());
                 let sample = [raw[0] * deck.trim, raw[1] * deck.trim];
                 let sample = deck.eq.process(sample);
-                let sample = if self.color_on { deck.color.process(sample) } else { sample };
+                let sample = deck.color.process(sample);
                 let side_gain = match deck.side {
                     CrossfaderSide::A => xfade[0],
                     CrossfaderSide::B => xfade[1],
@@ -1507,6 +1546,9 @@ pub(crate) struct Snapshot {
     fader_curve: FaderCurve,
     limiter: bool,
     color_on: bool,
+    /// The type the knobs drive (sessions from before: deck 1's type).
+    #[serde(default)]
+    color_kind: Option<ColorFxKind>,
     #[serde(with = "crate::session::array")]
     sampler: [SamplerVoice; SAMPLER_SLOTS],
     sampler_volume: f32,
@@ -1546,7 +1588,11 @@ struct DeckSnapshot {
     volume: f32,
     trim: f32,
     eq: Equalizer,
-    color: crate::fx::ColorFxState,
+    /// Sessions from before every type had a unit: the channel's one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<crate::fx::ColorFxState>,
+    #[serde(default)]
+    colors: Option<crate::fx::ChannelColorState>,
     slip: bool,
     slip_hold: bool,
     was_slipping: bool,
@@ -1578,8 +1624,10 @@ impl Snapshot {
             Setting::Volume(d) => f64::from(deck(d).volume),
             Setting::Trim(d) => f64::from(deck(d).trim),
             Setting::Eq(d, band) => f64::from(deck(d).eq.gain(band)),
-            Setting::Filter(d) => f64::from(deck(d).color.position()),
+            Setting::Filter(d) => f64::from(self.color_knob(d)),
+            Setting::ColorFx(d, kind) => f64::from(self.color_amount(d, kind)),
             Setting::Tempo(d) => deck(d).tempo,
+            Setting::BeatFxDepth => f64::from(self.beat_fx.params().depth),
             Setting::Crossfader => f64::from(self.crossfader),
             Setting::Master => f64::from(self.master),
         }
@@ -1592,7 +1640,37 @@ impl Snapshot {
 
     /// The channel fader's and crossfader's curves, and the Color FX type.
     pub(crate) fn curves(&self) -> (FaderCurve, CrossfaderCurve, crate::fx::ColorFxKind) {
-        (self.fader_curve, self.crossfader_curve, self.decks[0].color.kind())
+        (self.fader_curve, self.crossfader_curve, self.color_kind())
+    }
+
+    /// The Color FX type the channel knobs drove.
+    pub(crate) fn color_kind(&self) -> ColorFxKind {
+        self.color_kind.or_else(|| self.decks[0].color.map(|c| c.kind())).unwrap_or_default()
+    }
+
+    /// A channel's Color FX knob.
+    pub(crate) fn color_knob(&self, deck: usize) -> f32 {
+        let d = &self.decks[deck.min(DECKS - 1)];
+        match (&d.colors, &d.color) {
+            (Some(colors), _) => colors.knob,
+            (None, Some(color)) => color.position(),
+            (None, None) => 0.0,
+        }
+    }
+
+    /// A Color FX type's amount on a channel.
+    pub(crate) fn color_amount(&self, deck: usize, kind: ColorFxKind) -> f32 {
+        let d = &self.decks[deck.min(DECKS - 1)];
+        match (&d.colors, &d.color) {
+            (Some(colors), _) => colors.units[kind.index()].position(),
+            (None, Some(color)) if self.color_on && kind == self.color_kind() => color.position(),
+            _ => 0.0,
+        }
+    }
+
+    /// Whether the Color FX were on.
+    pub(crate) fn color_on(&self) -> bool {
+        self.color_on
     }
 
     /// Whether a deck's Master Tempo (key lock) was on.

@@ -774,6 +774,9 @@ fn launcher_python(script: &str) -> Option<PathBuf> {
 /// A track being separated piece by piece.
 struct Live {
     job: LiveJob,
+    /// The decks playing this track, with their playheads: a track loaded
+    /// on a second deck while it is being separated shares the work.
+    decks: Vec<(usize, Arc<AtomicU64>)>,
     /// The track as deckhand decodes it.
     track: Arc<deckhand_audio::TrackAudio>,
     layers: Arc<deckhand_audio::StemLayers>,
@@ -787,15 +790,31 @@ struct Live {
 }
 
 impl Live {
+    /// No deck plays it any more.
     fn cancelled(&self) -> bool {
-        self.job.playhead.load(Ordering::Relaxed) == CANCELLED
+        self.decks.is_empty()
+    }
+
+    /// Lets go of decks that have another track now.
+    fn drop_cancelled(&mut self) {
+        self.decks.retain(|(_, playhead)| playhead.load(Ordering::Relaxed) != CANCELLED);
+    }
+
+    /// The most urgent piece still missing for any of its decks.
+    fn next_piece(&self) -> Option<(usize, usize, usize)> {
+        self.decks
+            .iter()
+            .map(|(_, playhead)| playhead.load(Ordering::Relaxed))
+            .filter(|&bits| bits != CANCELLED)
+            .filter_map(|bits| self.next_piece_at(f64::from_bits(bits)))
+            .min()
     }
 
     /// The most urgent piece still missing, as (urgency, first block, end
     /// block): the playhead's own block first, then ones ahead by their
     /// distance, ones behind at three times theirs (and a bit).
-    fn next_piece(&self) -> Option<(usize, usize, usize)> {
-        let seconds = f64::from_bits(self.job.playhead.load(Ordering::Relaxed)).max(0.0);
+    fn next_piece_at(&self, seconds: f64) -> Option<(usize, usize, usize)> {
+        let seconds = seconds.max(0.0);
         let blocks = self.done.len();
         let at =
             ((seconds * f64::from(self.track.sample_rate)) as usize / self.block).min(blocks - 1);
@@ -977,6 +996,9 @@ fn live_loop(queue: &Receiver<LiveMessage>, events: &Sender<Event>, cache: &Path
                 LiveMessage::Rest => helper = None,
             }
         }
+        for live in &mut active {
+            live.drop_cancelled();
+        }
         active.retain(|live| !live.cancelled());
         let next = active
             .iter()
@@ -989,12 +1011,13 @@ fn live_loop(queue: &Receiver<LiveMessage>, events: &Sender<Event>, cache: &Path
         ensure_helper(&active[i].job.model, &mut helper);
         let live = &mut active[i];
         if let Err(err) = live.separate((first, end), &mut helper, &running) {
-            let deck = live.job.deck;
-            let _ = events.send(Event::Failed {
-                title: live.job.title.clone(),
-                error: format!("{err:#}"),
-                deck: Some(deck),
-            });
+            for &(deck, _) in &live.decks {
+                let _ = events.send(Event::Failed {
+                    title: live.job.title.clone(),
+                    error: format!("{err:#}"),
+                    deck: Some(deck),
+                });
+            }
             active.remove(i);
             continue;
         }
@@ -1041,9 +1064,23 @@ pub fn session_stems(
 /// silent stems at once (its parts can be switched straight away) and lines
 /// the track up for separating piece by piece.
 fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut Vec<Live>) {
-    // A deck taking another track drops its earlier job.
-    active.retain(|live| live.job.deck != job.deck && !live.cancelled());
     let dir = cache.join(&job.model.id).join(cache_key(&job.input));
+    // A deck taking another track lets go of its earlier one.
+    for live in active.iter_mut() {
+        live.decks.retain(|(deck, _)| *deck != job.deck);
+    }
+    // The same track on another deck, still being separated: this deck
+    // plays the same stems and its playhead steers the work too.
+    if let Some(live) = active.iter_mut().find(|live| live.dir == dir) {
+        live.decks.push((job.deck, job.playhead.clone()));
+        let _ = events.send(Event::Live {
+            deck: job.deck,
+            input: job.input.clone(),
+            stems: live.layers.clone(),
+        });
+        return;
+    }
+    active.retain(|live| !live.cancelled());
     let fail = |err: anyhow::Error| {
         let _ = events.send(Event::Failed {
             title: job.title.clone(),
@@ -1082,6 +1119,7 @@ fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut V
     });
     let stems = job.model.stems.iter().map(|s| (s.clone(), vec![0.0; frames * 2])).collect();
     active.push(Live {
+        decks: vec![(job.deck, job.playhead.clone())],
         layers,
         done: vec![false; frames.div_ceil(block).max(1)],
         stems,
