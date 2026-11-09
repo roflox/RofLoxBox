@@ -266,7 +266,13 @@ impl BeatFxKind {
     }
 
     /// Echo-like effects keep sounding after they are switched off.
-    fn has_tail(self) -> bool {
+    /// Whether the beat length changes it (Reverb and Pitch have none).
+    pub fn uses_beat(self) -> bool {
+        !matches!(self, Self::Reverb | Self::Pitch)
+    }
+
+    /// Whether it rings on after it stops (echoes, reverb).
+    pub fn has_tail(self) -> bool {
         matches!(
             self,
             Self::Delay | Self::Echo | Self::LowCutEcho | Self::Spiral | Self::Helix | Self::Reverb

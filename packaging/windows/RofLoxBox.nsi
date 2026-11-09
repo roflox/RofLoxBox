@@ -10,6 +10,10 @@ Unicode true
 !ifndef VERSION
   !define VERSION "0.0.0"
 !endif
+; Windows' version fields take numbers only: 0.25.0 for 0.25.0-dev.
+!ifndef NUMBER
+  !define NUMBER "${VERSION}"
+!endif
 !define NAME "RofLoxBox"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${NAME}"
 
@@ -20,10 +24,10 @@ InstallDirRegKey HKLM "Software\${NAME}" "InstallDir"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${NUMBER}.0"
 VIAddVersionKey "ProductName" "${NAME}"
 VIAddVersionKey "FileDescription" "${NAME} installer"
-VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "FileVersion" "${NUMBER}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "GPL-3.0"
 

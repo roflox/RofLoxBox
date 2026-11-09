@@ -79,7 +79,7 @@ rm -f "$ZIP" "$DIST/RofLoxBox-windows-x64.zip"
 echo "$ZIP"
 if command -v makensis >/dev/null; then
     SETUP=$DIST/RofLoxBox-$VERSION-windows-x64-setup.exe
-    makensis -V2 -DVERSION="$VERSION" -DEXE="$EXE" -DOUT="$SETUP" packaging/windows/RofLoxBox.nsi
+    makensis -V2 -DVERSION="$VERSION" -DNUMBER="${VERSION%%-*}" -DEXE="$EXE" -DOUT="$SETUP" packaging/windows/RofLoxBox.nsi
     sign "$SETUP"
     echo "$SETUP"
 else

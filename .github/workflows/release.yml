@@ -111,7 +111,7 @@ jobs:
           command -v makensis || choco install nsis -y --no-progress
           MAKENSIS=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
           SETUP=$(cygpath -w "$(pwd)/target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe")
-          "$MAKENSIS" -V2 -DVERSION="$VERSION" -DEXE="$EXE" -DOUT="$SETUP" packaging/windows/RofLoxBox.nsi
+          "$MAKENSIS" -V2 -DVERSION="$VERSION" -DNUMBER="${VERSION%%-*}" -DEXE="$EXE" -DOUT="$SETUP" packaging/windows/RofLoxBox.nsi
           sign "target/dist/RofLoxBox-$VERSION-windows-x64-setup.exe"
           (cd target/dist && 7z a -bd "RofLoxBox-$VERSION-windows-x64.zip" RofLoxBox.exe >/dev/null && rm RofLoxBox.exe)
       - uses: actions/upload-artifact@v4

@@ -19,6 +19,23 @@ use super::{DECK_COLORS, DeckhandApp, WARN};
 
 /// Bass clashes.
 const CLASH: Color32 = Color32::from_rgb(235, 60, 60);
+/// The Beat FX beats, as the mixer offers them.
+const BEATS: [(f64, &str); 11] = [
+    (1.0 / 16.0, "1/16"),
+    (0.125, "1/8"),
+    (0.25, "1/4"),
+    (0.5, "1/2"),
+    (0.75, "3/4"),
+    (1.0, "1"),
+    (2.0, "2"),
+    (4.0, "4"),
+    (8.0, "8"),
+    (16.0, "16"),
+    (32.0, "32"),
+];
+
+/// The range marked on the ruler.
+const RANGE: Color32 = Color32::from_rgb(90, 160, 255);
 /// The playhead.
 const PLAY: Color32 = Color32::from_rgb(255, 200, 60);
 /// Width of the names left of the timeline.
@@ -29,6 +46,9 @@ const DECK_ROW: f32 = 26.0;
 const TRACK_ROW: f32 = 52.0;
 const LANE_ROW: f32 = 56.0;
 const FX_ROW: f32 = 56.0;
+/// How far apart (frames) dragged points stay: saved points move to the
+/// nearest buffer start, and two on one would become one.
+const POINT_GAP: u64 = 2048;
 /// How close (points) the pointer has to be to take hold of a point.
 const GRAB: f32 = 7.0;
 
@@ -114,6 +134,16 @@ struct MixEditor {
     clip_selection: Option<(usize, u64, u64)>,
     fx_selection: Option<(u64, u64)>,
     range_from: u64,
+    /// The selected part of a clip being dragged (Normal tool).
+    sel_drag: Option<SelDrag>,
+    /// The timeline is being moved with the middle button.
+    panning: bool,
+    /// A stretch of the timeline marked on the ruler (Select tool): what
+    /// Render plays, and later more (loops). Where its drag started.
+    range: Option<(u64, u64)>,
+    range_start: Option<u64>,
+    /// A side of the range being dragged (right side: true).
+    range_side: Option<bool>,
     /// Where the pointer is on the timeline, for the values.
     hover: Option<u64>,
     /// What each deck played (levels and beats), being worked out again
@@ -243,6 +273,8 @@ struct AddFx {
     target: FxTarget,
     beats: u32,
     depth: f32,
+    /// The effect's beat (1/4, 1, 2…), as on the mixer.
+    beat: f64,
 }
 
 /// A Beat FX depth point being dragged: which point of the depth lane, the
@@ -251,6 +283,21 @@ struct DepthDrag {
     index: usize,
     block: Rect,
     points: Vec<Point>,
+    /// An effect's edge handle: up and down only.
+    edge: bool,
+    /// The effect's start and end handle: points between stay between.
+    limits: (u64, u64),
+}
+
+/// A depth handle in a Beat FX block: where, its lane point (none for an
+/// edge without one yet), the block, the moment, and whether it is an edge.
+#[derive(Clone, Copy)]
+struct Handle {
+    pos: Pos2,
+    index: Option<usize>,
+    block: usize,
+    at: u64,
+    edge: bool,
 }
 
 /// The editing tool: Normal moves and edits; Select drags stretches to
@@ -259,6 +306,14 @@ struct DepthDrag {
 pub(super) enum Tool {
     Normal,
     Select,
+}
+
+/// The selected part of a deck's clip being dragged: the deck, where the
+/// drag started, and how far it has gone (frames, kept inside the clip).
+struct SelDrag {
+    deck: usize,
+    x: f32,
+    frames: i64,
 }
 
 /// Which kind of selection is made (one at a time).
@@ -286,8 +341,9 @@ fn target_label(target: FxTarget) -> String {
 }
 
 enum Drag {
-    /// A point being moved; the lane as it was.
-    Point { setting: Setting, index: usize, before: Vec<Point> },
+    /// A point being moved; the lane as it was, and its scale then (kept
+    /// while dragging, so the point doesn't run off as the scale changes).
+    Point { setting: Setting, index: usize, before: Vec<Point>, range: (f64, f64) },
     /// A stretch being selected from here.
     Select { setting: Setting, from: u64 },
 }
@@ -295,6 +351,8 @@ enum Drag {
 /// The edited set being played into a WAV in the background.
 struct Render {
     done_frames: Arc<AtomicU64>,
+    /// Frames it plays through, for the progress.
+    total: u64,
     done: Receiver<Result<String>>,
 }
 
@@ -387,6 +445,7 @@ impl MixEditor {
                 target: FxTarget::Master,
                 beats: 8,
                 depth: 0.5,
+                beat: 1.0,
             },
             depth_drag: None,
             tool: Tool::Normal,
@@ -394,6 +453,11 @@ impl MixEditor {
             clip_selection: None,
             fx_selection: None,
             range_from: 0,
+            sel_drag: None,
+            panning: false,
+            range: None,
+            range_start: None,
+            range_side: None,
             fx_drag: None,
             hover: None,
             played: Vec::new(),
@@ -429,6 +493,11 @@ impl MixEditor {
     /// The lane's range on screen: the knob's travel, wider if it went
     /// further.
     fn range(&self, setting: Setting) -> (f64, f64) {
+        if let Some(Drag::Point { setting: s, range, .. }) = &self.drag
+            && *s == setting
+        {
+            return *range;
+        }
         let (lo, hi) = setting.range();
         self.lanes[&setting].iter().fold((lo, hi), |(lo, hi), p| (lo.min(p.value), hi.max(p.value)))
     }
@@ -716,6 +785,11 @@ impl MixEditor {
 
     /// The cursor (where playing starts) and the playhead, down `area`.
     fn play_marks(&self, painter: &egui::Painter, area: Rect) {
+        if let Some((from, to)) = self.range {
+            let band =
+                Rect::from_x_y_ranges(self.x_of(area, from)..=self.x_of(area, to), area.y_range());
+            painter.rect_filled(band, 0.0, RANGE.gamma_multiply(0.12));
+        }
         let x = self.x_of(area, self.cursor);
         painter.line_segment(
             [pos2(x, area.top()), pos2(x, area.bottom())],
@@ -996,7 +1070,7 @@ impl MixEditor {
                 Tool::Select => &keys[1],
             };
             let hint = if key.is_empty() { hint.to_owned() } else { format!("{hint} ({key})") };
-            if ui.selectable_label(self.tool == tool, label).on_hover_text(hint).clicked() {
+            if tool_button(ui, tool, label, self.tool == tool).on_hover_text(hint).clicked() {
                 self.tool = tool;
             }
         }
@@ -1026,7 +1100,7 @@ impl MixEditor {
         let selected = idle && self.selection.is_some();
         if ui
             .add_enabled(selected, egui::Button::new("Flatten"))
-            .on_hover_text("Holds the value from before the selection through it (Delete)")
+            .on_hover_text("Holds the value from before the selection through it (Delete joins its sides in a straight line instead)")
             .clicked()
         {
             self.flatten();
@@ -1078,17 +1152,111 @@ impl MixEditor {
     /// The timeline: ruler, the decks' tracks, then the lanes.
     fn timeline(&mut self, ui: &mut Ui) {
         let width = ui.available_width();
+        // Select: an I-beam over the timeline (rows set their own after).
+        if self.tool == Tool::Select
+            && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+            && ui.max_rect().contains(pos)
+            && pos.x >= ui.max_rect().left() + LABELS
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
         let (ruler, response) = ui.allocate_exact_size(vec2(width, RULER), Sense::click_and_drag());
         let area = Rect::from_min_max(pos2(ruler.left() + LABELS, ruler.top()), ruler.max);
         self.ruler(ui, area);
         // A click (or drag) on the ruler puts the cursor there; playing
         // goes on from there.
-        if let Some(pos) = response.interact_pointer_pos().filter(|p| p.x >= area.left())
+        let middle = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let pressed = ui.input(|i| i.pointer.press_origin()).filter(|p| p.x >= area.left());
+        // Either tool: the range's sides can be dragged.
+        let side_at = |x: f32| {
+            self.range.and_then(|(from, to)| {
+                if (self.x_of(area, to) - x).abs() <= GRAB {
+                    Some(true)
+                } else if (self.x_of(area, from) - x).abs() <= GRAB {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        };
+        if response.hover_pos().is_some_and(|p| side_at(p.x).is_some()) || self.range_side.is_some()
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if response.drag_started()
+            && !middle
+            && let Some(side) = pressed.and_then(|p| side_at(p.x))
+        {
+            self.range_side = Some(side);
+        }
+        if let Some(right) = self.range_side {
+            if let (Some((from, to)), Some(pos)) = (self.range, response.interact_pointer_pos()) {
+                let at = self.at_of(area, pos.x);
+                self.range =
+                    Some(if right { (from, at.max(from + 1)) } else { (at.min(to - 1), to) });
+            }
+            if response.drag_stopped() {
+                self.range_side = None;
+            }
+        } else if self.tool == Tool::Select && !middle {
+            // Select: drag along the ruler to mark a range; a click lets go
+            // of it and puts the cursor there.
+            if response.drag_started()
+                && let Some(pos) = pressed
+            {
+                let at = self.at_of(area, pos.x);
+                self.range_start = Some(at);
+                self.range = Some((at, at));
+            }
+            if response.dragged()
+                && let (Some(start), Some(pos)) =
+                    (self.range_start, response.interact_pointer_pos())
+            {
+                let at = self.at_of(area, pos.x);
+                self.range = Some((start.min(at), start.max(at)));
+            }
+            if response.drag_stopped() {
+                self.range_start = None;
+                if self.range.is_some_and(|(a, b)| b <= a) {
+                    self.range = None;
+                }
+            }
+            if response.clicked()
+                && let Some(pos) = response.interact_pointer_pos().filter(|p| p.x >= area.left())
+            {
+                self.range = None;
+                self.cursor = self.at_of(area, pos.x);
+            }
+        } else if let Some(pos) = response.interact_pointer_pos().filter(|p| p.x >= area.left())
+            && !middle
             && (response.clicked() || response.dragged())
         {
             self.cursor = self.at_of(area, pos.x);
             if response.clicked() && self.player.is_some() {
                 self.play_from(self.cursor);
+            }
+        }
+        // The range on the ruler, bright, with its times.
+        if let Some((from, to)) = self.range {
+            let band = Rect::from_x_y_ranges(
+                self.x_of(area, from)..=self.x_of(area, to),
+                area.top()..=area.bottom(),
+            )
+            .intersect(area);
+            if band.width() > 0.0 {
+                let painter = ui.painter_at(area);
+                painter.rect_filled(band, 0.0, RANGE.gamma_multiply(0.55));
+                let time = |at: u64| {
+                    let secs = at as f64 / self.rate;
+                    format!("{}:{:05.2}", (secs / 60.0) as u64, secs % 60.0)
+                };
+                painter.text(
+                    band.left_bottom() + vec2(3.0, -2.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{} – {}", time(from), time(to)),
+                    egui::FontId::monospace(10.0),
+                    Color32::WHITE,
+                );
             }
         }
         if self.show_clashes {
@@ -1108,6 +1276,19 @@ impl MixEditor {
             }
             if scroll.x != 0.0 {
                 self.view_from -= f64::from(scroll.x / area.width()) * self.view_secs;
+                self.clamp_view();
+            }
+        }
+        // Middle button held: the view follows the pointer sideways through
+        // the set; the rows stay put.
+        let (middle, delta) =
+            ui.input(|i| (i.pointer.button_down(egui::PointerButton::Middle), i.pointer.delta()));
+        let panning = middle && (over || self.panning);
+        self.panning = panning;
+        if panning {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if delta.x != 0.0 {
+                self.view_from -= f64::from(delta.x / area.width()) * self.view_secs;
                 self.clamp_view();
             }
         }
@@ -1431,7 +1612,7 @@ impl MixEditor {
                 Rect::from_x_y_ranges(self.x_of(area, from)..=self.x_of(area, to), area.y_range());
             painter.rect_filled(selected, 0.0, ui.visuals().selection.bg_fill.gamma_multiply(0.45));
         }
-        if self.busy() || pointer.is_none() && self.move_drag.is_none() {
+        if self.busy() || self.panning || pointer.is_none() && self.move_drag.is_none() {
             return;
         }
         // Select: drag a stretch of the deck's clips (Delete cuts it out).
@@ -1457,6 +1638,69 @@ impl MixEditor {
             }
             if response.clicked() {
                 self.clip_selection = None;
+            }
+            return;
+        }
+        // Normal tool: dragging the selected part moves just it, laid over
+        // what is there; dragging or clicking anything else lets go of the
+        // selection and goes on as usual.
+        let selected_x = self
+            .clip_selection
+            .filter(|s| s.0 == deck)
+            .map(|(_, from, to)| (self.x_of(area, from), self.x_of(area, to)));
+        let in_selection =
+            |pos: Pos2| selected_x.is_some_and(|(left, right)| pos.x >= left && pos.x <= right);
+        let origin = ui.input(|i| i.pointer.press_origin()).filter(|p| p.x >= area.left());
+        if response.drag_started() {
+            match origin {
+                Some(pos) if in_selection(pos) && self.selection_clip().is_some() => {
+                    self.sel_drag = Some(SelDrag { deck, x: pos.x, frames: 0 });
+                }
+                _ => self.clear_selections(),
+            }
+        }
+        if (response.clicked() || response.secondary_clicked())
+            && pointer.is_some_and(|p| !in_selection(p))
+        {
+            self.clear_selections();
+        }
+        if self.sel_drag.as_ref().is_some_and(|d| d.deck == deck) {
+            if let Some(pos) = pointer
+                && let Some((span, from, to)) = self.selection_clip()
+                && let Some(x0) = self.sel_drag.as_ref().map(|d| d.x)
+            {
+                let secs = f64::from(pos.x - x0) * self.view_secs / f64::from(area.width());
+                // Inside the clip: the deck plays this track only there.
+                let low = span.from as i64 - from as i64;
+                let high = span.to as i64 - to as i64;
+                let frames = ((secs * self.rate).round() as i64).clamp(low, high.max(low));
+                if let Some(drag) = self.sel_drag.as_mut() {
+                    drag.frames = frames;
+                }
+                let shifted = |at: u64| (at as i64 + frames).max(0) as u64;
+                let ghost = Rect::from_x_y_ranges(
+                    self.x_of(area, shifted(from))..=self.x_of(area, shifted(to)),
+                    area.y_range(),
+                );
+                painter.rect_filled(ghost, 2.0, color.gamma_multiply(0.45));
+                painter.rect_stroke(
+                    ghost,
+                    2.0,
+                    Stroke::new(1.5_f32, Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    pos2(ghost.right() + 6.0, area.top() + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:+.2} s", frames as f64 / self.rate),
+                    egui::FontId::monospace(12.0),
+                    Color32::WHITE,
+                );
+            }
+            if response.drag_stopped()
+                && let Some(drag) = self.sel_drag.take()
+            {
+                self.move_selection(drag.frames);
             }
             return;
         }
@@ -1894,8 +2138,8 @@ impl MixEditor {
             block.bottom() - 2.0 - (depth.clamp(0.0, 1.0) as f32) * (block.height() - 16.0)
         };
         let mut blocks = Vec::new();
-        // Depth points inside the effects: where, the lane point, the block.
-        let mut dots: Vec<(Pos2, usize, usize)> = Vec::new();
+        // Depth handles: an effect's edges and the points between.
+        let mut dots: Vec<Handle> = Vec::new();
         for (i, span) in spans.iter().enumerate() {
             let (from, to) = match &self.fx_drag {
                 Some(drag) if drag.index == i => (drag.from, drag.to),
@@ -1926,15 +2170,32 @@ impl MixEditor {
                     })
                     .collect();
                 painter.add(Shape::line(line, Stroke::new(1.5_f32, color)));
+                // A handle at each edge (a point there, or where one would
+                // go), and the points between.
+                let end = self.clip_end(span);
+                for (at, edge) in [(span.from, true), (end, true)] {
+                    let index = lane.iter().position(|p| p.at == at);
+                    let value = index.map_or_else(|| lane_value(&lane, at), |k| lane[k].value);
+                    let dot = pos2(self.x_of(area, at), y_in(block, value));
+                    painter.circle_filled(dot, 3.5, color);
+                    painter.circle_stroke(dot, 3.5, Stroke::new(1.0_f32, Color32::WHITE));
+                    dots.push(Handle { pos: dot, index, block: i, at, edge });
+                }
                 for (k, point) in lane.iter().enumerate() {
-                    if point.at >= span.from && point.at < span.to {
+                    if point.at > span.from && point.at < end {
                         let dot = pos2(self.x_of(area, point.at), y_in(block, point.value));
                         painter.circle_filled(dot, 2.5, color);
-                        dots.push((dot, k, i));
+                        dots.push(Handle {
+                            pos: dot,
+                            index: Some(k),
+                            block: i,
+                            at: point.at,
+                            edge: false,
+                        });
                     }
                 }
             }
-            let label = format!("{} · {}", span.kind.label(), target_label(span.target));
+            let label = self.fx_name(span);
             let text = ui.painter().layout_no_wrap(
                 label,
                 egui::FontId::proportional(11.0),
@@ -1953,18 +2214,42 @@ impl MixEditor {
             painter.rect_filled(selected, 0.0, visuals.selection.bg_fill.gamma_multiply(0.45));
         }
         self.play_marks(&painter, area);
+        // The depth at the cursor inside an effect (a point's own when on
+        // one), with the effect.
+        if let Some(pos) = response.hover_pos()
+            && self.depth_drag.is_none()
+            && self.fx_drag.is_none()
+            && let Some(i) = blocks.iter().position(|b| b.contains(pos))
+        {
+            let on_dot = dots
+                .iter()
+                .filter(|d| d.pos.distance(pos) <= GRAB + 2.0)
+                .min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)));
+            let depth = match on_dot {
+                Some(handle) => lane_value(&lane, handle.at),
+                None => lane_value(&lane, self.at_of(area, pos.x)),
+            };
+            let span = &spans[i];
+            let text = format!(
+                "{} · {} · depth {:.0}%",
+                span.kind.label(),
+                target_label(span.target),
+                depth * 100.0
+            );
+            value_tag(&painter, area, pos, &text);
+        }
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         let under = |pos: Pos2| blocks.iter().position(|b| b.expand2(vec2(4.0, 0.0)).contains(pos));
         let near = |pos: Pos2| {
             dots.iter()
-                .filter(|d| d.0.distance(pos) <= GRAB)
-                .min_by(|a, b| a.0.distance(pos).total_cmp(&b.0.distance(pos)))
+                .filter(|d| d.pos.distance(pos) <= GRAB + 2.0)
+                .min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)))
                 .copied()
         };
         let depth_of = |block: Rect, y: f32| {
             f64::from(((block.bottom() - 2.0 - y) / (block.height() - 16.0)).clamp(0.0, 1.0))
         };
-        if self.busy() {
+        if self.busy() || self.panning {
             return;
         }
         // Select: drag a stretch (Delete takes the effects off through it).
@@ -1992,17 +2277,50 @@ impl MixEditor {
                 self.fx_selection = None;
                 self.chosen_fx = pointer.and_then(under);
             }
+            // Right click on the selection: another beat or type for just
+            // that part (a block of its own), or off.
+            if let Some((from, to)) = self.fx_selection {
+                response.context_menu(|ui| {
+                    ui.label(RichText::new("The selected part").small().weak());
+                    let beat = self.beat_len(from).unwrap_or(1.0);
+                    ui.menu_button("Beat", |ui| {
+                        for (multiple, label) in BEATS {
+                            if ui.button(label).clicked() {
+                                let secs = (beat * multiple) as f32;
+                                self.change_fx_part(
+                                    from,
+                                    to,
+                                    |p| p.beat_secs = secs,
+                                    &format!("beat {label}"),
+                                );
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.menu_button("Type", |ui| {
+                        for kind in BeatFxKind::ALL {
+                            if ui.button(kind.label()).clicked() {
+                                self.change_fx_part(from, to, |p| p.kind = kind, kind.label());
+                                ui.close();
+                            }
+                        }
+                    });
+                    if ui.button("Remove (Delete)").clicked() {
+                        self.delete_selection();
+                        ui.close();
+                    }
+                });
+            }
             return;
         }
         if let Some(pos) = response.hover_pos()
-            && let Some((dot, ..)) = near(pos)
+            && let Some(handle) = near(pos)
         {
-            painter.circle_stroke(dot, 5.0, Stroke::new(1.5_f32, Color32::WHITE));
+            painter.circle_stroke(handle.pos, 6.0, Stroke::new(1.5_f32, Color32::WHITE));
         }
-        if response.clicked() {
-            self.chosen_fx = pointer.and_then(under);
-        }
-        if response.secondary_clicked() {
+        if response.clicked() || response.secondary_clicked() {
+            // One thing at a time: Delete takes the chosen effect away.
+            self.clear_selections();
             self.chosen_fx = pointer.and_then(under);
         }
         // Double-click inside an effect: a depth point there (in the shape
@@ -2034,11 +2352,11 @@ impl MixEditor {
         // Right-click on a depth point: gone (the lane's first stays).
         if response.secondary_clicked()
             && let Some(pos) = pointer
-            && let Some((_, index, _)) = near(pos).filter(|d| d.1 > 0)
+            && let Some(index) = near(pos).filter(|d| !d.edge).and_then(|d| d.index)
         {
             let setting = Setting::BeatFxDepth;
             let before = self.lanes[&setting].clone();
-            self.lanes.get_mut(&setting).expect("every setting has a lane").remove(index);
+            remove_point(self.lanes.get_mut(&setting).expect("every setting has a lane"), index);
             self.commit(setting, before, "delete depth point");
             return;
         }
@@ -2046,23 +2364,49 @@ impl MixEditor {
         // neighbours.
         if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
-            && let Some((_, index, block)) = near(pos)
+            && let Some(handle) = near(pos)
         {
-            let points = self.lanes[&Setting::BeatFxDepth].clone();
-            self.depth_drag = Some(DepthDrag { index, block: blocks[block], points });
-            self.chosen_fx = Some(block);
+            let mut points = self.lanes[&Setting::BeatFxDepth].clone();
+            // An edge without a point yet gets one now.
+            let index = handle.index.unwrap_or_else(|| {
+                let value = lane_value(&points, handle.at);
+                let curve =
+                    if handle.at == spans[handle.block].from { Curve::Line } else { Curve::Step };
+                let k = points.partition_point(|p| p.at < handle.at);
+                points.insert(k, Point { at: handle.at, value, curve });
+                k
+            });
+            self.clear_selections();
+            let span = &spans[handle.block];
+            let limits = (span.from, self.clip_end(span));
+            self.depth_drag = Some(DepthDrag {
+                index,
+                block: blocks[handle.block],
+                points,
+                edge: handle.edge,
+                limits,
+            });
+            self.chosen_fx = Some(handle.block);
         }
         if self.depth_drag.is_some() {
             if let Some(pos) = pointer {
                 let at = self.at_of(area, pos.x);
                 if let Some(drag) = self.depth_drag.as_mut() {
                     let i = drag.index;
-                    let low = if i == 0 { 0 } else { drag.points[i - 1].at + 1 };
-                    let high = drag.points.get(i + 1).map_or(u64::MAX, |p| p.at.saturating_sub(1));
+                    // Apart from its neighbours, and inside its effect.
+                    let low = if i == 0 { 0 } else { drag.points[i - 1].at + POINT_GAP };
+                    let low = low.max(drag.limits.0 + POINT_GAP);
+                    let high = drag
+                        .points
+                        .get(i + 1)
+                        .map_or(u64::MAX, |p| p.at.saturating_sub(POINT_GAP))
+                        .min(drag.limits.1.saturating_sub(POINT_GAP));
                     let value = depth_of(drag.block, pos.y);
+                    let edge = drag.edge;
                     let point = &mut drag.points[i];
                     point.value = value;
-                    if i > 0 {
+                    // Edges go up and down only; points between, along too.
+                    if i > 0 && !edge {
                         point.at = at.clamp(low, high.max(low));
                     }
                     painter.text(
@@ -2106,6 +2450,7 @@ impl MixEditor {
                 FxGrip::Whole
             };
             let span = &spans[i];
+            self.clear_selections();
             self.fx_drag = Some(FxDrag {
                 index: i,
                 grip,
@@ -2140,8 +2485,16 @@ impl MixEditor {
             && let Some(span) = spans.get(drag.index)
             && (drag.from, drag.to) != (span.from, span.to)
         {
+            let old = (span.from, self.clip_end(span));
             let changes = move_fx(&self.fx, span, drag.from, drag.to);
             self.set_fx(changes, "move");
+            // Its depth goes along.
+            let new_end = fx_spans(&self.fx, self.length)
+                .iter()
+                .find(|s| s.from == self.session.lock().map_or(drag.from, |s| s.snap(drag.from)))
+                .map_or(drag.to, |s| self.clip_end(s));
+            let new_from = self.session.lock().map_or(drag.from, |s| s.snap(drag.from));
+            self.move_clip_depth(old, new_from, new_end);
         }
     }
 
@@ -2163,20 +2516,13 @@ impl MixEditor {
     /// be dragged.
     fn add_fx(&mut self, add: AddFx) {
         let AddFx { at, kind, target, beats, depth, .. } = add;
+        let at = self.session.lock().map_or(at, |s| s.snap(at));
         let spans = fx_spans(&self.fx, self.length);
         if spans.iter().any(|s| s.from <= at && at < s.to) {
             return;
         }
         let at = self.session.lock().map_or(at, |s| s.snap(at));
-        let beat = self
-            .tracks
-            .iter()
-            .find(|t| t.from <= at && at < t.to)
-            .and_then(|t| {
-                self.bpm_at(t.deck, at).map(|bpm| bpm * self.value_at(Setting::Tempo(t.deck), at))
-            })
-            .filter(|bpm| *bpm > 0.0)
-            .map_or(1.0, |bpm| 60.0 / bpm);
+        let beat = self.beat_len(at).unwrap_or(1.0);
         let next = spans.iter().map(|s| s.from).filter(|&from| from > at).min();
         let to = (at + (beat * f64::from(beats) * self.rate) as u64)
             .min(next.map_or(self.length, |n| n.saturating_sub(1)))
@@ -2184,8 +2530,8 @@ impl MixEditor {
         if to <= at {
             return;
         }
-        let on =
-            BeatFxParams { kind, on: true, release: false, depth, beat_secs: beat as f32, target };
+        let beat_secs = (beat * add.beat) as f32;
+        let on = BeatFxParams { kind, on: true, release: false, depth, beat_secs, target };
         let off = BeatFxParams { on: false, ..on };
         let mut changes: Vec<(u64, BeatFxParams)> =
             self.fx.iter().copied().filter(|c| c.0 < at || c.0 > to).collect();
@@ -2193,26 +2539,67 @@ impl MixEditor {
         changes.push((to, off));
         changes.sort_by_key(|c| c.0);
         self.set_fx(changes, &format!("add {}", kind.label()));
-        self.set_depth_through(at, to, f64::from(depth));
+        if let Some(span) = fx_spans(&self.fx, self.length).iter().find(|s| s.from == at) {
+            let end = self.clip_end(span);
+            self.set_clip_depth(at, end, f64::from(depth));
+        }
         self.chosen_fx =
             fx_spans(&self.fx, self.length).iter().position(|s| s.from <= at && at < s.to);
     }
 
-    /// One Beat FX depth from `from` to `to`; after it the depth goes on
-    /// as before.
-    fn set_depth_through(&mut self, from: u64, to: u64, depth: f64) {
+    /// Where an effect's end handle sits: at its end, or just before it
+    /// when the next effect starts right there (a moment has one point).
+    fn clip_end(&self, span: &deckhand_audio::FxSpan) -> u64 {
+        let touching = fx_spans(&self.fx, self.length).iter().any(|s| s.from == span.to);
+        let end = if touching { span.to.saturating_sub(4096) } else { span.to };
+        // Drawn every frame: never waits for a render holding the session.
+        self.session.try_lock().map_or(end, |s| s.snap(end)).max(span.from + 1)
+    }
+
+    /// One flat Beat FX depth through an effect: a handle at each edge (the
+    /// end one holding after it, for the echoes ringing out).
+    fn set_clip_depth(&mut self, from: u64, end: u64, depth: f64) {
         let setting = Setting::BeatFxDepth;
         let before = self.lanes[&setting].clone();
-        let curve_at =
-            |at: u64| before[before.partition_point(|p| p.at <= at).saturating_sub(1)].curve;
         let mut lane: Vec<Point> = before.iter().filter(|p| p.at < from).copied().collect();
-        lane.push(Point { at: from, value: depth, curve: Curve::Step });
-        if to < self.length {
-            lane.push(Point { at: to, value: lane_value(&before, to), curve: curve_at(to) });
-            lane.extend(before.iter().filter(|p| p.at > to).copied());
+        lane.push(Point { at: from, value: depth, curve: Curve::Line });
+        if end > from {
+            lane.push(Point { at: end, value: depth, curve: Curve::Step });
         }
+        lane.extend(before.iter().filter(|p| p.at > end.max(from)).copied());
         self.lanes.insert(setting, lane);
         self.commit(setting, before, &format!("depth {:.0}%", depth * 100.0));
+    }
+
+    /// The depth points of an effect moved or stretched from `old` to
+    /// `from`–`to`, along with it.
+    fn move_clip_depth(&mut self, old: (u64, u64), from: u64, to: u64) {
+        let setting = Setting::BeatFxDepth;
+        let before = self.lanes[&setting].clone();
+        let length = (old.1 - old.0).max(1) as f64;
+        let place = |at: u64| from + ((at - old.0) as f64 / length * (to - from) as f64) as u64;
+        let inside = |at: u64| at >= old.0 && at <= old.1;
+        let mine: Vec<Point> = before
+            .iter()
+            .filter(|p| inside(p.at))
+            .map(|p| Point { at: place(p.at), ..*p })
+            .collect();
+        if mine.is_empty() {
+            return;
+        }
+        let mut lane: Vec<Point> = before
+            .iter()
+            .filter(|p| !inside(p.at) && !(p.at >= from && p.at <= to))
+            .copied()
+            .collect();
+        lane.extend(mine);
+        lane.sort_by_key(|p| p.at);
+        // The lane starts at the set's start.
+        if lane.first().is_none_or(|p| p.at > 0) {
+            lane.insert(0, Point::step(0, before[0].value));
+        }
+        self.lanes.insert(setting, lane);
+        self.commit(setting, before, "move depth");
     }
 
     /// Splits the clips at both edges of the selected stretch, so it is a
@@ -2245,8 +2632,45 @@ impl MixEditor {
         }
     }
 
+    /// Lets go of every selection.
+    fn clear_selections(&mut self) {
+        self.chosen_fx = None;
+        self.selection = None;
+        self.clip_selection = None;
+        self.fx_selection = None;
+    }
+
+    /// The clip the selected stretch lies in (all of it inside one), and
+    /// the stretch.
+    fn selection_clip(&self) -> Option<(TrackSpan, u64, u64)> {
+        let (deck, from, to) = self.clip_selection?;
+        let span = self.tracks.iter().find(|t| t.deck == deck && t.from <= from && to <= t.to)?;
+        Some((span.clone(), from, to))
+    }
+
+    /// Moves the selected part of a clip by `frames`: it plays there
+    /// instead of what was there (laid over it), and where it was is
+    /// silent. The selection goes along.
+    fn move_selection(&mut self, frames: i64) {
+        let Some((span, from, to)) = self.selection_clip() else { return };
+        if frames == 0 {
+            return;
+        }
+        let deck = span.deck;
+        let tempo = self.value_at(Setting::Tempo(deck), from).max(0.01);
+        let shared = self.session.clone();
+        let Ok(mut session) = shared.lock() else { return };
+        let Some(before) = pack(&session) else { return };
+        let (new_from, new_to) = session.move_part(&span, from, to, frames, tempo);
+        self.refresh(&session);
+        drop(session);
+        self.record(format!("Deck {} move selection", deck + 1), Edit::Events(before));
+        self.clip_selection = Some((deck, new_from, new_to));
+    }
+
     /// Clears the selections but one kind.
     fn select_only(&mut self, keep: Selected) {
+        self.chosen_fx = None;
         if !matches!(keep, Selected::Lane) {
             self.selection = None;
         }
@@ -2305,9 +2729,94 @@ impl MixEditor {
             changes.sort_by_key(|c| c.0);
             self.set_fx(changes, "delete");
             self.chosen_fx = None;
-        } else {
-            self.flatten();
+        } else if self.selection.is_some() {
+            // The points in it go; a straight line joins the sides, only
+            // across the deleted stretch.
+            self.bridge(Curve::Line);
+        } else if let Some(i) = self.chosen_fx.take() {
+            // The Beat FX clicked on: gone.
+            if let Some(span) = fx_spans(&self.fx, self.length).get(i) {
+                let changes = remove_fx(&self.fx, span);
+                self.set_fx(changes, "remove");
+            }
         }
+    }
+
+    /// Seconds a beat at `at`: of the track playing there (as sped up or
+    /// slowed down), if its BPM is known.
+    fn beat_len(&self, at: u64) -> Option<f64> {
+        self.tracks
+            .iter()
+            .find(|t| t.from <= at && at < t.to)
+            .and_then(|t| {
+                self.bpm_at(t.deck, at).map(|bpm| bpm * self.value_at(Setting::Tempo(t.deck), at))
+            })
+            .filter(|bpm| *bpm > 0.0)
+            .map(|bpm| 60.0 / bpm)
+    }
+
+    /// A beat length as the mixer shows it ("1/4", "2"), else in seconds.
+    fn beat_name(&self, at: u64, secs: f32) -> String {
+        let Some(beat) = self.beat_len(at) else { return format!("{secs:.2} s") };
+        let beats = f64::from(secs) / beat;
+        BEATS
+            .iter()
+            .find(|(multiple, _)| (beats / multiple - 1.0).abs() < 0.04)
+            .map_or_else(|| format!("{secs:.2} s"), |(_, label)| (*label).to_owned())
+    }
+
+    /// An effect's block name: its type, beat (for the ones that have
+    /// one), what it is on, and REL for Release FX.
+    fn fx_name(&self, span: &deckhand_audio::FxSpan) -> String {
+        let mut name = span.kind.label().to_owned();
+        if span.kind.uses_beat() {
+            name.push(' ');
+            name.push_str(&self.beat_name(span.from, span.beat_secs));
+        }
+        name.push_str(" · ");
+        name.push_str(&target_label(span.target));
+        if span.release {
+            name.push_str(" · REL");
+        }
+        name
+    }
+
+    /// Changes the Beat FX from `from` to `to` only (by `change`): that
+    /// part becomes a block of its own, the rest stays as it was.
+    fn change_fx_part(
+        &mut self,
+        from: u64,
+        to: u64,
+        change: impl Fn(&mut BeatFxParams),
+        what: &str,
+    ) {
+        let at = |t: u64| {
+            self.fx
+                .iter()
+                .take_while(|c| c.0 <= t)
+                .last()
+                .map_or_else(BeatFxParams::default, |c| c.1)
+        };
+        let (start, end) = (at(from), at(to));
+        let mut changes: Vec<(u64, BeatFxParams)> = self
+            .fx
+            .iter()
+            .map(|&(t, mut params)| {
+                if t > from && t < to && (params.on || params.release) {
+                    change(&mut params);
+                }
+                (t, params)
+            })
+            .filter(|c| c.0 != from && c.0 != to)
+            .collect();
+        let mut first = start;
+        if first.on || first.release {
+            change(&mut first);
+        }
+        changes.push((from, first));
+        changes.push((to, end));
+        changes.sort_by_key(|c| c.0);
+        self.set_fx(changes, what);
     }
 
     /// The Add Beat FX dialog, next to where it was asked for.
@@ -2348,6 +2857,14 @@ impl MixEditor {
                         ui.selectable_value(&mut add.target, target, target_label(target));
                     }
                 });
+                if add.kind.uses_beat() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Beat");
+                        for (beat, label) in BEATS {
+                            ui.selectable_value(&mut add.beat, beat, label);
+                        }
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label("Length");
                     for beats in [1, 2, 4, 8, 16, 32] {
@@ -2362,7 +2879,8 @@ impl MixEditor {
                             .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                     )
                     .on_hover_text(
-                        "0%: the sound as it is · 50%: half each · 100%: only the effect",
+                        "Where both edges start; drag them apart afterwards (e.g. 90% to 30%). \
+                         0%: the sound as it is · 100%: only the effect",
                     );
                 });
                 ui.add_space(6.0);
@@ -2389,12 +2907,26 @@ impl MixEditor {
         ui.menu_button(format!("Type: {}", span.kind.label()), |ui| {
             for kind in BeatFxKind::ALL {
                 if ui.selectable_label(kind == span.kind, kind.label()).clicked() {
-                    let changes = restyle_fx(&self.fx, span, Some(kind), None);
+                    let changes = restyle_fx(&self.fx, span, Some(kind), None, None);
                     self.set_fx(changes, kind.label());
                     ui.close();
                 }
             }
         });
+        if span.kind.uses_beat() {
+            let now = self.beat_name(span.from, span.beat_secs);
+            ui.menu_button(format!("Beat: {now}"), |ui| {
+                let beat = self.beat_len(span.from).unwrap_or(1.0);
+                for (multiple, label) in BEATS {
+                    if ui.selectable_label(label == now, label).clicked() {
+                        let secs = (beat * multiple) as f32;
+                        let changes = restyle_fx(&self.fx, span, None, None, Some(secs));
+                        self.set_fx(changes, &format!("beat {label}"));
+                        ui.close();
+                    }
+                }
+            });
+        }
         ui.menu_button(format!("On: {}", target_label(span.target)), |ui| {
             for target in [
                 FxTarget::Channel(0),
@@ -2410,12 +2942,29 @@ impl MixEditor {
                     FxTarget::Master => "Master".into(),
                 };
                 if ui.selectable_label(target == span.target, label).clicked() {
-                    let changes = restyle_fx(&self.fx, span, None, Some(target));
+                    let changes = restyle_fx(&self.fx, span, None, Some(target), None);
                     self.set_fx(changes, &format!("on {}", target_label(target)));
                     ui.close();
                 }
             }
         });
+        // Release FX: the sound cut, the echoes playing out.
+        if span.kind.has_tail() {
+            let mut release = span.release;
+            if ui
+                .checkbox(&mut release, "Release FX")
+                .on_hover_text("The sound is cut and the echoes play out")
+                .changed()
+            {
+                let (from, to) = (span.from, span.to);
+                self.change_fx_part(
+                    from,
+                    to,
+                    |p| p.release = release,
+                    if release { "release" } else { "no release" },
+                );
+            }
+        }
         // One depth through the stretch.
         let now = self.value_at(Setting::BeatFxDepth, span.from) as f32;
         let id = ui.id().with("fx depth");
@@ -2428,7 +2977,8 @@ impl MixEditor {
             );
             ui.data_mut(|d| d.insert_temp(id, depth));
             if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                self.set_depth_through(span.from, span.to, f64::from(depth));
+                let end = self.clip_end(span);
+                self.set_clip_depth(span.from, end, f64::from(depth));
             }
         })
         .response
@@ -2623,10 +3173,23 @@ impl MixEditor {
 
         let editable = !self.busy();
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
+        // The point under the pointer: the nearest on screen (every one, not
+        // only the dots drawn where points crowd), a little forgiving.
+        let spots: Vec<(usize, Pos2)> = {
+            let points = &self.lanes[&setting];
+            (first..last.min(points.len()))
+                .map(|i| {
+                    let p = &points[i];
+                    let x = self.x_of(area, p.at).max(area.left());
+                    (i, pos2(x, self.y_of(area, setting, p.value)))
+                })
+                .collect()
+        };
         let near = |pos: Pos2| {
-            dots.iter()
-                .map(|(i, at)| (*i, at.distance(pos)))
-                .filter(|(_, d)| *d <= GRAB)
+            spots
+                .iter()
+                .map(|&(i, at)| (i, at.distance(pos)))
+                .filter(|(_, d)| *d <= GRAB + 3.0)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(i, _)| i)
         };
@@ -2650,20 +3213,35 @@ impl MixEditor {
             );
             if let Some(i) = near(pos) {
                 painter.circle_stroke(
-                    dots.iter().find(|d| d.0 == i).map_or(pos, |d| d.1),
+                    spots.iter().find(|d| d.0 == i).map_or(pos, |d| d.1),
                     5.0,
                     Stroke::new(1.5_f32, color),
                 );
             }
+            // The value at the cursor (a point's own when on one).
+            if self.drag.is_none() {
+                let (at, value) = match near(pos) {
+                    Some(i) => {
+                        let p = self.lanes[&setting][i];
+                        (p.at, p.value)
+                    }
+                    None => (at, value),
+                };
+                value_tag(&painter, area, pos, &self.describe(setting, at, value));
+            }
         }
-        if !editable {
+        if !editable || self.panning {
             return;
         }
         if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
         {
             self.drag = Some(match near(pos).filter(|_| self.tool == Tool::Normal) {
-                Some(index) => Drag::Point { setting, index, before: self.lanes[&setting].clone() },
+                Some(index) => {
+                    self.clear_selections();
+                    let range = self.range(setting);
+                    Drag::Point { setting, index, before: self.lanes[&setting].clone(), range }
+                }
                 None => {
                     let from = self.at_of(area, pos.x);
                     self.select_only(Selected::Lane);
@@ -2676,13 +3254,16 @@ impl MixEditor {
             && let Some(pos) = pointer
         {
             match self.drag {
-                Some(Drag::Point { setting: s, index, .. }) if s == setting => {
-                    let value = self.value_of(area, setting, pos.y);
+                Some(Drag::Point { setting: s, index, range: (lo, hi), .. }) if s == setting => {
+                    let share = f64::from((area.bottom() - 3.0 - pos.y) / (area.height() - 6.0));
+                    let value = lo + share.clamp(0.0, 1.0) * (hi - lo);
                     let at = self.at_of(area, pos.x);
                     let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
-                    // Between its neighbours; the first stays at the start.
-                    let low = if index == 0 { 0 } else { lane[index - 1].at + 1 };
-                    let high = lane.get(index + 1).map_or(u64::MAX, |p| p.at.saturating_sub(1));
+                    // Between its neighbours, apart enough not to land on the
+                    // same buffer as one; the first stays at the start.
+                    let low = if index == 0 { 0 } else { lane[index - 1].at + POINT_GAP };
+                    let high =
+                        lane.get(index + 1).map_or(u64::MAX, |p| p.at.saturating_sub(POINT_GAP));
                     lane[index] = Point {
                         curve: lane[index].curve,
                         at: if index == 0 { 0 } else { at.clamp(low, high.max(low)) },
@@ -2711,6 +3292,7 @@ impl MixEditor {
         }
         if response.clicked() {
             self.selection = None;
+            self.chosen_fx = None;
         }
         if response.double_clicked()
             && let Some(pos) = pointer
@@ -2732,7 +3314,7 @@ impl MixEditor {
             && let Some(index) = on_point.filter(|i| *i > 0)
         {
             let before = self.lanes[&setting].clone();
-            self.lanes.get_mut(&setting).expect("every setting has a lane").remove(index);
+            remove_point(self.lanes.get_mut(&setting).expect("every setting has a lane"), index);
             self.commit(setting, before, "delete point");
         }
         // Right click away from points: back to the recording, and more.
@@ -2776,16 +3358,24 @@ impl MixEditor {
 
     /// Plays the edited set into "<name> edit.wav" in the background.
     fn start_render(&mut self) {
-        let out = free_path(&self.path, "edit");
+        let range = self.range;
+        let out = free_path(&self.path, if range.is_some() { "edit part" } else { "edit" });
         let session = self.session.clone();
         let done_frames = Arc::new(AtomicU64::new(0));
         let progress = done_frames.clone();
         let (tx, done) = std::sync::mpsc::channel();
+        let total = range.map_or(self.length, |r| r.1);
         std::thread::spawn(move || {
             let result = session
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the session is broken"))
-                .and_then(|s| s.render_to_wav(&out, None, |f| progress.store(f, Ordering::Relaxed)))
+                .and_then(|s| {
+                    let progress = |f| progress.store(f, Ordering::Relaxed);
+                    match range {
+                        Some((from, to)) => s.render_part_to_wav(&out, from, to, progress),
+                        None => s.render_to_wav(&out, None, progress).map(|r| r.frames),
+                    }
+                })
                 .map(|_| {
                     format!(
                         "Rendered into {}",
@@ -2794,7 +3384,7 @@ impl MixEditor {
                 });
             let _ = tx.send(result);
         });
-        self.render = Some(Render { done_frames, done });
+        self.render = Some(Render { done_frames, total, done });
     }
 
     /// Writes the edited session where the user picks.
@@ -2817,6 +3407,86 @@ impl MixEditor {
             Err(err) => format!("Not saved: {err:#}"),
         })
     }
+}
+
+/// A tool's button: its pointer drawn (an arrow for Normal, an I-beam for
+/// Select) before its name.
+fn tool_button(ui: &mut Ui, tool: Tool, label: &str, on: bool) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    // Its colour comes when painted (hovered, chosen, theme).
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
+    let icon = 12.0;
+    let size = vec2(icon + 6.0 + galley.size().x + 12.0, ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let visuals = ui.style().interact_selectable(&response, on);
+    if on || response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
+    }
+    let color = visuals.text_color();
+    let c = pos2(rect.left() + 6.0 + icon / 2.0, rect.center().y);
+    match tool {
+        // A pointer arrow.
+        Tool::Normal => {
+            let top = c + vec2(-4.0, -6.0);
+            ui.painter().add(Shape::convex_polygon(
+                vec![top, top + vec2(0.0, 11.0), top + vec2(3.0, 8.0), top + vec2(7.5, 8.0)],
+                color,
+                Stroke::NONE,
+            ));
+            ui.painter().line_segment(
+                [top + vec2(3.0, 8.0), top + vec2(5.0, 12.0)],
+                Stroke::new(1.6_f32, color),
+            );
+        }
+        // An I-beam.
+        Tool::Select => {
+            let stroke = Stroke::new(1.4_f32, color);
+            let (top, bottom) = (c.y - 6.0, c.y + 6.0);
+            ui.painter().line_segment([pos2(c.x, top), pos2(c.x, bottom)], stroke);
+            for y in [top, bottom] {
+                ui.painter().line_segment([pos2(c.x - 3.0, y), pos2(c.x + 3.0, y)], stroke);
+            }
+        }
+    }
+    ui.painter().galley(
+        pos2(rect.left() + 6.0 + icon + 6.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response
+}
+
+/// Takes a point out of a lane; the one before it then runs in a straight
+/// line to the one after (unless it was a curve), not a step.
+fn remove_point(lane: &mut Vec<Point>, index: usize) {
+    lane.remove(index);
+    if let Some(before) = index.checked_sub(1).and_then(|i| lane.get_mut(i))
+        && before.curve == Curve::Step
+    {
+        before.curve = Curve::Line;
+    }
+}
+
+/// A value next to the cursor, on a dark tag, kept inside `area`.
+fn value_tag(painter: &egui::Painter, area: Rect, pos: Pos2, text: &str) {
+    // Above everything, so rows drawn later or the row's edge don't hide it.
+    let painter = painter
+        .ctx()
+        .layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("value tag")));
+    let galley =
+        painter.layout_no_wrap(text.to_owned(), egui::FontId::monospace(11.0), Color32::WHITE);
+    let size = galley.size() + vec2(8.0, 4.0);
+    // Up and right of the pointer; flipped where it would leave the area.
+    let mut at = pos + vec2(12.0, -size.y - 6.0);
+    if at.x + size.x > area.right() {
+        at.x = pos.x - size.x - 12.0;
+    }
+    if at.y < area.top() {
+        at.y = pos.y + 10.0;
+    }
+    let rect = Rect::from_min_size(at, size);
+    painter.rect_filled(rect, 3.0, Color32::from_black_alpha(200));
+    painter.galley(rect.min + vec2(4.0, 2.0), galley, Color32::WHITE);
 }
 
 /// EDIT mode is not finished: says so.
@@ -2883,17 +3553,25 @@ impl DeckhandApp {
             if ui.add_enabled(idle, egui::Button::new("Save edit…")).clicked() {
                 message = editor.save();
             }
-            if ui
-                .add_enabled(idle, egui::Button::new("Render"))
-                .on_hover_text("Plays the edited set into a new WAV next to the session")
-                .clicked()
-            {
+            let (label, hint) = match editor.range {
+                Some(_) => (
+                    "Render range",
+                    "Plays the range marked on the ruler into a new WAV next to the session \
+                     (Select tool: drag along the ruler; click it to let go)",
+                ),
+                None => (
+                    "Render",
+                    "Plays the edited set into a new WAV next to the session. To render a part, \
+                     mark it on the ruler with the Select tool",
+                ),
+            };
+            if ui.add_enabled(idle, egui::Button::new(label)).on_hover_text(hint).clicked() {
                 editor.start_render();
             }
             if let Some(render) = &editor.render {
                 ui.spinner();
                 let done = render.done_frames.load(Ordering::Relaxed);
-                ui.label(format!("Rendering… {}%", done * 100 / editor.length.max(1)));
+                ui.label(format!("Rendering… {}%", done * 100 / render.total.max(1)));
             }
             if editor.resync.is_some() {
                 ui.spinner();
@@ -3056,6 +3734,43 @@ mod tests {
     /// How much faster than real time `DECKHAND_SESSION` plays offline:
     /// listening from a cursor plays everything before it first (read only).
     /// `cargo test -p deckhand-app --release render_speed -- --ignored --nocapture`
+    /// A new effect on `DECKHAND_SESSION` is flat at the depth chosen, with
+    /// a handle at each edge, and its depth goes along when it moves:
+    /// `cargo test -p deckhand-app new_effect_is_flat -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn new_effect_is_flat() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
+        session.split_fx_depth();
+        let mut editor = MixEditor::new(path, session);
+        let at = editor.length / 3;
+        let add = AddFx { at, pos: Pos2::ZERO, ..editor.last_fx };
+        editor.add_fx(AddFx { depth: 0.75, kind: BeatFxKind::Reverb, ..add });
+        let span = fx_spans(&editor.fx, editor.length)
+            .into_iter()
+            // Its start moved to a buffer start.
+            .find(|s| s.from.abs_diff(at) < 4096)
+            .expect("the new effect");
+        let end = editor.clip_end(&span);
+        let lane = editor.lanes[&Setting::BeatFxDepth].clone();
+        let edges: Vec<_> =
+            lane.iter().filter(|p| p.at == span.from || p.at == end).map(|p| p.value).collect();
+        assert_eq!(edges, [0.75, 0.75], "{lane:?}");
+        for t in [span.from, (span.from + end) / 2, end] {
+            assert!((lane_value(&lane, t) - 0.75).abs() < 1e-9, "flat at {t}");
+        }
+        // Moved two seconds on: the depth goes with it.
+        let by = (2.0 * editor.rate) as u64;
+        let old = (span.from, end);
+        let changes = move_fx(&editor.fx, &span, span.from + by, span.to + by);
+        editor.set_fx(changes, "move");
+        editor.move_clip_depth(old, span.from + by, end + by);
+        let lane = &editor.lanes[&Setting::BeatFxDepth];
+        assert!((lane_value(lane, span.from + by + 10) - 0.75).abs() < 1e-9, "{lane:?}");
+        println!("ok: {} depth points", lane.len());
+    }
+
     #[test]
     #[ignore]
     fn render_speed() {

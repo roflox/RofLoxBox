@@ -913,8 +913,21 @@ pub struct FxSpan {
     pub to: u64,
     pub kind: BeatFxKind,
     pub target: FxTarget,
+    /// The effect's beat length (beat × multiplier) in seconds.
+    pub beat_secs: f32,
+    /// Release FX: the sound cut, the echo playing out.
+    pub release: bool,
     /// The depth knob along it.
     pub depth: Vec<(u64, f32)>,
+}
+
+impl FxSpan {
+    /// Whether `params` are this effect's (another type, target, beat or
+    /// Release FX makes another block).
+    fn same_effect(&self, params: &BeatFxParams) -> bool {
+        (self.kind, self.target, self.release) == (params.kind, params.target, params.release)
+            && self.beat_secs == params.beat_secs
+    }
 }
 
 fn fx_on(params: &BeatFxParams) -> bool {
@@ -926,16 +939,22 @@ fn fx_on(params: &BeatFxParams) -> bool {
 pub fn fx_spans(changes: &[(u64, BeatFxParams)], length: u64) -> Vec<FxSpan> {
     let mut spans = Vec::new();
     let mut open: Option<FxSpan> = None;
+    let start = |at: u64, params: &BeatFxParams| FxSpan {
+        from: at,
+        to: at,
+        kind: params.kind,
+        target: params.target,
+        beat_secs: params.beat_secs,
+        release: params.release,
+        depth: vec![(at, params.depth)],
+    };
     for &(at, params) in changes {
         match (open.as_mut(), fx_on(&params)) {
-            (None, true) => {
-                open = Some(FxSpan {
-                    from: at,
-                    to: at,
-                    kind: params.kind,
-                    target: params.target,
-                    depth: vec![(at, params.depth)],
-                });
+            (None, true) => open = Some(start(at, &params)),
+            // Another effect right after: a block of its own.
+            (Some(span), true) if !span.same_effect(&params) => {
+                spans.extend(open.take().map(|span| FxSpan { to: at, ..span }));
+                open = Some(start(at, &params));
             }
             (Some(span), true) => {
                 if span.depth.last().is_none_or(|d| d.1 != params.depth) {
@@ -962,28 +981,41 @@ pub fn move_fx(
 ) -> Vec<(u64, BeatFxParams)> {
     let length = (span.to - span.from).max(1) as f64;
     let place = |at: u64| from + ((at - span.from) as f64 / length * (to - from) as f64) as u64;
-    let inside = |at: u64| at >= span.from && at <= span.to;
-    let mut moved: Vec<_> = changes
-        .iter()
-        .filter(|(at, _)| !inside(*at) && !(*at >= from && *at <= to))
-        .copied()
-        .collect();
-    moved.extend(changes.iter().filter(|(at, _)| inside(*at)).map(|&(at, p)| (place(at), p)));
+    let own = |&(at, params): &(u64, BeatFxParams)| span_owns(span, at, &params);
+    let mut moved: Vec<_> =
+        changes.iter().filter(|c| !own(c) && !(c.0 >= from && c.0 <= to)).copied().collect();
+    let mine: Vec<(u64, BeatFxParams)> =
+        changes.iter().filter(|c| own(c)).map(|&(at, p)| (place(at), p)).collect();
+    // A block that ran into the next one has no end of its own: it ends
+    // where it was moved to.
+    if let Some(&(_, last)) = mine.last()
+        && fx_on(&last)
+    {
+        moved.push((to, BeatFxParams { on: false, release: false, ..last }));
+    }
+    moved.extend(mine);
     moved.sort_by_key(|(at, _)| *at);
     moved
 }
 
-/// The changes with `span`'s effect type or what it is on changed, also
-/// while its echoes ring out after it.
+/// Whether a change is `span`'s own: in it, or its end (not the next
+/// block starting where it ends).
+fn span_owns(span: &FxSpan, at: u64, params: &BeatFxParams) -> bool {
+    at >= span.from && (at < span.to || at == span.to && !fx_on(params))
+}
+
+/// The changes with `span`'s effect type, what it is on or its beat length
+/// changed, also while its echoes ring out after it.
 pub fn restyle_fx(
     changes: &[(u64, BeatFxParams)],
     span: &FxSpan,
     kind: Option<BeatFxKind>,
     target: Option<FxTarget>,
+    beat_secs: Option<f32>,
 ) -> Vec<(u64, BeatFxParams)> {
     let next_on = changes
         .iter()
-        .find(|(at, params)| *at > span.to && fx_on(params))
+        .find(|(at, params)| *at >= span.to && fx_on(params))
         .map_or(u64::MAX, |(at, _)| *at);
     changes
         .iter()
@@ -991,6 +1023,7 @@ pub fn restyle_fx(
             if at >= span.from && at < next_on {
                 params.kind = kind.unwrap_or(params.kind);
                 params.target = target.unwrap_or(params.target);
+                params.beat_secs = beat_secs.unwrap_or(params.beat_secs);
             }
             (at, params)
         })
@@ -1002,7 +1035,7 @@ pub fn remove_fx(changes: &[(u64, BeatFxParams)], span: &FxSpan) -> Vec<(u64, Be
     changes
         .iter()
         .map(|&(at, mut params)| {
-            if at >= span.from && at <= span.to {
+            if span_owns(span, at, &params) {
                 (params.on, params.release) = (false, false);
             }
             (at, params)
@@ -1327,6 +1360,70 @@ impl Session {
         }
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         self.fit_fx_depth();
+    }
+
+    /// Moves `from`–`to` of `span` (frames from the start) by `frames`,
+    /// inside the clip: that audio plays at the new place instead of what
+    /// was there (laid over it), and the old place is silent. `tempo` is
+    /// the deck's there (track seconds a set second). Returns the new
+    /// place.
+    pub fn move_part(
+        &mut self,
+        span: &TrackSpan,
+        from: u64,
+        to: u64,
+        frames: i64,
+        tempo: f64,
+    ) -> (u64, u64) {
+        let frames = frames.clamp(
+            span.from as i64 - from as i64,
+            (span.to as i64 - to as i64).max(span.from as i64 - from as i64),
+        );
+        let shifted = |at: u64| (at as i64 + frames).max(0) as u64;
+        let (new_from, new_to) = (shifted(from), shifted(to));
+        if frames == 0 {
+            return (from, to);
+        }
+        let without = |pieces: &[(u64, u64)], a: u64, b: u64| {
+            let mut out = Vec::new();
+            for &(f, t) in pieces {
+                if t <= a || f >= b {
+                    out.push((f, t));
+                    continue;
+                }
+                if f < a {
+                    out.push((f, a));
+                }
+                if t > b {
+                    out.push((b, t));
+                }
+            }
+            out
+        };
+        // Heard: the rest without the old and the new place, and the part's
+        // own pieces at the new place.
+        let pieces = self.pieces(span);
+        let moved: Vec<(u64, u64)> = pieces
+            .iter()
+            .filter(|&&(f, t)| f < to && t > from)
+            .map(|&(f, t)| (shifted(f.max(from)), shifted(t.min(to))))
+            .collect();
+        let mut heard = without(&without(&pieces, from, to), new_from, new_to);
+        heard.extend(moved);
+        heard.sort_by_key(|p| p.0);
+        self.set_pieces(span, &heard);
+        // The deck plays the part's audio from the new place, then goes on
+        // where it was.
+        let later = frames as f64 / f64::from(self.rate) * tempo;
+        let moved_by = |session: &Self, at: u64| {
+            let at = session.snap(at);
+            let deck = span.deck;
+            session.moves().iter().find(|m| m.deck == deck && m.at == at).map_or(0.0, |m| m.later)
+        };
+        let (into, back) = (moved_by(self, new_from), moved_by(self, new_to));
+        self.move_track(span.deck, new_from, into + later);
+        self.move_track(span.deck, new_to, back - later);
+        (new_from, new_to)
     }
 
     /// The pieces of `span` heard, between the editor's cuts (all of it
@@ -1911,6 +2008,48 @@ impl Session {
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         // Tempo lanes as edited keep their points; the rest show sync's.
         Ok(count)
+    }
+
+    /// Plays `from`–`to` of the session (frames from the start) into a
+    /// 24-bit WAV at `path`. Everything before it is played too, unheard,
+    /// so the part sounds as it does in the whole set. `progress` gets the
+    /// frames done (of the whole way to `to`). Returns the frames written.
+    pub fn render_part_to_wav(
+        &self,
+        path: &Path,
+        from: u64,
+        to: u64,
+        mut progress: impl FnMut(u64),
+    ) -> Result<u64> {
+        let rate = self.rate;
+        let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let mut wav = BufWriter::with_capacity(1 << 16, file);
+        crate::record::write_header(&mut wav, rate, 0)?;
+        let (mut clock, mut written) = (0u64, 0u64);
+        // Played past `to`: stops the mixer there (not a failure).
+        const DONE: &str = "the part is played";
+        let played = self.render(|buffer| {
+            let frames = buffer.len() as u64 / 2;
+            let (start, end) = (clock, clock + frames);
+            clock = end;
+            let (a, b) = (from.clamp(start, end), to.clamp(start, end));
+            for &sample in &buffer[((a - start) * 2) as usize..((b - start) * 2) as usize] {
+                wav.write_all(&crate::record::to_24_bit(sample).to_le_bytes()[..3])?;
+            }
+            written += b - a;
+            progress(end.min(to));
+            if end >= to { Err(anyhow!(DONE)) } else { Ok(()) }
+        });
+        if let Err(err) = played
+            && err.to_string() != DONE
+        {
+            return Err(err);
+        }
+        wav.flush()?;
+        let mut file = wav.into_inner().map_err(|e| e.into_error())?;
+        file.seek(SeekFrom::Start(0))?;
+        crate::record::write_header(&mut file, rate, written)?;
+        Ok(written)
     }
 
     /// Plays the session into a 24-bit WAV at `path` and, if given,
@@ -2744,7 +2883,8 @@ mod tests {
         assert_eq!(moved[0].depth, [(2000, 0.5), (2500, 0.8)]);
         assert_eq!(moved[1], spans[1]);
 
-        let restyled = restyle_fx(&changes, &spans[0], Some(Reverb), Some(FxTarget::Channel(1)));
+        let restyled =
+            restyle_fx(&changes, &spans[0], Some(Reverb), Some(FxTarget::Channel(1)), None);
         let spans_now = fx_spans(&restyled, 8000);
         assert_eq!((spans_now[0].kind, spans_now[0].target), (Reverb, FxTarget::Channel(1)));
         // Its echoes ring out as the same effect; the next one is untouched.
@@ -2975,6 +3115,117 @@ mod tests {
             session.beat_fx().iter().filter(|c| c.0 >= half).map(|c| c.1.depth).collect();
         assert_eq!(later, [1.0]);
         assert_ne!(render(&session), before);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Part of a clip moved a second later plays there, laid over what
+    /// was there, and leaves silence where it was.
+    #[test]
+    fn moved_part_plays_at_its_new_place() {
+        let a = track(48_000, 4.0, 3);
+        let path = PathBuf::from("/music/part.wav");
+        remember_track(&a, &path);
+        let file = record(
+            "part",
+            vec![
+                Command::Load { deck: 0, audio: a.clone() },
+                Command::SetPlaying { deck: 0, playing: true },
+            ],
+            3.5,
+        );
+        let mut session = Session::read(&file, Tracks([(path, a)].into_iter().collect())).unwrap();
+        let render = |s: &Session| {
+            let mut out = Vec::new();
+            s.render(|b| Ok(out.extend_from_slice(b))).unwrap();
+            out
+        };
+        let before = render(&session);
+        let span = session.tracks()[0].clone();
+        // On buffer starts, half a second long, moved a second on.
+        let (from, to, by) = (47 * 512, 94 * 512, 94 * 512);
+        let (new_from, new_to) = session.move_part(&span, from, to, by, 1.0);
+        assert_eq!((new_from, new_to), (from + 94 * 512, to + 94 * 512));
+        let after = render(&session);
+        // Away from the fades at the edges.
+        let margin = 1024;
+        let worst = |a: &[f32], a0: u64, b: &[f32], b0: u64, len: u64| {
+            (0..len as usize * 2)
+                .map(|i| (a[a0 as usize * 2 + i] - b[b0 as usize * 2 + i]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let len = to - from - 2 * margin;
+        let moved = worst(&after, new_from + margin, &before, from + margin, len);
+        assert!(moved < 1e-3, "the part plays at its new place: {moved}");
+        let old = (from + margin) as usize * 2..(to - margin) as usize * 2;
+        let left = after[old].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(left < 1e-3, "silent where it was: {left}");
+        // After it, the track goes on as before.
+        let rest = worst(&after, new_to + margin, &before, new_to + margin, 24_000);
+        assert!(rest < 1e-3, "the rest as before: {rest}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Another beat (or type, target) makes a block of its own; moving or
+    /// removing one leaves the one right after it alone.
+    #[test]
+    fn beat_fx_blocks_split_by_their_settings() {
+        let echo = |beat: f32| BeatFxParams {
+            kind: crate::fx::BeatFxKind::Echo,
+            on: true,
+            beat_secs: beat,
+            ..BeatFxParams::default()
+        };
+        let off = BeatFxParams { on: false, ..echo(0.25) };
+        let changes = vec![(0, off), (100, echo(0.125)), (200, echo(0.25)), (300, off)];
+        let spans = fx_spans(&changes, 1000);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_eq!((spans[0].from, spans[0].to, spans[0].beat_secs), (100, 200, 0.125));
+        assert_eq!((spans[1].from, spans[1].to, spans[1].beat_secs), (200, 300, 0.25));
+
+        // The 1/8 one off: the 1/4 one plays on.
+        let removed = fx_spans(&remove_fx(&changes, &spans[0]), 1000);
+        assert_eq!(removed.len(), 1);
+        assert_eq!((removed[0].from, removed[0].to, removed[0].beat_secs), (200, 300, 0.25));
+
+        // The 1/8 one moved later, past the other: both keep their place.
+        let moved = fx_spans(&move_fx(&changes, &spans[0], 500, 600), 1000);
+        let places: Vec<_> = moved.iter().map(|s| (s.from, s.to, s.beat_secs)).collect();
+        assert_eq!(places, [(200, 300, 0.25), (500, 600, 0.125)]);
+
+        // A new beat for the first: only it changes.
+        let restyled = fx_spans(&restyle_fx(&changes, &spans[0], None, None, Some(0.5)), 1000);
+        let beats: Vec<_> = restyled.iter().map(|s| s.beat_secs).collect();
+        assert_eq!(beats, [0.5, 0.25]);
+    }
+
+    /// A part rendered alone is the same as that part of the whole.
+    #[test]
+    fn a_part_renders_as_in_the_whole() {
+        let a = track(48_000, 3.0, 2);
+        let path = PathBuf::from("/music/whole.wav");
+        remember_track(&a, &path);
+        let file = record(
+            "part-render",
+            vec![
+                Command::Load { deck: 0, audio: a.clone() },
+                Command::SetPlaying { deck: 0, playing: true },
+            ],
+            2.5,
+        );
+        let session = Session::read(&file, Tracks([(path, a)].into_iter().collect())).unwrap();
+        let mut whole = Vec::new();
+        session.render(|b| Ok(whole.extend_from_slice(b))).unwrap();
+        let (from, to) = (30_001, 70_003);
+        let out = file.with_file_name("part.wav");
+        let written = session.render_part_to_wav(&out, from, to, |_| {}).unwrap();
+        assert_eq!(written, to - from);
+        let part = crate::decode::decode_file(&out).unwrap();
+        assert_eq!(part.frames() as u64, to - from);
+        let worst = (0..part.samples.len())
+            .map(|i| (part.samples[i] - whole[from as usize * 2 + i]).abs())
+            .fold(0.0f32, f32::max);
+        // 24-bit rounding.
+        assert!(worst < 1e-5, "{worst}");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 

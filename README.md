@@ -167,21 +167,36 @@ Open a session:
   recording.
 - **Effects**: a Color FX row shows where each deck's Color FX were on.
   The Beat FX play as blocks: right-click or double-click an empty spot in
-  their row to open **Add Beat FX** (type, what it is on, length in beats,
+  their row to open **Add Beat FX** (type, beat, what it is on, length,
   depth), drag a block or its edges to move or stretch it, and right-click
-  it to change its type, target or depth, or remove it. The line inside a
-  block is its depth (wet/dry), a lane like the others: double-click to add
-  a point (Step, Line or Smooth, as chosen in the toolbar), drag points up,
-  down and along, right-click one to delete it.
+  it to change its type, beat (1/16 … 32), target, Release FX or depth, or
+  remove it (or click it and press **Delete**). A block's name shows its
+  settings, e.g. `ECHO 1/4 · MST`; each change of type, beat, target or
+  Release FX is a block of its own. To change only part of an effect,
+  select that part with **Select** and right-click it: another beat or type
+  there makes it a new block. The line inside a
+  block is its depth (wet/dry), with a handle at each edge: drag them up
+  or down (start at 90% and end at 30%, say). Double-click to add points
+  between (Step, Line or Smooth, as chosen in the toolbar), drag those up,
+  down and along, right-click one to delete it. The depth goes along when
+  the block is moved or stretched.
 - **Tools**: **Normal** (key `1`) moves and edits; **Select** (key `2`)
   drags a stretch over a deck's clips, the Beat FX or a lane, and
   **Delete** cuts it out of the clips, takes the effects off through it, or
-  flattens the lane. **Cmd + E** (Ctrl + E on Windows and Linux) splits the clips at both edges of the
-  selection instead, so the selected part becomes a piece of its own. The keys can be changed in Preferences → Keyboard →
+  takes a lane's points out and joins its sides in a straight line. Deleting
+  a single point (right-click) also leaves a straight line, not a step. **Cmd + E** (Ctrl + E on Windows and Linux) splits the clips at both edges of the
+  selection instead, so the selected part becomes a piece of its own.
+  With **Normal**, drag the selected part to move just it: it is cut out
+  and laid over whatever plays at its new place on that deck, leaving
+  silence where it was. Dragging or clicking anything else lets go of the
+  selection. The keys can be changed in Preferences → Keyboard →
   EDIT mode.
 - **Play** (Space) listens to the edited set from the cursor (click the
   ruler to place it); edits are heard as you make them. **Bass clashes**
-  marks where two decks' low end plays together. Undo, Redo and History keep
+  marks where two decks' low end plays together.
+  With **Select**, drag along the ruler to mark a range; **Render range**
+  then plays only that part into the WAV (click the ruler to let go of it).
+  Its sides can be dragged on the ruler with either tool. Undo, Redo and History keep
   the last 100 changes; **Save edit…** writes a new session and **Render**
   plays it into a new WAV.
 
