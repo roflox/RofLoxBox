@@ -1466,6 +1466,7 @@ impl DeckhandApp {
             marked: &self.marked,
             editable_rating: true,
             reorder,
+            compatible_with: self.compatible_key(),
         };
         let mut actions: Vec<TrackAction> = Vec::new();
         let output = egui::Frame::new()
@@ -1691,16 +1692,25 @@ pub(super) fn deckhand_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-fn reveal_label() -> &'static str {
-    if cfg!(windows) { "Show in Explorer" } else { "Show in Finder" }
+pub(super) fn reveal_label() -> &'static str {
+    if cfg!(windows) {
+        "Show in Explorer"
+    } else if cfg!(target_os = "macos") {
+        "Show in Finder"
+    } else {
+        "Show in file manager"
+    }
 }
 
-/// Opens the file manager with the file selected.
+/// Opens the file manager with the file (or folder) selected; elsewhere
+/// than macOS and Windows, opens the folder it is in.
 pub(super) fn reveal(path: &std::path::Path) {
     let _ = if cfg!(windows) {
         std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
-    } else {
+    } else if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg("-R").arg(path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()
     };
 }
 

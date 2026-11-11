@@ -358,6 +358,7 @@ impl DeckhandApp {
             marked: &self.marked,
             editable_rating: false,
             reorder: None,
+            compatible_with: self.compatible_key(),
         };
         let selection = self.selected_ids();
         let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };

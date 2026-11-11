@@ -274,6 +274,8 @@ pub struct TableOptions<'a> {
     /// Playlist entries being dragged can be dropped between rows: shown
     /// in playlist order, or reversed (`Some(true)`).
     pub reorder: Option<bool>,
+    /// Keys that mix with this one (the master deck's) are lit up.
+    pub compatible_with: Option<(i32, bool)>,
 }
 
 /// The track list. `context` fills a row's right-click menu.
@@ -443,7 +445,26 @@ pub fn track_table(
                                 .collect();
                             text = marker + &text;
                         }
-                        ui.add(egui::Label::new(text).truncate());
+                        let compatible = column == TrackColumn::Key
+                            && options.compatible_with.is_some_and(|with| {
+                                row.key.as_deref().and_then(parse_key).is_some_and(|key| {
+                                    crate::deck::compatible_keys(key, with)
+                                })
+                            });
+                        if compatible {
+                            let green = Color32::from_rgb(70, 200, 110);
+                            ui.painter().rect_filled(
+                                ui.max_rect().shrink2(vec2(0.0, 1.0)),
+                                3.0,
+                                green.gamma_multiply(0.25),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(text).color(green).strong())
+                                    .truncate(),
+                            );
+                        } else {
+                            ui.add(egui::Label::new(text).truncate());
+                        }
                     });
                 }
                 let response = table_row.response();
@@ -612,6 +633,7 @@ mod tests {
                         marked: &marked,
                         editable_rating: false,
                         reorder,
+                        compatible_with: None,
                     };
                     let mut columns = vec![TrackColumn::Number, TrackColumn::Title];
                     let output =

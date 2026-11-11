@@ -930,7 +930,15 @@ impl Mixer {
                     d.target = d.held.then_some(d.position);
                 }
             }
-            Command::Gate { deck, open } => self.decks[deck].gate_open = open,
+            Command::Gate { deck, open } => {
+                let d = &mut self.decks[deck];
+                d.gate_open = open;
+                // A deck standing still makes no sound to fade: a cut (or
+                // its end) is there at once, so nothing leaks when it plays.
+                if !d.playing && !d.braking {
+                    d.gate = if open { 1.0 } else { 0.0 };
+                }
+            }
             Command::MoveTrack { deck, later } => {
                 self.apply(&Command::Shift { deck, seconds: -later });
             }

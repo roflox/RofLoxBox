@@ -141,7 +141,8 @@ The screen is yours to arrange, all from the **View** menu:
 > recordings (edits are saved as new files and never change them).
 
 **REC** records the master to a folder of its own in `Music/RofLoxBox
-Recordings`: the 24-bit WAV, a `.session` file with everything that was
+Recordings`; when you stop it, a window asks for its name (Esc keeps the
+date and time): the 24-bit WAV, a `.session` file with everything that was
 played (the tracks, every knob, fader, button and jog movement, sync, beat
 grids) and the stems the decks used. Preferences → Audio → **Replay a
 session…** plays a session through the mixer again, and it comes out
@@ -151,18 +152,28 @@ identical to the recording, sample for sample.
 Open a session:
 
 - **Decks**: each deck shows what it played, its waveform bright where it
-  reached the mix, with the beat grid. Drag a clip by its title to move it,
+  reached the mix, with the beat grid. Every time a deck played (PLAY, or CUE
+  held) is a box of its own: click one to select it (Delete cuts it out,
+  dragging moves it), or right-click it to cut out just that play, e.g. a
+  CUE preview that was heard. Drag a clip by its title to move it,
   drag inside it to slide its audio (to fix a beatmatch), shrink it by its
   edges, double-click to split it and right-click a piece to cut it out or
-  bring it back. After a split, dragging moves the piece you grab.
+  bring it back. Dragging one of a clip's plays moves just it, with what
+  was done in it, between the plays around it (it starts where it did in
+  the track); a piece of a split clip moves laid over what is there; a clip with one play, or
+  any clip with ⌥ held, slides its audio instead (to fix a beatmatch).
+  **Cmd/Ctrl-click** picks more: plays, pieces, or whole clips by their
+  title strip, on any deck (again to let go of one). Dragging any of them
+  moves them all together; Delete and Cmd/Ctrl+E act on all.
 - **Lanes**: a lane of automation for each knob and fader: volume, trim, EQ,
   tempo, crossfader, master, and an **intensity** lane for every Color FX
   type on every deck (Filter, Space, Dub Echo, Crush, Noise, Pitch). The
   types are separate, so you can add a Space on deck 2 for eight bars
   afterwards, alongside the filter you played, even if you never touched
   Space live. Press **+** under a deck (or the mixer, or Effects) to show
-  more lanes. Double-click to add a point, drag to move it, right-click to
-  delete it; points step, run in lines or ease in curves; select a stretch
+  more lanes. Double-click to add a point (or, on a point, to type its value: the
+  BPM for tempo, dB for EQ and trim, percent otherwise), drag to move it,
+  right-click to delete it; points step, run in lines or ease in curves; select a stretch
   to flatten or ramp it, or right-click it to **reset it to the original**
   recording.
 - **Effects**: a Color FX row shows where each deck's Color FX were on.
@@ -244,9 +255,11 @@ Every commit is a new version, `0.<number of commits>.0`
 changes is marked as the version they will become: `0.<commits + 1>.0-dev`. Each push to `main` runs
 `.github/workflows/release.yml`, which builds all three on GitHub's machines
 and publishes them as the release `v0.<n>.0`, with their SHA-256 sums.
-`scripts/publish-release.sh [--draft]` uploads the builds of this version
-from `target/dist/` to that release yourself (needs the GitHub CLI:
-`brew install gh && gh auth login`, and the commit pushed).
+`scripts/publish-release.sh` uploads the builds of the pushed commit
+(`v0.<n>.0`) from `target/dist/` yourself; with `--dev` it publishes the
+`-dev` builds (uncommitted changes included) as a pre-release, and
+`--draft` keeps either hidden until you publish it. Needs the GitHub CLI
+(`brew install gh && gh auth login`) and the commit pushed.
 
 Signing needs your own certificates; without them the builds are unsigned
 (macOS ad hoc: open it once with right-click → Open; Windows SmartScreen

@@ -18,6 +18,58 @@ pub fn default_recordings_dir() -> PathBuf {
     home.join("Music").join(format!("{} Recordings", crate::APP_NAME))
 }
 
+/// A typed name fit for a file name (none when nothing is left).
+fn clean_name(typed: &str) -> Option<String> {
+    let name: String = typed
+        .chars()
+        .map(|c| if "/\\:*?\"<>|".contains(c) || c.is_control() { '-' } else { c })
+        .collect();
+    let name = name.trim().trim_matches('.').trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// `name`, or "name 2", "name 3"… where a recording has it already.
+fn free_name(dir: &Path, name: &str) -> String {
+    (1..)
+        .map(|n| if n == 1 { name.to_owned() } else { format!("{name} {n}") })
+        .find(|n| !dir.join(n).exists())
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Gives a finished recording (its folder, WAV and session) `name`;
+/// returns the WAV's new path. Sessions find their kept stems in the
+/// renamed folder.
+fn rename_recording(wav: &Path, name: &str) -> Result<PathBuf> {
+    let folder = wav.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
+    let old = wav.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    if old == name {
+        return Ok(wav.to_path_buf());
+    }
+    // A folder of its own (named like it): that is renamed too.
+    let own_folder = folder.file_name().is_some_and(|f| f.to_string_lossy() == old);
+    let parent = folder.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
+    let name = if own_folder {
+        free_name(parent, name)
+    } else {
+        (1..)
+            .map(|n| if n == 1 { name.to_owned() } else { format!("{name} {n}") })
+            .find(|n| !folder.join(format!("{n}.wav")).exists())
+            .unwrap_or_else(|| name.to_owned())
+    };
+    for ext in ["wav", "session"] {
+        let from = folder.join(format!("{old}.{ext}"));
+        if from.exists() {
+            std::fs::rename(&from, folder.join(format!("{name}.{ext}")))?;
+        }
+    }
+    if !own_folder {
+        return Ok(folder.join(format!("{name}.wav")));
+    }
+    let renamed = parent.join(&name);
+    std::fs::rename(folder, &renamed)?;
+    Ok(renamed.join(format!("{name}.wav")))
+}
+
 impl DeckhandApp {
     pub(super) fn recordings_dir(&self) -> PathBuf {
         self.config.recordings_dir.clone().unwrap_or_else(default_recordings_dir)
@@ -31,16 +83,23 @@ impl DeckhandApp {
         };
         match self.recording.take() {
             Some(recording) => match engine.stop_recording(recording) {
-                Ok(path) => self.status = Some(format!("Recording saved: {}", path.display())),
+                Ok(path) => {
+                    self.status = Some(format!("Recording saved: {}", path.display()));
+                    // Now it gets its name (or keeps the date and time).
+                    let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                    self.naming = Some((path, name));
+                }
                 Err(err) => self.status = Some(format!("Recording failed: {err:#}")),
             },
             None => {
-                // A folder each: the WAV, its session and the stems used.
+                // A folder each: the WAV, its session and the stems used;
+                // by the date and time until it is named when it stops.
                 let name = format!(
                     "{} {}",
                     crate::APP_NAME,
                     chrono::Local::now().format("%Y-%m-%d %H-%M-%S")
                 );
+                let name = free_name(&dir, &name);
                 let path = dir.join(&name).join(format!("{name}.wav"));
                 match engine.start_recording(&path) {
                     Ok(recording) => {
@@ -51,6 +110,43 @@ impl DeckhandApp {
                     }
                     Err(err) => self.status = Some(format!("Could not start recording: {err:#}")),
                 }
+            }
+        }
+    }
+
+    /// The recording just stopped gets its name: Enter (or Save) renames its
+    /// folder, WAV and session; Esc (or Keep) leaves the date and time.
+    fn naming_dialog(&mut self, ctx: &egui::Context) {
+        let Some((_, name)) = self.naming.as_mut() else { return };
+        let (mut save, mut keep) = (false, ctx.input(|i| i.key_pressed(egui::Key::Escape)));
+        egui::Window::new("Name this recording")
+            .id(egui::Id::new("name recording"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let field = ui.add(egui::TextEdit::singleline(name).desired_width(260.0));
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                save = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.label(
+                    RichText::new("Its folder, WAV and session take the name.").small().weak(),
+                );
+                ui.horizontal(|ui| {
+                    save |= ui.button(RichText::new("Save").strong()).clicked();
+                    keep |= ui.button("Keep the date and time").clicked();
+                });
+            });
+        if keep {
+            self.naming = None;
+        } else if save {
+            let (path, name) = self.naming.take().expect("open");
+            if let Some(name) = clean_name(&name) {
+                self.status = Some(match rename_recording(&path, &name) {
+                    Ok(path) => format!("Recording saved: {}", path.display()),
+                    Err(err) => format!("Kept its first name: {err:#}"),
+                });
             }
         }
     }
@@ -73,7 +169,23 @@ impl DeckhandApp {
             None => "REC".to_owned(),
         };
         let red = egui::Color32::from_rgb(230, 50, 50);
-        let mut response = crate::widgets::lit_button(ui, &label, recording.is_some(), red);
+        // Room on the left for the red dot.
+        let mut response =
+            crate::widgets::lit_button(ui, &format!("    {label}"), recording.is_some(), red);
+        // The red dot: steady when ready, blinking while recording.
+        let lit = match recording {
+            Some(r) => r.duration().as_millis() % 1000 < 600,
+            None => true,
+        };
+        let dot = egui::pos2(response.rect.left() + 11.0, response.rect.center().y);
+        let color = if recording.is_some() && lit {
+            egui::Color32::from_rgb(255, 40, 40)
+        } else if recording.is_some() {
+            red.gamma_multiply(0.35)
+        } else {
+            red
+        };
+        ui.painter().circle_filled(dot, 4.5, color);
         let dropped = recording.map_or(0, |r| r.dropped_frames());
         if dropped > 0 {
             ui.label(RichText::new(format!("{dropped} frames lost")).small().color(WARN))
@@ -86,6 +198,23 @@ impl DeckhandApp {
         if response.clicked() {
             self.toggle_recording();
         }
+        // The recording going on, else the last one, in the file manager.
+        let what = if self.recording.is_some() { "the recording going on" } else { "the last recording" };
+        let folder = ui
+            .button(super::collection_view::reveal_label())
+            .on_hover_text(format!("Opens the folder with {what}"));
+        if folder.clicked() {
+            let dir = self.recordings_dir();
+            let shown = match self.recording.as_ref() {
+                Some(r) => Some(r.path().to_path_buf()),
+                None => latest_recording(&dir),
+            };
+            match shown {
+                Some(path) => super::collection_view::reveal(&path),
+                None => self.status = Some(format!("Nothing recorded yet in {}", dir.display())),
+            }
+        }
+        self.naming_dialog(ui.ctx());
         if self.recording.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -254,6 +383,28 @@ fn replay(session: &Path, progress: &AtomicU64, total: &AtomicU64) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn names_for_recordings() {
+        use super::{clean_name, rename_recording};
+        assert_eq!(clean_name("  Friday set: part 1/2 "), Some("Friday set- part 1-2".into()));
+        assert_eq!(clean_name(" .. "), None);
+        // A recording renamed: folder, WAV and session; a taken name
+        // gets a number.
+        let root = std::env::temp_dir().join(format!("deckhand-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let old = root.join("RofLoxBox 2026-11-09 20-00-00");
+        std::fs::create_dir_all(old.join("stems")).unwrap();
+        let wav = old.join("RofLoxBox 2026-11-09 20-00-00.wav");
+        std::fs::write(&wav, b"wav").unwrap();
+        std::fs::write(wav.with_extension("session"), b"session").unwrap();
+        std::fs::create_dir_all(root.join("Friday")).unwrap();
+        let renamed = rename_recording(&wav, "Friday").unwrap();
+        assert_eq!(renamed, root.join("Friday 2").join("Friday 2.wav"));
+        assert!(renamed.exists() && renamed.with_extension("session").exists());
+        assert!(root.join("Friday 2").join("stems").is_dir() && !old.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Replays the session `DECKHAND_SESSION` with the app's tracks and
     /// stems into `DECKHAND_REPLAY`, comparing it with its recording:
     /// `cargo test -p deckhand-app --release replays_a_real_session -- --ignored --nocapture`
@@ -316,4 +467,18 @@ mod played_tests {
             }
         }
     }
+}
+
+/// The newest recording in `dir` (its folder, or for older ones its WAV).
+fn latest_recording(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            !name.starts_with('.')
+                && (e.path().is_dir() || name.ends_with(".wav") || name.ends_with(".session"))
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
 }

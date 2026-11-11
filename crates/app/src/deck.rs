@@ -1550,6 +1550,16 @@ pub fn camelot_number((pitch, minor): (i32, bool)) -> i32 {
     ((pitch - base) * 7 + 7).rem_euclid(12) + 1
 }
 
+/// Keys that mix well on the Camelot wheel: the same key, its relative
+/// major/minor (same number), or a fifth up or down (±1, same letter).
+pub fn compatible_keys(a: (i32, bool), b: (i32, bool)) -> bool {
+    let (na, nb) = (camelot_number(a), camelot_number(b));
+    if a.1 != b.1 {
+        return na == nb;
+    }
+    matches!((na - nb).rem_euclid(12), 0 | 1 | 11)
+}
+
 pub fn format_key(key: (i32, bool), notation: KeyNotation) -> String {
     match notation {
         KeyNotation::Classic => key_name(key),
@@ -2249,6 +2259,15 @@ mod tests {
         assert_eq!(parse_key("1B"), Some((11, false)));
         assert_eq!(parse_key("12A"), Some((1, true)));
         assert_eq!(key_name((10, true)), "Bbm");
+        // Camelot neighbours of 8A (Am): 7A, 9A and 8B.
+        let am = parse_key("8A").unwrap();
+        for k in ["8A", "7A", "9A", "8B", "Am", "C", "Em", "Dm"] {
+            assert!(compatible_keys(am, parse_key(k).unwrap()), "{k}");
+        }
+        for k in ["10A", "9B", "7B", "F#m", "G"] {
+            assert!(!compatible_keys(am, parse_key(k).unwrap()), "{k}");
+        }
+        assert!(compatible_keys(parse_key("12A").unwrap(), parse_key("1A").unwrap()));
         let both = |text: &str| {
             (display_key(text, KeyNotation::Classic), display_key(text, KeyNotation::Alphanumeric))
         };

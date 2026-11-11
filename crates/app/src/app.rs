@@ -157,6 +157,8 @@ pub struct DeckhandApp {
     show_diagnostics: bool,
     /// The master being recorded.
     recording: Option<deckhand_audio::Recording>,
+    /// A recording just stopped, being named: its WAV and the name typed.
+    naming: Option<(PathBuf, String)>,
     /// A session being replayed into a WAV.
     replay: Option<recording::Replay>,
     /// PERFORMANCE or EDIT (a recorded set as a little DAW).
@@ -318,6 +320,7 @@ impl DeckhandApp {
             stems_for: Default::default(),
             stem_models: crate::stems::load_models(&crate::stems::models_dir()),
             recording: None,
+            naming: None,
             replay: None,
             // Test aid: start in EDIT mode with this session.
             mode: if std::env::var_os("DECKHAND_EDIT_SESSION").is_some() {
@@ -810,6 +813,15 @@ impl DeckhandApp {
     }
 
     // Sync
+
+    /// The key the track lists light up compatible keys for (when on):
+    /// what the master deck plays now, key shift and tempo included.
+    fn compatible_key(&self) -> Option<(i32, bool)> {
+        if !self.config.prefs.highlight_compatible_keys {
+            return None;
+        }
+        self.decks[self.master_deck()?].heard_key()
+    }
 
     /// The deck others follow: the chosen master if loaded, otherwise a
     /// playing deck that is not itself synced (an audible one first).
@@ -2817,6 +2829,7 @@ impl DeckhandApp {
             marked: &self.marked,
             editable_rating: false,
             reorder: None,
+            compatible_with: self.compatible_key(),
         };
         let selection = self.selected_ids();
         let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };

@@ -133,6 +133,12 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
             ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
             ui.label(RichText::new("On the decks and in the track lists, whatever the tags say.").small().weak());
+            ui.checkbox(&mut p.highlight_compatible_keys, "Highlight compatible keys in the track lists");
+            ui.label(
+                RichText::new("Keys that mix with the master deck's (same key, ±1 on the wheel, relative major/minor) light up green.")
+                    .small()
+                    .weak(),
+            );
         });
         section(ui, "Waveform detail", |ui| {
             use crate::waveform::WaveformDetail;
@@ -250,6 +256,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.track_end_warning = defaults.track_end_warning;
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
+            p.highlight_compatible_keys = defaults.highlight_compatible_keys;
             p.analysis = defaults.analysis;
             p.waveform_detail = defaults.waveform_detail;
             p.auto_master = defaults.auto_master;
