@@ -683,6 +683,9 @@ struct Mixer {
     recorder: Option<crate::record::RecordTap>,
     /// Measure each deck's low end (offline only).
     measure_low: bool,
+    /// Only the decks move (no sound is made): for finding where they are,
+    /// many times quicker.
+    positions_only: bool,
     crossfader_curve: CrossfaderCurve,
     fader_curve: FaderCurve,
     limiter: bool,
@@ -871,6 +874,7 @@ impl Mixer {
             master_cue: false,
             recorder: None,
             measure_low: false,
+            positions_only: false,
             crossfader_curve: CrossfaderCurve::default(),
             fader_curve: FaderCurve::default(),
             limiter: true,
@@ -1296,8 +1300,8 @@ impl Mixer {
         }
     }
 
-    fn render<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T], channels: usize) {
-        let frames = out.len() / channels.max(1);
+    /// Takes in the commands sent since the last buffer.
+    fn take_commands(&mut self) {
         let now = self.clock;
         while let Ok(command) = self.commands.pop() {
             match command {
@@ -1310,6 +1314,12 @@ impl Mixer {
                 }
             }
         }
+    }
+
+    fn render<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T], channels: usize) {
+        let frames = out.len() / channels.max(1);
+        let now = self.clock;
+        self.take_commands();
         if let Some(session) = self.session() {
             session.block(now, frames);
         }
@@ -1323,12 +1333,25 @@ impl Mixer {
         let stem_glide = 1.0 / (STEM_GLIDE_SECS * self.rate) as f32;
         let gate_step = 1.0 / (GATE_FADE_SECS * self.rate) as f32;
         let stem_release = 1.0 / (STEM_RELEASE_SECS * self.rate) as f32;
-        for frame in out.chunks_mut(channels) {
+        let positions_only = self.positions_only;
+        // Finding where the decks are: one at rest or playing steadily moves
+        // the whole buffer at once (the rest frame by frame).
+        let mut moved = [false; DECKS];
+        if positions_only {
+            for (deck, done) in self.decks.iter_mut().zip(moved.iter_mut()) {
+                *done = move_buffer(deck, frames as f64, self.rate);
+            }
+        }
+        let run = if moved.iter().all(|&m| m) { 0 } else { frames };
+        for frame in out.chunks_mut(channels).take(run) {
             let mut master = [0f32; 2];
             let mut cue = [0f32; 2];
             // The channel or sampler signal the Beat FX is inserted on.
             let mut fx_in = [0f32; 2];
             for (index, deck) in self.decks.iter_mut().enumerate() {
+                if moved[index] {
+                    continue;
+                }
                 let Some(audio) = deck.audio.as_ref() else { continue };
                 let step = f64::from(audio.sample_rate) / self.rate;
                 // Slip: a shadow position keeps the normal timeline while the
@@ -1382,6 +1405,10 @@ impl Mixer {
                 } else {
                     deck.velocity = 0.0;
                     deck.stretcher.reset();
+                    continue;
+                }
+                if positions_only {
+                    advance(deck, audio.frames() as f64);
                     continue;
                 }
                 // Stem levels glide, so a muted part fades in a few ms.
@@ -1452,18 +1479,10 @@ impl Mixer {
                         cue[channel] += sample[channel];
                     }
                 }
-                deck.position += deck.velocity;
-                if let Some((start, end)) = deck.loop_frames
-                    && deck.velocity > 0.0
-                    && deck.position >= end
-                {
-                    deck.position = start + (deck.position - end) % (end - start);
-                }
-                deck.position = deck.position.max(0.0);
-                if deck.position >= audio.frames() as f64 {
-                    deck.position = audio.frames() as f64;
-                    deck.playing = false;
-                }
+                advance(deck, audio.frames() as f64);
+            }
+            if positions_only {
+                continue;
             }
             let mut sampler = [0f32; 2];
             for voice in &mut self.sampler {
@@ -1736,6 +1755,18 @@ impl Offline {
         self.jog.push((deck, steps)).map_err(|_| anyhow!("too much jog movement at one moment"))
     }
 
+    /// Makes no sound from now on, only moves the decks: where they are,
+    /// many times quicker.
+    pub(crate) fn positions_only(&mut self) {
+        self.mixer.positions_only = true;
+    }
+
+    /// Takes in the commands sent so far now (the next buffer would), so
+    /// [`Offline::deck`] tells where a deck is after them.
+    pub(crate) fn settle(&mut self) {
+        self.mixer.take_commands();
+    }
+
     /// Plays one buffer of interleaved stereo.
     pub(crate) fn render(&mut self, out: &mut [f32]) {
         self.mixer.render(out, 2);
@@ -1766,6 +1797,67 @@ impl Offline {
                 || d.nudge != 0.0
                 || d.target.is_some(),
         }
+    }
+}
+
+/// Moves `deck` a whole buffer of `frames` at once, when it is at rest or
+/// plays at a steady speed (not scratched, braking, spinning up or
+/// slipping): false, and nothing done, otherwise.
+fn move_buffer(deck: &mut DeckState, frames: f64, rate: f64) -> bool {
+    let Some(length) = deck.audio.as_ref().map(|a| a.frames() as f64) else { return true };
+    let Some(step) = deck.audio.as_ref().map(|a| f64::from(a.sample_rate) / rate) else {
+        return true;
+    };
+    // Slip on and keeping a shadow (held, looping) or about to return to it.
+    let slipping = deck.slip
+        && (deck.was_slipping
+            || deck.playing
+                && (deck.held || deck.coasting || deck.loop_frames.is_some() || deck.slip_hold));
+    if slipping || deck.target.is_some() || deck.braking {
+        return false;
+    }
+    if deck.playing {
+        let speed = deck.tempo * (1.0 + deck.nudge + deck.jog_bend) * step;
+        if deck.start_secs > 0.0 && deck.velocity < speed {
+            return false;
+        }
+        deck.velocity = speed;
+        let mut position = deck.position + speed * frames;
+        if let Some((start, end)) = deck.loop_frames
+            && speed > 0.0
+            && position >= end
+            && end > start
+        {
+            position = start + (position - end) % (end - start);
+        }
+        position = position.max(0.0);
+        if position >= length {
+            position = length;
+            deck.playing = false;
+        }
+        deck.position = position;
+    } else {
+        deck.velocity = 0.0;
+    }
+    // As frame by frame: noted before the last frame moved it.
+    deck.shadow = (deck.position - deck.velocity).max(0.0);
+    deck.was_slipping = false;
+    true
+}
+
+/// A deck's record moves on a frame: round its loop, not past its ends.
+fn advance(deck: &mut DeckState, frames: f64) {
+    deck.position += deck.velocity;
+    if let Some((start, end)) = deck.loop_frames
+        && deck.velocity > 0.0
+        && deck.position >= end
+    {
+        deck.position = start + (deck.position - end) % (end - start);
+    }
+    deck.position = deck.position.max(0.0);
+    if deck.position >= frames {
+        deck.position = frames;
+        deck.playing = false;
     }
 }
 

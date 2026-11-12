@@ -1,5 +1,6 @@
 //! Writers: byte-exact reproduction of rekordbox output where possible,
 //! semantic round trips everywhere else.
+#![allow(clippy::unwrap_used)] // tests: helpers outside #[test] functions too
 
 use std::path::{Path, PathBuf};
 

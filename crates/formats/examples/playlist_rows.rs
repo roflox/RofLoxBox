@@ -4,11 +4,11 @@
 
 use deckhand_formats::pdb::{Database, PlaylistEntry, PlaylistTreeNode};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("export.pdb");
-    let db = Database::open(&path).unwrap();
-    let nodes: Vec<PlaylistTreeNode> = db.read_all().unwrap();
-    let entries: Vec<PlaylistEntry> = db.read_all().unwrap();
+    let db = Database::open(&path)?;
+    let nodes: Vec<PlaylistTreeNode> = db.read_all()?;
+    let entries: Vec<PlaylistEntry> = db.read_all()?;
     for n in &nodes {
         let mine: Vec<_> = entries.iter().filter(|e| e.playlist_id == n.id).collect();
         let indexes: Vec<u32> = mine.iter().take(4).map(|e| e.entry_index).collect();
@@ -23,4 +23,5 @@ fn main() {
             indexes
         );
     }
+    Ok(())
 }

@@ -12,3 +12,6 @@ rtrb = "0.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 symphonia = { version = "0.6", features = ["all"] }
+
+[lints]
+workspace = true

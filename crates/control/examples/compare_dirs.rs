@@ -12,11 +12,10 @@ fn summary(path: &Path) -> String {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let (a, b) = (Path::new(&args[1]), Path::new(&args[2]));
-    let mut names: Vec<String> = std::fs::read_dir(a)
-        .unwrap()
+    let mut names: Vec<String> = std::fs::read_dir(a)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| n.ends_with(".midi.csv"))
         .collect();
@@ -29,4 +28,5 @@ fn main() {
         let mark = if left == right { " " } else { "≠" };
         println!("{mark} {:<28} rb6 {left:<26} rb7 {right}", name.trim_end_matches(".midi.csv"));
     }
+    Ok(())
 }

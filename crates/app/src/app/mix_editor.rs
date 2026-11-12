@@ -2,7 +2,7 @@
 //! time, and a lane of automation for each knob and fader, to change and
 //! play into a new WAV.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -34,6 +34,8 @@ const BEATS: [(f64, &str); 11] = [
     (32.0, "32"),
 ];
 
+/// How far past its end the timeline reaches at least (seconds).
+const ROOM_SECS: f64 = 120.0;
 /// The master grid line a drag snapped to.
 const SNAP: Color32 = Color32::from_rgb(120, 220, 255);
 /// The range marked on the ruler.
@@ -65,7 +67,13 @@ pub enum Mode {
 }
 
 /// A session being opened: its name, and then it with its file.
-type Opening = (String, Receiver<Result<(PathBuf, Session)>>);
+type Opening = (String, Receiver<Result<(PathBuf, Session, Outlines)>>);
+
+/// Each track's outline, to draw its clips from.
+type Outlines = HashMap<PathBuf, deckhand_audio::Outline>;
+
+/// Frames a track's outline takes the loudest of, drawn zoomed in.
+const OUTLINE_STEP: usize = 128;
 
 /// EDIT mode's state: the session being edited, or being opened.
 #[derive(Default)]
@@ -96,6 +104,9 @@ struct MixEditor {
     redo: Vec<Change>,
     edited: bool,
     render: Option<Render>,
+    /// Copying the session with its songs somewhere: how it went, and
+    /// where.
+    export: Option<Receiver<(anyhow::Result<String>, PathBuf)>>,
     /// The shape of new points, and of selected ones when chosen.
     shape: Curve,
     /// When each deck was synced to which (from the recording).
@@ -111,6 +122,22 @@ struct MixEditor {
     chosen_move: Option<(usize, u64)>,
     /// Each track's BPM, by file.
     bpms: HashMap<PathBuf, f64>,
+    /// Each track's hot cues and memory cues (from the library), drawn on
+    /// its clips where the deck passed them.
+    cues: HashMap<PathBuf, Vec<ClipCue>>,
+    /// Each track's outline: clips are drawn from it, as in a DAW, so they
+    /// move, resize and stretch with the tempo at once.
+    outlines: Outlines,
+    /// Where in its track each play began (deck, its start): from the
+    /// replay, kept along as clips move and resize.
+    anchors: HashMap<(usize, u64), f64>,
+    /// The plays (deck, from, to) the replay's places are good for: drawn
+    /// from where the deck really was (jog, nudges, jumps); others, and a
+    /// deck whose tempo changed since, by the tempo lane.
+    replayed: HashSet<(usize, u64, u64)>,
+    /// Each nudge in the set (jog edge, pitch bend): marked on its clip,
+    /// right-click one to take it out.
+    nudges: Vec<deckhand_audio::Nudge>,
     /// The Beat FX row and the Color FX overview are shown.
     show_beat_fx: bool,
     show_color_fx: bool,
@@ -407,11 +434,13 @@ struct EdgeDrag {
     pieces: Vec<(u64, u64)>,
 }
 
-/// A play's start or end being dragged: the play as it was, as it is
-/// now, how far it can go, and the edge.
+/// A play's start or end being dragged: the play as it was, the part of
+/// it heard then (a cut may end it sooner), as it is now, how far it can
+/// go, and the edge.
 struct PlayEdgeDrag {
     deck: usize,
     play: (u64, u64),
+    heard: (u64, u64),
     now: (u64, u64),
     edges: deckhand_audio::PlayEdges,
     right: bool,
@@ -492,6 +521,68 @@ struct PointEdit {
     text: String,
     pos: Pos2,
     unit: Unit,
+    /// A clip edge's BPM handle: its points are pinned as the value is set.
+    handle: Option<TempoHandle>,
+}
+
+/// A hot cue (A = 0 … H = 7) or memory cue of a track: where, and its
+/// colour.
+#[derive(Clone, Copy)]
+struct ClipCue {
+    seconds: f64,
+    hot: Option<u8>,
+    color: Color32,
+}
+
+/// The cues the library has for each of `paths`: by the file, else (a copy
+/// on a USB stick, an exported session) by its name.
+fn library_cues<'a>(
+    collection: &deckhand_library::Collection,
+    paths: impl Iterator<Item = &'a PathBuf>,
+) -> HashMap<PathBuf, Vec<ClipCue>> {
+    let mut found = HashMap::new();
+    for path in paths {
+        if found.contains_key(path) {
+            continue;
+        }
+        let name = path.file_name();
+        let track = collection
+            .tracks
+            .iter()
+            .find(|t| t.path == *path)
+            .or_else(|| collection.tracks.iter().find(|t| name.is_some() && t.path.file_name() == name));
+        let Some(track) = track else { continue };
+        let cues: Vec<ClipCue> = track
+            .cues
+            .iter()
+            .filter(|c| c.end.is_none())
+            .map(|c| match c.kind {
+                deckhand_library::CueKind::Hot(n) => ClipCue {
+                    seconds: c.start,
+                    hot: Some(n),
+                    color: c.color.map_or(crate::deck::HOT_CUE_DEFAULT, |[r, g, b]| {
+                        Color32::from_rgb(r, g, b)
+                    }),
+                },
+                deckhand_library::CueKind::Memory => {
+                    ClipCue { seconds: c.start, hot: None, color: Color32::from_rgb(230, 50, 50) }
+                }
+            })
+            .collect();
+        found.insert(path.clone(), cues);
+    }
+    found
+}
+
+/// A clip edge's BPM handle on its deck's tempo lane: the clip, where on
+/// screen, whether it is its end, and the BPM there (the track's known).
+#[derive(Clone, Copy)]
+struct TempoHandle {
+    from: u64,
+    to: u64,
+    end: bool,
+    pos: Pos2,
+    bpm: Option<f64>,
 }
 
 /// What a typed value means.
@@ -641,7 +732,8 @@ fn target_label(target: FxTarget) -> String {
 enum Drag {
     /// A point being moved; the lane as it was, and its scale then (kept
     /// while dragging, so the point doesn't run off as the scale changes).
-    Point { setting: Setting, index: usize, before: Vec<Point>, range: (f64, f64) },
+    /// `pinned`: a clip edge's BPM handle, which only goes up and down.
+    Point { setting: Setting, index: usize, before: Vec<Point>, range: (f64, f64), pinned: bool },
     /// A stretch being selected from here.
     Select { setting: Setting, from: u64 },
 }
@@ -675,6 +767,7 @@ impl MixEditor {
             .filter(|(_, bpm)| *bpm > 0.0)
             .collect();
         let (moves, fx) = (session.moves(), session.beat_fx());
+        let nudges = session.nudges();
         let pieces = tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
         let key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
         let decks = tracks.iter().map(|t| t.deck + 1).max().unwrap_or(0);
@@ -718,15 +811,21 @@ impl MixEditor {
             redo: Vec::new(),
             edited: false,
             render: None,
+            export: None,
             shape: Curve::Line,
             sync,
             follow: true,
-            follow_playhead: true,
+            follow_playhead: false,
             resync: None,
             moves,
             move_drag: None,
             chosen_move: None,
             bpms,
+            cues: HashMap::new(),
+            outlines: HashMap::new(),
+            anchors: HashMap::new(),
+            replayed: HashSet::new(),
+            nudges,
             show_beat_fx: true,
             show_color_fx: true,
             original,
@@ -791,6 +890,12 @@ impl MixEditor {
         self.length as f64 / self.rate
     }
 
+    /// Seconds the timeline reaches: past the end, to drag clips out
+    /// there (the set grows to take them).
+    fn room_secs(&self) -> f64 {
+        self.secs() + ROOM_SECS.max(self.secs() * 0.25)
+    }
+
     fn x_of(&self, rect: Rect, at: u64) -> f32 {
         let t = at as f64 / self.rate;
         rect.left() + ((t - self.view_from) / self.view_secs * f64::from(rect.width())) as f32
@@ -798,7 +903,7 @@ impl MixEditor {
 
     fn at_of(&self, rect: Rect, x: f32) -> u64 {
         let t = self.view_from + f64::from((x - rect.left()) / rect.width()) * self.view_secs;
-        ((t.max(0.0) * self.rate) as u64).min(self.length)
+        ((t.max(0.0) * self.rate) as u64).min((self.room_secs() * self.rate) as u64)
     }
 
     /// The lane's range on screen: the knob's travel, wider if it went
@@ -878,6 +983,9 @@ impl MixEditor {
             };
             self.record(format!("{name}: {what}"), Edit::Lane(setting, before));
         }
+        if let Setting::Tempo(deck) = setting {
+            self.replayed.retain(|p| p.0 != deck);
+        }
         self.follow_tempo(setting);
     }
 
@@ -897,6 +1005,10 @@ impl MixEditor {
 
     /// Goes to `edit`'s state; returns the edit that comes back.
     fn apply(&mut self, edit: Edit) -> Option<Edit> {
+        if let Edit::Lane(Setting::Tempo(deck), _) = &edit {
+            let deck = *deck;
+            self.replayed.retain(|p| p.0 != deck);
+        }
         let edit_kind = Self::mix_only(&edit);
         let shared = self.session.clone();
         let mut session = shared.lock().ok()?;
@@ -939,6 +1051,8 @@ impl MixEditor {
 
     /// Takes in everything from the session again (after events changed).
     fn refresh(&mut self, session: &Session) {
+        self.length = session.length();
+        self.nudges = session.nudges();
         self.tracks = session.tracks();
         self.key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
         self.pieces = self.tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
@@ -1033,6 +1147,12 @@ impl MixEditor {
                         // Half a second of both at least.
                         self.clashes = deckhand_audio::clashes(&played, (self.rate * 0.5) as u64);
                         self.played = played;
+                        self.anchors = self.find_anchors();
+                        self.replayed = self
+                            .tracks
+                            .iter()
+                            .flat_map(|t| t.playing.iter().map(move |p| (t.deck, p.0, p.1)))
+                            .collect();
                         (self.grid, self.grid_beat) =
                             master_grid(&self.played, &self.sync, self.rate, self.length);
                         self.tempo = grid_tempo(&self.grid, self.rate);
@@ -1374,14 +1494,14 @@ impl MixEditor {
     /// Zooms around `x` by `factor` (above 1 zooms in).
     fn zoom(&mut self, rect: Rect, x: f32, factor: f64) {
         let pivot = self.view_from + f64::from((x - rect.left()) / rect.width()) * self.view_secs;
-        let secs = (self.view_secs / factor).clamp(0.5, self.secs().max(1.0) * 1.2);
+        let secs = (self.view_secs / factor).clamp(0.5, self.room_secs().max(1.0));
         self.view_from = pivot - (pivot - self.view_from) * secs / self.view_secs;
         self.view_secs = secs;
         self.clamp_view();
     }
 
     fn clamp_view(&mut self) {
-        let max = (self.secs() - self.view_secs * 0.5).max(0.0);
+        let max = (self.room_secs() - self.view_secs * 0.5).max(0.0);
         self.view_from = self.view_from.clamp(-self.view_secs * 0.05, max);
     }
 
@@ -1429,6 +1549,34 @@ impl MixEditor {
             .clicked()
         {
             super::collection_view::reveal(&self.path);
+        }
+        if ui
+            .add_enabled(self.export.is_none(), egui::Button::new("Export with songs…"))
+            .on_hover_text(
+                "Copies the session as edited, the songs it plays and its stems into a folder, \
+                 to open on another computer",
+            )
+            .clicked()
+        {
+            self.start_export();
+        }
+        let picked = self.selected();
+        let nudged = picked
+            .iter()
+            .any(|p| self.nudges.iter().any(|n| n.deck == p.deck && n.from < p.to && p.from <= n.to));
+        if nudged
+            && ui
+                .button("Remove nudges")
+                .on_hover_text(
+                    "Takes the nudges in the selection out; each play starts where the nudges \
+                     had put it, so it stays in step (⌥: just take them out)",
+                )
+                .clicked()
+        {
+            let keep = !ui.input(|i| i.modifiers.alt);
+            for p in picked {
+                self.remove_nudges(p.deck, p.from, p.to, keep);
+            }
         }
         ui.separator();
         let idle = !self.busy();
@@ -1872,22 +2020,14 @@ impl MixEditor {
                     egui::StrokeKind::Inside,
                 );
             }
-            let pieces = self.span_pieces(span);
             let shown = self.visible(span);
             let clip_color = self.clip_color(&span.path);
             let hovered = response
                 .hover_pos()
                 .filter(|p| area.contains(*p) && p.y > area.top() + 16.0)
                 .map(|p| self.at_of(area, p.x));
-            // Never played and cut: the clip's outline around its pieces.
-            if span.playing.is_empty() && pieces != [(span.from, span.to)] {
-                painter.rect_stroke(
-                    block,
-                    3.0,
-                    Stroke::new(1.0_f32, clip_color.gamma_multiply(0.5)),
-                    egui::StrokeKind::Inside,
-                );
-            }
+            // A clip never played is silent: nothing drawn, not even an
+            // outline.
             let mut name = span.path.file_stem().map_or_else(
                 || "(not from a file)".to_owned(),
                 |n| n.to_string_lossy().into_owned(),
@@ -1905,7 +2045,19 @@ impl MixEditor {
                 );
                 boxes.push(piece);
                 painter.rect_filled(piece, 3.0, clip_color.gamma_multiply(0.22));
-                self.waveform(&painter, area, piece.intersect(area), deck, clip_color);
+                // Its own audio, then what of it reached the mix.
+                let drawn = self.clip_outline(
+                    &painter,
+                    area,
+                    piece.intersect(area),
+                    span,
+                    (from, to),
+                    shifted(from, by) as i64 - from as i64,
+                    clip_color,
+                );
+                self.waveform(&painter, area, piece.intersect(area), deck, clip_color, drawn);
+                self.cue_marks(&painter, piece.intersect(area), area, (deck, &span.path), (from, to), by);
+                self.nudge_marks(&painter, piece.intersect(area), area, deck, (from, to), by, hovered);
                 // Its name on a strip of its own colour.
                 let strip = Rect::from_x_y_ranges(piece.x_range(), piece.top()..=piece.top() + 15.0);
                 painter.rect_filled(strip, 3.0, clip_color.gamma_multiply(0.55));
@@ -2084,37 +2236,16 @@ impl MixEditor {
             |pos: Pos2| selected_x.iter().any(|&(left, right)| pos.x >= left && pos.x <= right);
         let command = ui.input(|i| i.modifiers.command);
         let origin = ui.input(|i| i.pointer.press_origin()).filter(|p| p.x >= area.left());
-        // One of several plays, or a piece of a split clip, grabbed away
-        // from its edges (⌥ slides the audio inside instead): it moves on
-        // its own, like a selection. A clip with one play slides its audio.
         let alt = ui.input(|i| i.modifiers.alt);
-        let piece_grabbed =
-            // Below the title strip (that one moves the whole clip).
-            origin.filter(|p| !alt && p.y > area.top() + 16.0 && self.edge_at(area, deck, p.x).is_none()).and_then(|p| {
-                let at = self.at_of(area, p.x);
-                let span = self.clip_at(deck, at)?;
-                // One of several plays (each PLAY, or CUE held): just it.
-                if span.playing.len() > 1
-                    && let Some(play) = self.play_at(deck, at)
-                {
-                    return Some(play);
-                }
-                // One of several pieces of a split clip.
-                let pieces = self.span_pieces(span);
-                if pieces.len() < 2 {
-                    return None;
-                }
-                pieces.into_iter().find(|&(from, to)| from <= at && at < to)
-            });
         if response.drag_started() {
             match origin {
-                Some(pos) if in_selection(pos) && !command => {
-                    self.sel_drag = Some(SelDrag { deck, x: pos.x, frames: 0 });
-                }
-                Some(pos) if piece_grabbed.is_some() => {
-                    let (from, to) = piece_grabbed.expect("checked");
-                    self.select_only(Selected::Clip);
-                    self.clip_selection = Some((deck, from, to));
+                // A stretch selected (Select), or several things picked:
+                // they move together. A clip clicked moves as a clip.
+                Some(pos)
+                    if in_selection(pos)
+                        && !command
+                        && (self.tool == Tool::Select || !self.picked.is_empty()) =>
+                {
                     self.sel_drag = Some(SelDrag { deck, x: pos.x, frames: 0 });
                 }
                 _ if command => {}
@@ -2177,7 +2308,17 @@ impl MixEditor {
             }
             return;
         }
+        // A nudge's mark along the clip's foot: right-click takes it out
+        // (⌥: without keeping step).
+        let on_nudge = pointer
+            .filter(|p| p.y >= area.bottom() - 9.0)
+            .and_then(|p| self.nudge_near(area, deck, self.at_of(area, p.x)));
         if response.secondary_clicked()
+            && let Some(n) = on_nudge
+        {
+            let keep = !ui.input(|i| i.modifiers.alt);
+            self.remove_nudges(deck, n.from, n.to, keep);
+        } else if response.secondary_clicked()
             && let Some(pos) = pointer
         {
             let at = self.at_of(area, pos.x);
@@ -2187,7 +2328,7 @@ impl MixEditor {
                 (None, Some((from, to))) if self.heard_at(deck, at) => {
                     self.cut_out(deck, from, to, "cut out play");
                 }
-                (None, _) => self.toggle_piece(deck, at),
+                (None, _) => self.bring_back(deck, at),
             }
         }
         if response.double_clicked()
@@ -2217,10 +2358,27 @@ impl MixEditor {
                 self.select_only(Selected::Clip);
                 self.clip_selection = Some((deck, from, to));
             }
+            // Its title clicked: the whole clip (Delete deletes it, as in a
+            // DAW).
+            let whole = self.clip_at(deck, self.at_of(area, pos.x)).map(|span| {
+                let shown = self.visible(span);
+                (shown.first().map_or(span.from, |v| v.0), shown.last().map_or(span.to, |v| v.1))
+            });
+            if self.chosen_move.is_none()
+                && !command
+                && pos.y <= area.top() + 16.0
+                && let Some((from, to)) = whole
+            {
+                self.select_only(Selected::Clip);
+                self.clip_selection = Some((deck, from, to));
+            }
         }
         // The title strip along the top: the whole clip.
         let on_title = |pos: Pos2| pos.y <= area.top() + 16.0;
-        if let Some(pos) = response.hover_pos().filter(|p| p.x >= area.left() && on_title(*p)) {
+        if let Some(pos) = response
+            .hover_pos()
+            .filter(|p| p.x >= area.left() && (on_title(*p) || !ui.input(|i| i.modifiers.alt)))
+        {
             let over = self.at_of(area, pos.x);
             if self.clip_at(deck, over).is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -2241,10 +2399,19 @@ impl MixEditor {
                     // One of several plays: it changes alone.
                     self.separate(deck, play.0);
                     let edges = self.session.lock().ok().and_then(|s| s.play_edges(deck, play.0, play.1));
+                    let heard_end = self
+                        .tracks
+                        .iter()
+                        .find(|t| t.deck == deck && t.playing.contains(&play))
+                        .and_then(|t| {
+                            self.visible(t).into_iter().filter(|v| play.0 <= v.0 && v.1 <= play.1).map(|v| v.1).max()
+                        })
+                        .unwrap_or(play.1);
+                    let heard = (play.0, heard_end);
                     match edges {
                         Some(edges) if right || edges.start != (play.0, play.0) => {
                             self.play_edge =
-                                Some(PlayEdgeDrag { deck, play, now: play, edges, right });
+                                Some(PlayEdgeDrag { deck, play, heard, now: heard, edges, right });
                         }
                         _ => {
                             self.note = Some(
@@ -2255,8 +2422,14 @@ impl MixEditor {
                 }
             }
         } else if response.drag_started()
+            && self.sel_drag.is_none()
             && let Some(pos) = pressed
-            && on_title(pos)
+            // By its title or its body, as in a DAW (⌥ on the body: its
+            // audio slides inside instead).
+            && (on_title(pos)
+                || !alt
+                    && near_mark(pos).is_none()
+                    && self.clip_at(deck, self.at_of(area, pos.x)).is_some())
         {
             let grabbed = self.at_of(area, pos.x);
             // One of several plays: it goes alone.
@@ -2319,7 +2492,7 @@ impl MixEditor {
                     let (e, (from, to)) = (drag.edges, drag.now);
                     if drag.right {
                         drag.now.1 = at.clamp(e.end.0.max(from + 1), e.end.1.max(e.end.0));
-                        drag.now.1 as i64 - drag.play.1 as i64
+                        drag.now.1 as i64 - drag.heard.1 as i64
                     } else {
                         drag.now.0 = at.clamp(e.start.0, e.start.1.min(to.saturating_sub(1)));
                         drag.now.0 as i64 - drag.play.0 as i64
@@ -2410,6 +2583,15 @@ impl MixEditor {
                     let grab = self.at_of(area, x0);
                     let snapped = self.snap_shift(area, deck, (at, to), grab, raw, false);
                     later = base + snapped as f64 / self.rate * tempo;
+                    // Half a beat or more: whole beats, so the track stays
+                    // on its beat (a fine fix under that stays free).
+                    if let Some(bpm) = self.bpm_at(deck, at).filter(|b| *b > 0.0) {
+                        let beat = 60.0 / bpm;
+                        let by = later - base;
+                        if by.abs() >= beat / 2.0 {
+                            later = base + (by / beat).round() * beat;
+                        }
+                    }
                 }
                 let later = (later * 10_000.0).round() / 10_000.0;
                 if let Some(drag) = self.move_drag.as_mut() {
@@ -2446,6 +2628,301 @@ impl MixEditor {
         }
     }
 
+    /// Where a clip `from`–`to`'s end handle sets the tempo: a little
+    /// before its end (its last stretch), so the next clip keeps its own.
+    fn tempo_end_at(from: u64, to: u64) -> u64 {
+        to.saturating_sub(POINT_GAP).max(from + 1)
+    }
+
+    /// The BPM handles at each clip's start and end on `deck`'s tempo lane
+    /// (clips wide enough on screen to tell them apart).
+    fn tempo_handles(&self, area: Rect, deck: usize) -> Vec<TempoHandle> {
+        let setting = Setting::Tempo(deck);
+        let mut handles = Vec::new();
+        for span in self.tracks.iter().filter(|t| t.deck == deck) {
+            for (from, to) in self.visible(span) {
+                let (left, right) = (self.x_of(area, from), self.x_of(area, to));
+                if right < area.left() || left > area.right() || right - left < 24.0 {
+                    continue;
+                }
+                for (at, x, end) in [(from, left, false), (Self::tempo_end_at(from, to), right, true)] {
+                    let value = self.value_at(setting, at);
+                    handles.push(TempoHandle {
+                        from,
+                        to,
+                        end,
+                        pos: pos2(x, self.y_of(area, setting, value)),
+                        bpm: self.bpm_at(deck, at).map(|bpm| bpm * value),
+                    });
+                }
+            }
+        }
+        handles
+    }
+
+    /// Puts points at `handle`'s clip edges in `setting`'s lane (as the lane
+    /// stands there now): its start, ramping to its end, and just after it
+    /// what follows. Returns the index of the handle's own point.
+    fn pin_clip_tempo(&mut self, setting: Setting, handle: TempoHandle) -> usize {
+        let (from, to) = (handle.from, handle.to);
+        let end = Self::tempo_end_at(from, to);
+        let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
+        let now = lane.clone();
+        let mut pin = |at: u64, curve: Curve| match lane.iter().position(|p| p.at == at) {
+            Some(i) => lane[i].curve = curve,
+            None => {
+                let i = lane.partition_point(|p| p.at < at);
+                lane.insert(i, Point { at, value: lane_value(&now, at), curve });
+            }
+        };
+        pin(from, Curve::Line);
+        if end > from {
+            pin(end, Curve::Step);
+        }
+        if to < self.length {
+            let after = lane_value(&now, to);
+            match lane.iter().position(|p| p.at == to) {
+                Some(_) => {}
+                None => {
+                    let i = lane.partition_point(|p| p.at < to);
+                    lane.insert(i, Point { at: to, value: after, curve: Curve::Step });
+                }
+            }
+        }
+        let at = if handle.end { end } else { from };
+        lane.iter().position(|p| p.at == at).unwrap_or(0)
+    }
+
+    /// Where in its track each play began, from the replay's places.
+    fn find_anchors(&self) -> HashMap<(usize, u64), f64> {
+        let mut anchors = HashMap::new();
+        for span in &self.tracks {
+            let Some(played) = self.played.get(span.deck) else { continue };
+            for &(from, _) in &span.playing {
+                let i = played.levels.partition_point(|l| l.0 < from);
+                if played.levels.get(i).is_some_and(|l| l.0 == from)
+                    && let Some(&(begins, _)) = played.places.get(i)
+                {
+                    anchors.insert((span.deck, from), begins);
+                }
+            }
+        }
+        anchors
+    }
+
+    /// Seconds of its track `deck` plays from `a` to `b` (frames; negative
+    /// back from `b` before `a`), at its tempo lane's pace.
+    fn track_secs(&self, deck: usize, a: u64, b: u64) -> f64 {
+        let (low, high, sign) = if b >= a { (a, b, 1.0) } else { (b, a, -1.0) };
+        let step = ((0.05 * self.rate) as u64).max(1);
+        let setting = Setting::Tempo(deck);
+        let (mut t, mut secs) = (low, 0.0);
+        while t < high {
+            let next = (t + step).min(high);
+            secs += (next - t) as f64 / self.rate * self.value_at(setting, t);
+            t = next;
+        }
+        sign * secs
+    }
+
+    /// Draws `span`'s clip `from`–`to` (moved `by` frames while dragged)
+    /// from its track's own audio, as a DAW does: the outline laid along
+    /// the deck's tempo from where the play began in the track, so moving,
+    /// resizing and tempo changes show at once. False if it can't be (the
+    /// track or where the play began unknown).
+    #[allow(clippy::too_many_arguments)]
+    fn clip_outline(
+        &self,
+        painter: &egui::Painter,
+        area: Rect,
+        block: Rect,
+        span: &TrackSpan,
+        (from, to): (u64, u64),
+        by: i64,
+        color: Color32,
+    ) -> bool {
+        let deck = span.deck;
+        let Some(outline) = self.outlines.get(&span.path) else { return false };
+        // The play it is part of (as it was, while its edge is dragged).
+        let play = match &self.play_edge {
+            Some(d) if d.deck == deck && span.playing.contains(&d.play) && d.now.0 <= from && to <= d.now.1.max(d.play.1) => {
+                Some(d.play)
+            }
+            _ => span.playing.iter().copied().find(|p| p.0 <= from && to <= p.1.max(from + 1)),
+        };
+        let Some(play) = play else { return false };
+        let Some(&anchor) = self.anchors.get(&(deck, play.0)) else { return false };
+        if block.width() <= 0.0 || block.width().is_nan() {
+            return true;
+        }
+        let (middle, half) = (block.center().y + 4.0, (block.height() - 18.0) / 2.0);
+        let back = |t: u64| (t as i64 - by).max(0) as u64;
+        // Where the deck really was (the replay's), inside the play as it
+        // was replayed, unless its tempo is being changed.
+        let tempo_moving = matches!(
+            &self.drag,
+            Some(Drag::Point { setting: Setting::Tempo(d), .. }) if *d == deck
+        );
+        let real_ok = !tempo_moving && self.replayed.contains(&(deck, play.0, play.1));
+        let played = self.played.get(deck).filter(|p| p.places.len() == p.levels.len());
+        let real = |t: u64| -> Option<f64> {
+            if !real_ok || t < play.0 || t >= play.1 {
+                return None;
+            }
+            let levels = &played?.levels;
+            let j = levels.partition_point(|l| l.0 <= t).checked_sub(1)?;
+            let start = levels[j].0;
+            let end = levels.get(j + 1).map_or(start, |l| l.0);
+            if end <= start {
+                return None;
+            }
+            let (begins, ends) = *played?.places.get(j)?;
+            Some(begins + (ends - begins) * (t - start) as f64 / (end - start) as f64)
+        };
+        let mut x = block.left().floor();
+        let mut t = back(self.at_of(area, x));
+        let mut secs = real(t).unwrap_or_else(|| anchor + self.track_secs(deck, play.0, t));
+        let setting = Setting::Tempo(deck);
+        let stroke = Stroke::new(1.0_f32, color.gamma_multiply(0.45));
+        while x < block.right() {
+            let next = back(self.at_of(area, x + 1.0));
+            let pace = self.value_at(setting, t);
+            let ahead = real(next)
+                .unwrap_or_else(|| secs + next.saturating_sub(t) as f64 / self.rate * pace);
+            if (from..to).contains(&t) {
+                let h = (outline.peak(secs, ahead).min(1.0) * half).max(0.0);
+                if h > 0.3 {
+                    painter.line_segment([pos2(x, middle - h), pos2(x, middle + h)], stroke);
+                }
+            }
+            (t, secs) = (next, ahead);
+            x += 1.0;
+        }
+        true
+    }
+
+    /// The nudges on `deck`'s clip `from`–`to` (moved `by`): a bar along
+    /// its foot, amber where it sped up, blue where it slowed, with how
+    /// far it moved the track when the pointer is on one.
+    #[allow(clippy::too_many_arguments)]
+    fn nudge_marks(
+        &self,
+        painter: &egui::Painter,
+        block: Rect,
+        area: Rect,
+        deck: usize,
+        (from, to): (u64, u64),
+        by: i64,
+        hovered: Option<u64>,
+    ) {
+        if block.width() <= 0.0 {
+            return;
+        }
+        let painter = painter.with_clip_rect(block);
+        let moved = |t: u64| (t as i64 + by).max(0) as u64;
+        for n in self.nudges.iter().filter(|n| n.deck == deck && n.from < to && from <= n.to) {
+            let (a, b) = (self.x_of(area, moved(n.from)), self.x_of(area, moved(n.to)));
+            let color = if n.shift >= 0.0 {
+                Color32::from_rgb(255, 180, 40)
+            } else {
+                Color32::from_rgb(70, 170, 255)
+            };
+            let bar = Rect::from_x_y_ranges(a..=b.max(a + 3.0), block.bottom() - 5.0..=block.bottom() - 1.0);
+            painter.rect_filled(bar, 1.0, color);
+            if hovered.is_some_and(|at| self.nudge_near(area, deck, at).is_some_and(|m| m.from == n.from)) {
+                painter.text(
+                    pos2(a, block.bottom() - 7.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("nudge {:+.1} ms · right-click: remove", n.shift * 1000.0),
+                    egui::FontId::proportional(11.0),
+                    color,
+                );
+            }
+        }
+    }
+
+    /// The nudge on `deck` at `at` (or within a few pixels of it).
+    fn nudge_near(&self, area: Rect, deck: usize, at: u64) -> Option<deckhand_audio::Nudge> {
+        let slack = (4.0 / f64::from(area.width()) * self.view_secs * self.rate) as u64;
+        self.nudges
+            .iter()
+            .filter(|n| n.deck == deck && n.from <= at + slack && at <= n.to + slack)
+            .min_by_key(|n| n.from.abs_diff(at))
+            .copied()
+    }
+
+    /// Takes `deck`'s nudges between `from` and `to` out, keeping step (see
+    /// [`Session::remove_nudges`]); ⌥ held: without.
+    fn remove_nudges(&mut self, deck: usize, from: u64, to: u64, keep_step: bool) {
+        let shared = self.session.clone();
+        let Ok(mut session) = shared.lock() else { return };
+        let Some(before) = pack(&session) else { return };
+        let count = session.remove_nudges(deck, from, to, keep_step);
+        if count == 0 {
+            self.note = Some("No nudges there".into());
+            return;
+        }
+        self.refresh(&session);
+        drop(session);
+        let what = if count == 1 { "nudge".to_owned() } else { format!("{count} nudges") };
+        let how = if keep_step { "" } else { " (not kept in step)" };
+        self.record(format!("Deck {}: {what} removed{how}", deck + 1), Edit::Events(before));
+    }
+
+    /// The track's hot cues (lettered, in their colours) and memory cues
+    /// (red) on its clip, where the deck passed them between `from` and `to`
+    /// (moved `by` frames while being dragged).
+    fn cue_marks(
+        &self,
+        painter: &egui::Painter,
+        block: Rect,
+        area: Rect,
+        (deck, path): (usize, &Path),
+        (from, to): (u64, u64),
+        by: i64,
+    ) {
+        let (Some(cues), Some(played)) = (self.cues.get(path), self.played.get(deck)) else {
+            return;
+        };
+        if block.width() <= 0.0 {
+            return;
+        }
+        let painter = painter.with_clip_rect(block);
+        let top = block.top() + 16.0;
+        for cue in cues {
+            for at in played.passes(cue.seconds) {
+                if at < from || at >= to {
+                    continue;
+                }
+                let x = self.x_of(area, (at as i64 + by).max(0) as u64);
+                painter.line_segment(
+                    [pos2(x, top), pos2(x, block.bottom())],
+                    Stroke::new(1.0_f32, cue.color.gamma_multiply(0.8)),
+                );
+                match cue.hot {
+                    Some(n) => {
+                        let flag = Rect::from_min_size(pos2(x, top), vec2(11.0, 11.0));
+                        painter.rect_filled(flag, 1.5, cue.color);
+                        painter.text(
+                            flag.center(),
+                            egui::Align2::CENTER_CENTER,
+                            char::from(b'A' + n.min(7)),
+                            egui::FontId::monospace(9.0),
+                            Color32::BLACK,
+                        );
+                    }
+                    None => {
+                        painter.add(Shape::convex_polygon(
+                            vec![pos2(x - 4.0, top), pos2(x + 4.0, top), pos2(x, top + 5.0)],
+                            cue.color,
+                            Stroke::NONE,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     /// What `deck` played inside `block`: dim as the track played, bright
     /// as it reached the mix, with its beats (bars brighter) where they
     /// fell.
@@ -2456,6 +2933,7 @@ impl MixEditor {
         block: Rect,
         deck: usize,
         color: Color32,
+        heard_only: bool,
     ) {
         let Some(played) = self.played.get(deck) else { return };
         // A track off the view has nothing to draw (and its box is inside out).
@@ -2487,6 +2965,7 @@ impl MixEditor {
                 }
                 (loud, heard) = (loud.max(p), heard.max(h));
             }
+            let loud = if heard_only { 0.0 } else { loud };
             for (level, shade) in [(loud, 0.35), (heard, 1.0)] {
                 let h = (level.min(1.0) * half).max(if level > 0.0 { 0.5 } else { 0.0 });
                 if h > 0.0 {
@@ -2504,8 +2983,12 @@ impl MixEditor {
             _ => at,
         };
         let (from, to) = (self.at_of(area, block.left()), self.at_of(area, block.right()));
-        let beats: Vec<(u64, bool)> = played
-            .beats
+        // Only the beats near the block (sorted by time; a moved track's
+        // from where they were).
+        let reach = preview.map_or(0, |p| p.frames.unsigned_abs());
+        let near = played.beats.partition_point(|b| b.0 + reach < from)
+            ..played.beats.partition_point(|b| b.0 <= to + reach);
+        let beats: Vec<(u64, bool)> = played.beats[near]
             .iter()
             .map(|&(at, bar)| (moved(at), bar))
             .filter(|&(at, _)| at >= from && at <= to)
@@ -2561,14 +3044,46 @@ impl MixEditor {
                 Some(t).filter(|&t| !inside(t))
             }
         };
-        let mut levels: Vec<((u64, f32, f32), f32)> = played
+        let places = played.places.iter().copied().chain(std::iter::repeat((0.0, 0.0)));
+        let mut levels: Vec<((u64, f32, f32), (f32, (f64, f64)))> = played
             .levels
             .iter()
-            .zip(&played.lows)
-            .filter_map(|(&(at, p, h), &low)| place(at).map(|at| ((at, p, h), low)))
+            .zip(played.lows.iter().zip(places))
+            .filter_map(|(&(at, p, h), (&low, place_in))| {
+                place(at).map(|at| ((at, p, h), (low, place_in)))
+            })
             .collect();
         levels.sort_by_key(|l| l.0.0);
-        (played.levels, played.lows) = levels.into_iter().unzip();
+        let had_places = !played.places.is_empty();
+        let (moved_levels, rest): (Vec<_>, Vec<_>) = levels.into_iter().unzip();
+        (played.lows, played.places) = rest.into_iter().unzip();
+        played.levels = moved_levels;
+        if !had_places {
+            played.places.clear();
+        }
+        // What the replay is good for goes along.
+        self.replayed = std::mem::take(&mut self.replayed)
+            .into_iter()
+            .filter_map(|(d, a, b)| {
+                if d != deck {
+                    return Some((d, a, b));
+                }
+                match (place(a), place(b.saturating_sub(1))) {
+                    (Some(a), Some(b)) => Some((d, a, b + 1)),
+                    _ => None,
+                }
+            })
+            .collect();
+        // Where its plays began in the track goes along.
+        self.anchors = std::mem::take(&mut self.anchors)
+            .into_iter()
+            .filter_map(|((d, at), secs)| {
+                if d != deck {
+                    return Some(((d, at), secs));
+                }
+                place(at).map(|at| ((d, at), secs))
+            })
+            .collect();
         played.beats = played.beats.iter().filter_map(|&(at, bar)| place(at).map(|at| (at, bar))).collect();
         played.beats.sort_by_key(|b| b.0);
         self.clashes = deckhand_audio::clashes(&self.played, (self.rate * 0.5) as u64);
@@ -2923,29 +3438,39 @@ impl MixEditor {
     /// The edge under `x` on `deck`'s row of a part shown: a play's start
     /// or end, else a piece's (a cut).
     fn edge_at(&self, area: Rect, deck: usize, x: f32) -> Option<EdgeHit> {
-        self.tracks.iter().filter(|t| t.deck == deck).find_map(|span| {
-            let pieces = self.span_pieces(span);
-            self.visible(span).into_iter().find_map(|(from, to)| {
-                let right = if (self.x_of(area, to) - x).abs() <= GRAB {
-                    true
-                } else if (self.x_of(area, from) - x).abs() <= GRAB {
-                    false
-                } else {
-                    return None;
-                };
-                let edge = if right { to } else { from };
-                let play = span
-                    .playing
-                    .iter()
-                    .find(|p| if right { p.1 == edge } else { p.0 == edge });
-                if let Some(&play) = play {
-                    return Some(EdgeHit::Play(play, right));
+        // Every edge in reach; where two clips touch, the one the pointer
+        // is over wins, then the nearest.
+        let mut near: Vec<(bool, f32, &TrackSpan, u64, bool)> = Vec::new();
+        for span in self.tracks.iter().filter(|t| t.deck == deck) {
+            for (from, to) in self.visible(span) {
+                for (edge, right) in [(from, false), (to, true)] {
+                    let ex = self.x_of(area, edge);
+                    let distance = (ex - x).abs();
+                    if distance <= GRAB {
+                        let inside = if right { x <= ex } else { x >= ex };
+                        near.push((!inside, distance, span, edge, right));
+                    }
                 }
-                let piece =
-                    pieces.iter().position(|p| if right { p.1 == edge } else { p.0 == edge })?;
-                Some(EdgeHit::Piece(span.clone(), piece, right))
-            })
-        })
+            }
+        }
+        near.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let &(_, _, span, edge, right) = near.first()?;
+        // An end: the last part of its play heard (what's cut after it
+        // gives way as the play goes on).
+        let shown = self.visible(span);
+        let play = span.playing.iter().find(|p| {
+            if right {
+                p.0 < edge && edge <= p.1 && !shown.iter().any(|v| edge <= v.0 && v.1 <= p.1)
+            } else {
+                p.0 == edge
+            }
+        });
+        if let Some(&play) = play {
+            return Some(EdgeHit::Play(play, right));
+        }
+        let pieces = self.span_pieces(span);
+        let piece = pieces.iter().position(|p| if right { p.1 == edge } else { p.0 == edge })?;
+        Some(EdgeHit::Piece(span.clone(), piece, right))
     }
 
     /// The parts of `span` shown as clips: where it played (as its edges are
@@ -2956,7 +3481,23 @@ impl MixEditor {
         let mut shown = Vec::new();
         for &play in &span.playing {
             let (a, b) = match &self.play_edge {
-                Some(d) if d.deck == span.deck && d.play == play => d.now,
+                // Its end dragged: as heard, to where it ends now.
+                Some(d) if d.deck == span.deck && d.play == play && d.right => {
+                    for &(c, e) in &pieces {
+                        let (from, to) = (play.0.max(c), play.1.min(e).min(d.now.1));
+                        if from < to {
+                            shown.push((from, to));
+                        }
+                    }
+                    if d.now.1 > d.heard.1 {
+                        match shown.iter_mut().find(|s| s.1 == d.heard.1) {
+                            Some(last) => last.1 = d.now.1,
+                            None => shown.push((d.heard.1, d.now.1)),
+                        }
+                    }
+                    continue;
+                }
+                Some(d) if d.deck == span.deck && d.play == play => (d.now.0, play.1),
                 _ => play,
             };
             for &(c, d) in &pieces {
@@ -3024,7 +3565,7 @@ impl MixEditor {
     /// Makes a play start or end where its edge was dragged to, keeping
     /// the old for undo.
     fn resize_play(&mut self, drag: &PlayEdgeDrag) {
-        if drag.now == drag.play {
+        if drag.now == drag.heard {
             return;
         }
         let deck = drag.deck;
@@ -3032,10 +3573,17 @@ impl MixEditor {
         let Ok(mut session) = shared.lock() else { return };
         let Some(before) = pack(&session) else { return };
         match session.resize_play(deck, drag.play, drag.now) {
-            Ok(_) => {
+            Ok((new_from, _)) => {
+                // Where it begins in the track now, until the replay says.
+                if new_from != drag.play.0
+                    && let Some(&anchor) = self.anchors.get(&(deck, drag.play.0))
+                {
+                    let moved = anchor + self.track_secs(deck, drag.play.0, new_from);
+                    self.anchors.insert((deck, new_from), moved.max(0.0));
+                }
                 self.refresh(&session);
                 drop(session);
-                let longer = drag.now.1 - drag.now.0 > drag.play.1 - drag.play.0;
+                let longer = drag.now.1 - drag.now.0 > drag.heard.1 - drag.heard.0;
                 let what = if longer { "longer" } else { "shorter" };
                 self.record(format!("Deck {} play {what}", deck + 1), Edit::Events(before));
             }
@@ -3057,42 +3605,55 @@ impl MixEditor {
         self.record(format!("Deck {} {what}", span.deck + 1), Edit::Events(before));
     }
 
-    /// Splits the piece of `deck`'s clip at `at` in two.
+    /// Splits `deck`'s clip at `at` into two clips of their own, as in a
+    /// DAW (each selected, moved and deleted apart).
     fn split(&mut self, deck: usize, at: u64) {
-        let Some(span) =
-            self.tracks.iter().find(|t| t.deck == deck && t.from <= at && at < t.to).cloned()
-        else {
-            return;
-        };
-        let mut pieces = self.span_pieces(&span);
-        let Some(i) = pieces.iter().position(|&(from, to)| from < at && at < to) else { return };
-        let (from, to) = pieces[i];
-        pieces.splice(i..=i, [(from, at), (at, to)]);
-        self.set_pieces(&span, pieces, "split");
+        let shared = self.session.clone();
+        let Ok(mut session) = shared.lock() else { return };
+        let Some(before) = pack(&session) else { return };
+        match session.split_clip(deck, at) {
+            Ok(at) => {
+                // Where its second half begins in the track, until the
+                // replay says.
+                let begun = self
+                    .tracks
+                    .iter()
+                    .find(|t| t.deck == deck && t.from < at && at < t.to)
+                    .and_then(|t| t.playing.iter().find(|p| p.0 < at && at <= p.1))
+                    .and_then(|p| self.anchors.get(&(deck, p.0)).map(|&a| (p.0, a)));
+                if let Some((play, anchor)) = begun {
+                    let there = anchor + self.track_secs(deck, play, at);
+                    self.anchors.insert((deck, at), there);
+                }
+                self.refresh(&session);
+                drop(session);
+                self.record(format!("Deck {} split", deck + 1), Edit::Events(before));
+            }
+            Err(err) => self.note = Some(format!("Not split: {err:#}")),
+        }
     }
 
-    /// Takes the piece of `deck`'s clip at `at` out, or brings the gap
-    /// there back.
-    fn toggle_piece(&mut self, deck: usize, at: u64) {
+    /// Brings back the gap cut in `deck`'s clip at `at`, if a play is in
+    /// it. (Where the deck is stopped, nothing is cut: a piece there can
+    /// run on into what is heard.)
+    fn bring_back(&mut self, deck: usize, at: u64) {
         let Some(span) =
             self.tracks.iter().find(|t| t.deck == deck && t.from <= at && at < t.to).cloned()
         else {
             return;
         };
         let mut pieces = self.span_pieces(&span);
-        match pieces.iter().position(|&(from, to)| from <= at && at < to) {
-            Some(i) => {
-                pieces.remove(i);
-                self.set_pieces(&span, pieces, "cut out");
-            }
-            None => {
-                let i = pieces.partition_point(|p| p.1 <= at);
-                let from = i.checked_sub(1).map_or(span.from, |i| pieces[i].1);
-                let to = pieces.get(i).map_or(span.to, |p| p.0);
-                pieces.insert(i, (from, to));
-                self.set_pieces(&span, pieces, "bring back");
-            }
+        if pieces.iter().any(|&(from, to)| from <= at && at < to) {
+            return;
         }
+        let i = pieces.partition_point(|p| p.1 <= at);
+        let from = i.checked_sub(1).map_or(span.from, |i| pieces[i].1);
+        let to = pieces.get(i).map_or(span.to, |p| p.0);
+        if !span.playing.iter().any(|p| p.0 < to && from < p.1) {
+            return;
+        }
+        pieces.insert(i, (from, to));
+        self.set_pieces(&span, pieces, "bring back");
     }
 
     /// Moves the clip of `deck`'s track loaded at `from` by `frames`, with
@@ -3160,7 +3721,13 @@ impl MixEditor {
 
     /// The BPM of the track on `deck` at `at`, at its own tempo.
     fn bpm_at(&self, deck: usize, at: u64) -> Option<f64> {
-        let span = self.tracks.iter().find(|t| t.deck == deck && t.from <= at && at < t.to)?;
+        let on_deck = || self.tracks.iter().filter(|t| t.deck == deck);
+        // The track there; between tracks, the next one loaded (the tempo
+        // set there is what it starts at), else the last.
+        let span = on_deck()
+            .find(|t| t.from <= at && at < t.to)
+            .or_else(|| on_deck().filter(|t| t.from > at).min_by_key(|t| t.from))
+            .or_else(|| on_deck().filter(|t| t.to <= at).max_by_key(|t| t.to))?;
         self.bpms.get(&span.path).copied()
     }
 
@@ -3798,29 +4365,33 @@ impl MixEditor {
             .any(|t| self.span_pieces(t).iter().any(|&(f, e)| f <= at && at < e))
     }
 
-    /// Cuts `from`–`to` out of `deck`'s clips.
+    /// Deletes `from`–`to` of `deck`, as in a DAW: a clip it cuts through
+    /// becomes two clips of their own.
     fn cut_out(&mut self, deck: usize, from: u64, to: u64, what: &str) {
-        let spans: Vec<TrackSpan> = self
-            .tracks
-            .iter()
-            .filter(|t| t.deck == deck && t.from < to && from < t.to)
-            .cloned()
-            .collect();
-        for span in spans {
-            let mut pieces = Vec::new();
-            for (a, b) in self.span_pieces(&span) {
-                if b <= from || a >= to {
-                    pieces.push((a, b));
-                    continue;
+        let shared = self.session.clone();
+        let Ok(mut session) = shared.lock() else { return };
+        let Some(before) = pack(&session) else { return };
+        let after = session.snap(to);
+        match session.delete_range(deck, from, to) {
+            Ok(()) => {
+                // Where the part after it begins in the track, until the
+                // replay says.
+                let begun = self
+                    .tracks
+                    .iter()
+                    .filter(|t| t.deck == deck)
+                    .flat_map(|t| t.playing.iter().copied())
+                    .find(|p| p.0 < after && after < p.1)
+                    .and_then(|p| self.anchors.get(&(deck, p.0)).map(|&a| (p.0, a)));
+                if let Some((play, anchor)) = begun {
+                    let there = anchor + self.track_secs(deck, play, after);
+                    self.anchors.insert((deck, after), there);
                 }
-                if a < from {
-                    pieces.push((a, from));
-                }
-                if b > to {
-                    pieces.push((to, b));
-                }
+                self.refresh(&session);
+                drop(session);
+                self.record(format!("Deck {} {what}", deck + 1), Edit::Events(before));
             }
-            self.set_pieces(&span, pieces, what);
+            Err(err) => self.note = Some(format!("Not deleted: {err:#}")),
         }
     }
 
@@ -4094,7 +4665,16 @@ impl MixEditor {
         let bpm = setting.deck().and_then(|d| self.bpm_at(d, at));
         let unit = Unit::of(setting, bpm);
         let text = unit.show(self.value_at(setting, at));
-        self.point_edit = Some(PointEdit { setting, at, text, pos, unit });
+        self.point_edit = Some(PointEdit { setting, at, text, pos, unit, handle: None });
+    }
+
+    /// Opens the dialog to type the BPM at a clip's edge (its handle).
+    fn open_handle_edit(&mut self, setting: Setting, handle: TempoHandle, pos: Pos2) {
+        let at = if handle.end { Self::tempo_end_at(handle.from, handle.to) } else { handle.from };
+        self.open_point_edit(setting, at, pos);
+        if let Some(edit) = self.point_edit.as_mut() {
+            edit.handle = Some(handle);
+        }
     }
 
     /// The typed value dialog; Enter sets it, Esc closes.
@@ -4148,6 +4728,9 @@ impl MixEditor {
         };
         let setting = edit.setting;
         let before = self.lanes[&setting].clone();
+        if let Some(handle) = edit.handle {
+            self.pin_clip_tempo(setting, handle);
+        }
         let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
         match lane.iter_mut().find(|p| p.at == edit.at) {
             Some(point) => point.value = value,
@@ -4357,7 +4940,8 @@ impl MixEditor {
                 };
                 match self.bpm_at(deck, at) {
                     // The track's own BPM is in its title.
-                    Some(bpm) => format!("{:.2} BPM {}{how}", bpm * value, setting.display(value)),
+                    // Where it lands, not how far it is off the track's own.
+                    Some(bpm) => format!("{:.2} BPM{how}", bpm * value),
                     None => format!("{}{how}", setting.display(value)),
                 }
             }
@@ -4512,6 +5096,38 @@ impl MixEditor {
             }
         }
 
+        // Each clip's BPM at its start and end, as handles on its deck's
+        // tempo lane.
+        let handles = match setting {
+            Setting::Tempo(deck) => self.tempo_handles(area, deck),
+            _ => Vec::new(),
+        };
+        for h in &handles {
+            painter.circle_filled(h.pos, 4.5, color);
+            painter.circle_stroke(h.pos, 4.5, Stroke::new(1.0_f32, Color32::WHITE));
+            if let Some(bpm) = h.bpm {
+                let (anchor, x) = if h.end {
+                    (egui::Align2::RIGHT_BOTTOM, h.pos.x - 6.0)
+                } else {
+                    (egui::Align2::LEFT_BOTTOM, h.pos.x + 6.0)
+                };
+                painter.text(
+                    pos2(x, h.pos.y - 3.0),
+                    anchor,
+                    format!("{bpm:.2}"),
+                    egui::FontId::monospace(10.0),
+                    color,
+                );
+            }
+        }
+        let handle_near = |pos: Pos2| {
+            handles
+                .iter()
+                .filter(|h| h.pos.distance(pos) <= GRAB + 3.0)
+                .min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)))
+                .copied()
+        };
+
         let editable = !self.busy();
         let pointer = response.interact_pointer_pos().or(response.hover_pos());
         // The point under the pointer: the nearest on screen (every one, not
@@ -4575,13 +5191,32 @@ impl MixEditor {
             return;
         }
         if response.drag_started()
+            && self.tool == Tool::Normal
+            && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+            && let Some(handle) = handle_near(pos)
+        {
+            // A clip edge's BPM: points pinned at its edges (and just after
+            // it, so what follows keeps its tempo), the handle's goes up and
+            // down.
+            self.clear_selections();
+            let range = self.range(setting);
+            let before = self.lanes[&setting].clone();
+            let index = self.pin_clip_tempo(setting, handle);
+            self.drag = Some(Drag::Point { setting, index, before, range, pinned: true });
+        } else if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
         {
             self.drag = Some(match near(pos).filter(|_| self.tool == Tool::Normal) {
                 Some(index) => {
                     self.clear_selections();
                     let range = self.range(setting);
-                    Drag::Point { setting, index, before: self.lanes[&setting].clone(), range }
+                    Drag::Point {
+                        setting,
+                        index,
+                        before: self.lanes[&setting].clone(),
+                        range,
+                        pinned: false,
+                    }
                 }
                 None => {
                     let from = self.at_of(area, pos.x);
@@ -4595,7 +5230,7 @@ impl MixEditor {
             && let Some(pos) = pointer
         {
             match self.drag {
-                Some(Drag::Point { setting: s, index, range: (lo, hi), .. }) if s == setting => {
+                Some(Drag::Point { setting: s, index, range: (lo, hi), pinned, .. }) if s == setting => {
                     let share = f64::from((area.bottom() - 3.0 - pos.y) / (area.height() - 6.0));
                     let value = lo + share.clamp(0.0, 1.0) * (hi - lo);
                     let at = self.at_of(area, pos.x);
@@ -4607,7 +5242,11 @@ impl MixEditor {
                         lane.get(index + 1).map_or(u64::MAX, |p| p.at.saturating_sub(POINT_GAP));
                     lane[index] = Point {
                         curve: lane[index].curve,
-                        at: if index == 0 { 0 } else { at.clamp(low, high.max(low)) },
+                        at: if index == 0 || pinned {
+                            lane[index].at
+                        } else {
+                            at.clamp(low, high.max(low))
+                        },
                         value,
                     };
                 }
@@ -4635,15 +5274,20 @@ impl MixEditor {
             self.selection = None;
             self.chosen_fx = None;
         }
-        // Double-click on a point: type its value.
+        // Double-click on a clip edge's BPM handle, or a point: type its
+        // value.
+        let on_handle = pointer.and_then(|pos| handle_near(pos).map(|h| (h, pos)));
         if response.double_clicked()
+            && let Some((handle, pos)) = on_handle
+        {
+            self.open_handle_edit(setting, handle, pos);
+        } else if response.double_clicked()
             && let Some(pos) = pointer
             && let Some(i) = near(pos)
         {
             let at = self.lanes[&setting][i].at;
             self.open_point_edit(setting, at, pos);
-        }
-        if response.double_clicked()
+        } else if response.double_clicked()
             && let Some(pos) = pointer
             && near(pos).is_none()
         {
@@ -4734,6 +5378,56 @@ impl MixEditor {
             let _ = tx.send(result);
         });
         self.render = Some(Render { done_frames, total, done });
+    }
+
+    /// Copies the session as edited, with its songs and the stems kept
+    /// with it, into a new folder where the user picks, in the background.
+    fn start_export(&mut self) {
+        let here = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let Some(parent) = rfd::FileDialog::new()
+            .set_title("Export the session with its songs into")
+            .set_directory(&here)
+            .pick_folder()
+        else {
+            return;
+        };
+        let dir = (1..)
+            .map(|n| match n {
+                1 => parent.join(format!("{} export", self.name)),
+                n => parent.join(format!("{} export {n}", self.name)),
+            })
+            .find(|d| !d.exists())
+            .unwrap_or_else(|| parent.join(format!("{} export", self.name)));
+        let session = self.session.clone();
+        let file = dir.join(format!("{}.session", self.name));
+        let stems = here.join("stems");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = dir.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<String> {
+                std::fs::create_dir_all(&out)?;
+                let tracks: Vec<PathBuf> = {
+                    let session =
+                        session.lock().map_err(|_| anyhow::anyhow!("the session is broken"))?;
+                    session.write(&file)?;
+                    session.track_files().into_iter().map(|(path, _)| path).collect()
+                };
+                let done = deckhand_audio::export_files(&out, &tracks, Some(&stems))?;
+                let mut note = format!(
+                    "Exported with {} songs ({:.0} MB) into {}",
+                    done.tracks,
+                    done.bytes as f64 / 1e6,
+                    out.file_name().unwrap_or_default().to_string_lossy()
+                );
+                if !done.missing.is_empty() {
+                    note.push_str(&format!("; {} not found to copy", done.missing.len()));
+                }
+                Ok(note)
+            })();
+            let _ = tx.send((result, out));
+        });
+        self.export = Some(rx);
+        self.note = Some("Exporting with songs…".into());
     }
 
     /// Writes the edited session where the user picks.
@@ -5014,7 +5708,13 @@ impl DeckhandApp {
                 editor.nudge_move(nudge);
             }
         }
+        // Follow playhead is a preference, kept between runs.
+        editor.follow_playhead = self.config.prefs.edit_follow_playhead;
         editor.timeline(ui);
+        if editor.follow_playhead != self.config.prefs.edit_follow_playhead {
+            self.config.prefs.edit_follow_playhead = editor.follow_playhead;
+            self.config.save();
+        }
     }
 
     fn open_session(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -5022,7 +5722,11 @@ impl DeckhandApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Session::read(&path, super::recording::Sources).map(|s| (path, s)));
+            let opened = Session::read(&path, super::recording::Sources).map(|s| {
+                let outlines = s.outlines(OUTLINE_STEP);
+                (path, s, outlines)
+            });
+            let _ = tx.send(opened);
             ctx.request_repaint();
         });
         self.edit_view.opening = Some((name, rx));
@@ -5034,7 +5738,7 @@ impl DeckhandApp {
         {
             self.edit_view.opening = None;
             match result {
-                Ok((path, mut session)) => {
+                Ok((path, mut session, outlines)) => {
                     // Recorded before beat grids were kept: the collection's.
                     for (file, duration) in session.track_files() {
                         if session.grid(&file).is_none()
@@ -5056,7 +5760,10 @@ impl DeckhandApp {
                     session.split_color_fx();
                     // And the Beat FX depth one, with curves.
                     session.split_fx_depth();
-                    self.edit_view.editor = Some(MixEditor::new(path, session));
+                    let mut editor = MixEditor::new(path, session);
+                    editor.cues = library_cues(&self.collection, editor.tracks.iter().map(|t| &t.path));
+                    editor.outlines = outlines;
+                    self.edit_view.editor = Some(editor);
                 }
                 Err(err) => self.status = Some(format!("Could not open the session: {err:#}")),
             }
@@ -5078,6 +5785,22 @@ impl DeckhandApp {
             }
         }
         editor.update_played(ctx);
+        if let Some(export) = &editor.export {
+            match export.try_recv() {
+                Ok((result, dir)) => {
+                    editor.export = None;
+                    editor.note = None;
+                    match result {
+                        Ok(note) => {
+                            self.status = Some(note);
+                            super::collection_view::reveal(&dir);
+                        }
+                        Err(err) => self.status = Some(format!("Export failed: {err:#}")),
+                    }
+                }
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
         if let Some(render) = &editor.render {
             match render.done.try_recv() {
                 Ok(result) => {
@@ -5100,7 +5823,7 @@ mod tests {
         let levels = (from..to).step_by(512).map(|at| (at, 0.5, 0.5)).collect::<Vec<_>>();
         let lows = vec![0.0; levels.len()];
         let beats = (0..).map(|i| (first + i * beat, i % 4 == 0)).take_while(|b| b.0 < to).collect();
-        deckhand_audio::Played { levels, lows, beats }
+        deckhand_audio::Played { levels, lows, beats, places: Vec::new() }
     }
 
     #[test]
@@ -5138,6 +5861,34 @@ mod tests {
         assert_eq!(Unit::Percent.read("45%").unwrap(), 0.45);
         assert_eq!(Unit::Percent.read("12,5").unwrap(), 0.125);
         assert_eq!(Unit::Percent.read("abc"), None);
+    }
+
+    /// A clip's start BPM handle on `DECKHAND_SESSION` (in memory): raised,
+    /// the clip ramps from it and what follows the clip keeps its tempo:
+    /// `cargo test -p deckhand-app clip_bpm_handle -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn clip_bpm_handle() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let session = Session::read(&path, deckhand_audio::Files).unwrap();
+        let mut editor = MixEditor::new(path, session);
+        let span = editor.tracks.iter().find(|t| !t.playing.is_empty() && t.to < editor.length).unwrap().clone();
+        let (from, to) = editor.visible(&span)[0];
+        let setting = Setting::Tempo(span.deck);
+        let after = editor.value_at(setting, to);
+        let before = editor.lanes[&setting].clone();
+        let handle = TempoHandle { from, to, end: false, pos: Pos2::ZERO, bpm: None };
+        let index = editor.pin_clip_tempo(setting, handle);
+        assert_eq!(editor.lanes[&setting][index].at, from);
+        let raised = editor.lanes[&setting][index].value * 1.02;
+        editor.lanes.get_mut(&setting).unwrap()[index].value = raised;
+        editor.commit(setting, before, "move point");
+        let now = |at: u64| editor.value_at(setting, at);
+        println!("clip {from}..{to}: start {:.4} → mid {:.4} → end {:.4}; after {:.4} (was {after:.4})", now(from), now((from + to) / 2), now(to - 4096), now(to));
+        assert!((now(from) - raised).abs() < 1e-6, "the start raised");
+        assert!((now(to) - after).abs() < 1e-6, "what follows as it was");
+        let session = editor.session.lock().unwrap();
+        assert!((session.lane(setting).iter().find(|p| p.at >= to).map_or(after, |p| p.value) - after).abs() < 1e-6);
     }
 
     /// How much faster than real time `DECKHAND_SESSION` plays offline:

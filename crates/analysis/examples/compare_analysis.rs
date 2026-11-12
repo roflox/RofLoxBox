@@ -29,7 +29,7 @@ fn main() -> Result<()> {
             scope.spawn(|| {
                 loop {
                     let i = {
-                        let mut n = next.lock().unwrap();
+                        let mut n = next.lock().expect("a worker panicked");
                         *n += 1;
                         *n - 1
                     };
@@ -37,12 +37,12 @@ fn main() -> Result<()> {
                     let Ok(audio) = deckhand_audio::decode_file(&track.path) else { continue };
                     let grid = beat_grid(&audio.samples, audio.sample_rate, DEFAULT_RANGE);
                     let key = detect_key(&audio.samples, audio.sample_rate);
-                    rows.lock().unwrap().push((track, grid, key));
+                    rows.lock().expect("a worker panicked").push((track, grid, key));
                 }
             });
         }
     });
-    let mut rows = rows.into_inner().unwrap();
+    let mut rows = rows.into_inner().expect("a worker panicked");
     rows.sort_by_key(|r| r.0.id);
 
     let (mut same_bpm, mut octave, mut phase_ok, mut downbeat_ok, mut errors) =

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // tests: helpers outside #[test] functions too
 use std::path::{Path, PathBuf};
 
 use deckhand_formats::settings::values::*;

@@ -10,3 +10,6 @@ anyhow = "1.0.104"
 midir = "0.11.1"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
+
+[lints]
+workspace = true

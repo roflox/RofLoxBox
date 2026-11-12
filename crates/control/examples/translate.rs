@@ -5,13 +5,14 @@
 
 use deckhand_control::{Mapping, MidiMessage, Translator};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("mapping file");
-    let mut translator = Translator::new(Mapping::load(path.as_ref()).unwrap());
+    let mut translator = Translator::new(Mapping::load(path.as_ref())?);
     for arg in args {
-        let bytes: Vec<u8> = arg.split(':').map(|b| u8::from_str_radix(b, 16).unwrap()).collect();
+        let bytes = arg.split(':').map(|b| u8::from_str_radix(b, 16)).collect::<Result<Vec<u8>, _>>()?;
         let message = MidiMessage::parse(&bytes).expect("unknown message");
         println!("{arg} -> {:?}", translator.translate(message));
     }
+    Ok(())
 }

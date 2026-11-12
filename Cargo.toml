@@ -20,3 +20,8 @@ opt-level = 3
 
 [profile.dev.package.deckhand-analysis]
 opt-level = 3
+
+# No `.unwrap()` outside tests (clippy.toml allows it in them): handle the
+# error, or `.expect("why it can't fail")`.
+[workspace.lints.clippy]
+unwrap_used = "deny"

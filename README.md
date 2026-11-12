@@ -155,13 +155,18 @@ Open a session:
   reached the mix, with the beat grid. Every time a deck played (PLAY, or CUE
   held) is a box of its own: click one to select it (Delete cuts it out,
   dragging moves it), or right-click it to cut out just that play, e.g. a
-  CUE preview that was heard. Drag a clip by its title to move it,
-  drag inside it to slide its audio (to fix a beatmatch), shrink it by its
-  edges, double-click to split it and right-click a piece to cut it out or
-  bring it back. Dragging one of a clip's plays moves just it, with what
-  was done in it, between the plays around it (it starts where it did in
-  the track); a piece of a split clip moves laid over what is there; a clip with one play, or
-  any clip with ⌥ held, slides its audio instead (to fix a beatmatch).
+  CUE preview that was heard. Drag a clip (by its title or its body) to
+  move it, as in a DAW; ⌥-drag slides its audio inside instead, to fix a
+  beatmatch (half a beat or more snaps to whole beats; a blue triangle
+  marks each slide, right-click it to take it back). Drag its edges to
+  shrink it or make it longer (the track plays on, over whatever the deck
+  did there, up to the next thing heard), double-click to split it into
+  two clips, and delete a stretch from its middle to leave two clips. A
+  clip deleted whole is gone from the session (undo brings it back). A hot
+  cue pressed while playing starts a new clip. Hot and memory cues are
+  marked on the clips; nudges show as amber (faster) or blue (slower) bars
+  along a clip's foot: right-click one, or **Remove nudges** for a
+  selection, to take them out and keep the track in step.
   **Cmd/Ctrl-click** picks more: plays, pieces, or whole clips by their
   title strip, on any deck (again to let go of one). Dragging any of them
   moves them all together; Delete and Cmd/Ctrl+E act on all.

@@ -13,3 +13,6 @@ anyhow = "1.0.104"
 deckhand-audio = { version = "0.1.0", path = "../audio" }
 deckhand-formats = { version = "0.1.0", path = "../formats" }
 deckhand-library = { version = "0.1.0", path = "../library" }
+
+[lints]
+workspace = true

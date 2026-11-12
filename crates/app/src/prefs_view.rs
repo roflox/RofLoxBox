@@ -128,6 +128,14 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             lock(ui, &mut p.needle_lock);
             ui.label(RichText::new("Locked: clicking the small waveform of a playing deck does not jump. The big waveform always jumps.").small().weak());
         });
+        section(ui, "EDIT", |ui| {
+            ui.checkbox(&mut p.edit_follow_playhead, "Follow playhead");
+            ui.label(
+                RichText::new("While a set plays in EDIT, the view moves along when the playhead runs off it. Also on EDIT's toolbar.")
+                    .small()
+                    .weak(),
+            );
+        });
         section(ui, "Key display format", |ui| {
             use crate::deck::KeyNotation;
             ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
@@ -257,6 +265,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.memory_call_lock = defaults.memory_call_lock;
             p.key_notation = defaults.key_notation;
             p.highlight_compatible_keys = defaults.highlight_compatible_keys;
+            p.edit_follow_playhead = defaults.edit_follow_playhead;
             p.analysis = defaults.analysis;
             p.waveform_detail = defaults.waveform_detail;
             p.auto_master = defaults.auto_master;

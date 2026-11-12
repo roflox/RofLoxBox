@@ -12,3 +12,6 @@ thiserror = "2.0.21"
 [dev-dependencies]
 binrw = "0.14"
 rekordcrate = "0.3.0"
+
+[lints]
+workspace = true

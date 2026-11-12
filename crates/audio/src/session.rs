@@ -243,12 +243,134 @@ fn open_track(path: &Path) -> Result<Arc<TrackAudio>> {
         if let Some(audio) = opened.tracks.get(path) {
             return Ok(audio.clone());
         }
-        let audio =
-            opened.sources.track(path).with_context(|| format!("opening {}", path.display()))?;
+        // Not on this computer: exported along with the session.
+        let exported = (!path.exists())
+            .then(|| opened.folder.as_deref().and_then(|f| exported_track(f, path)))
+            .flatten();
+        let audio = opened
+            .sources
+            .track(exported.as_deref().unwrap_or(path))
+            .with_context(|| format!("opening {}", path.display()))?;
         remember_track(&audio, path);
         opened.tracks.insert(path.to_path_buf(), audio.clone());
         Ok(audio)
     })
+}
+
+/// The folder in an exported session's folder its tracks are copied to,
+/// and the file there naming each track's copy by its original path.
+const EXPORTED_TRACKS: &str = "tracks";
+const EXPORTED_INDEX: &str = "index.json";
+
+/// The copy of `path` exported with the session in `folder`, if there.
+fn exported_track(folder: &Path, path: &Path) -> Option<PathBuf> {
+    let tracks = folder.join(EXPORTED_TRACKS);
+    let index = std::fs::read(tracks.join(EXPORTED_INDEX)).ok()?;
+    let index: HashMap<PathBuf, String> = serde_json::from_slice(&index).ok()?;
+    let copy = tracks.join(index.get(path)?);
+    copy.exists().then_some(copy)
+}
+
+/// A track's outline, to draw its clips from (as a DAW does): the
+/// loudest sample, either channel, in every `step` frames, and in every
+/// `step * COARSE` (to draw zoomed out).
+#[derive(Debug, Clone, Default)]
+pub struct Outline {
+    pub rate: u32,
+    pub step: usize,
+    pub fine: Vec<f32>,
+    pub coarse: Vec<f32>,
+}
+
+impl Outline {
+    pub const COARSE: usize = 32;
+
+    fn of(audio: &TrackAudio, step: usize) -> Self {
+        let step = step.max(1);
+        let fine: Vec<f32> = audio
+            .samples
+            .chunks(step * 2)
+            .map(|c| c.iter().fold(0f32, |m, s| m.max(s.abs())))
+            .collect();
+        let coarse =
+            fine.chunks(Self::COARSE).map(|c| c.iter().copied().fold(0f32, f32::max)).collect();
+        Self { rate: audio.sample_rate, step, fine, coarse }
+    }
+
+    /// The loudest between `from` and `to` seconds into the track.
+    pub fn peak(&self, from: f64, to: f64) -> f32 {
+        let (from, to) = (from.min(to), from.max(to));
+        let per = f64::from(self.rate) / self.step as f64;
+        let (a, b) = ((from * per).floor().max(0.0) as usize, (to * per).ceil().max(0.0) as usize);
+        let (list, a, b) = if b - a > 4 * Self::COARSE {
+            (&self.coarse, a / Self::COARSE, b.div_ceil(Self::COARSE))
+        } else {
+            (&self.fine, a, b.max(a + 1))
+        };
+        list.get(a.min(list.len())..b.min(list.len()))
+            .map_or(0.0, |s| s.iter().copied().fold(0f32, f32::max))
+    }
+}
+
+/// What [`export_files`] did.
+#[derive(Debug, Default)]
+pub struct Exported {
+    pub tracks: usize,
+    pub bytes: u64,
+    /// Tracks not found to copy.
+    pub missing: Vec<PathBuf>,
+}
+
+/// Copies `tracks` (the files a session plays) into `dir`'s `tracks/`
+/// folder, and the stems kept with the recording (`stems`, the `stems/`
+/// folder beside it) into `dir/stems`: with the session written into
+/// `dir`, it opens on another computer, finding them there.
+pub fn export_files(dir: &Path, tracks: &[PathBuf], stems: Option<&Path>) -> Result<Exported> {
+    let folder = dir.join(EXPORTED_TRACKS);
+    std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
+    let mut exported = Exported::default();
+    let mut index: HashMap<PathBuf, String> = HashMap::new();
+    for track in tracks {
+        if !track.is_file() {
+            exported.missing.push(track.clone());
+            continue;
+        }
+        let stem = track.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let extension = track.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        // Tracks with the same name from different folders: numbered.
+        let name = (1..)
+            .map(|n| if n == 1 { format!("{stem}{extension}") } else { format!("{stem} {n}{extension}") })
+            .find(|name| !index.values().any(|taken| taken == name))
+            .unwrap_or_default();
+        let to = folder.join(&name);
+        exported.bytes += std::fs::copy(track, &to)
+            .with_context(|| format!("copying {} to {}", track.display(), to.display()))?;
+        exported.tracks += 1;
+        index.insert(track.clone(), name);
+    }
+    let written = serde_json::to_vec_pretty(&index)?;
+    std::fs::write(folder.join(EXPORTED_INDEX), written)?;
+    if let Some(stems) = stems.filter(|s| s.is_dir()) {
+        exported.bytes += copy_dir(stems, &dir.join("stems"))?;
+    }
+    Ok(exported)
+}
+
+/// Copies the folder `from` (with what is in it) to `to`; returns the bytes.
+fn copy_dir(from: &Path, to: &Path) -> Result<u64> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    let mut bytes = 0;
+    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            bytes += copy_dir(&entry.path(), &target)?;
+        } else {
+            bytes += std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(bytes)
 }
 
 /// A track's stems. Stems that are gone become stems not separated yet,
@@ -1079,6 +1201,20 @@ fn is_jump(event: &Logged) -> bool {
     )
 }
 
+/// A nudge: `deck` sped up or slowed down a moment (the jog's edge, the
+/// pitch bend buttons) from `from` to `to` (frames from the start), which
+/// left its track `shift` seconds ahead (or behind, negative).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Nudge {
+    pub deck: usize,
+    pub from: u64,
+    pub to: u64,
+    pub shift: f64,
+}
+
+/// Nudges this close together (seconds) are one (taps in a row).
+const NUDGE_GAP_SECS: f64 = 0.3;
+
 /// A track moved in the editor: from `at` (frames from the start) on,
 /// `deck`'s track plays `later` seconds later.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1208,6 +1344,31 @@ impl Session {
         self.end.map(|end| end.saturating_sub(self.snapshot.clock))
     }
 
+    /// Moves the end out past the last thing done, with [`TAIL_SECS`] to
+    /// ring out, when an edit put something after it: a set is as long as
+    /// what is in it.
+    fn stretch_end(&mut self) {
+        let start = self.snapshot.clock;
+        let Some(i) = self.events.iter().rposition(|(_, e)| matches!(e, Logged::End)) else {
+            return;
+        };
+        let last = self
+            .events
+            .iter()
+            .filter(|(_, e)| !matches!(e, Logged::End | Logged::Block(_)))
+            .map(|(at, _)| *at)
+            .max()
+            .unwrap_or(start);
+        if last < self.events[i].0 {
+            return;
+        }
+        let tail = (TAIL_SECS * f64::from(self.rate)) as u64;
+        let end = start + self.block_ceil(last - start + tail);
+        let (_, event) = self.events.remove(i);
+        self.events.push((end, event));
+        self.end = Some(end);
+    }
+
     /// Events lost while recording; the replay will not match then.
     pub fn lost_events(&self) -> u64 {
         self.lost
@@ -1231,6 +1392,7 @@ impl Session {
         let length = self.length();
         let path = |audio: &Arc<TrackAudio>| source_of(&TRACKS, audio).unwrap_or_default();
         let span = |deck, path, from| TrackSpan { deck, path, from, to: from, playing: Vec::new() };
+        let jump_split = (JUMP_SPLIT_SECS * f64::from(self.rate)) as u64;
         // Per deck: the track on it, and since when it plays.
         let mut open: Vec<Option<(TrackSpan, Option<u64>)>> = (0..crate::engine::DECKS)
             .map(|deck| {
@@ -1256,6 +1418,17 @@ impl Session {
                 }
                 Command::Unload { deck } if deck < open.len() => {
                     close(&mut open[deck], at, &mut spans);
+                }
+                // A jump while playing (a hot cue, a beat jump): from there
+                // it is a play of its own, unless the one before would be a
+                // sliver (dragging the needle).
+                Command::Seek { deck, .. } if deck < open.len() => {
+                    if let Some((span, Some(since))) = open[deck].as_mut()
+                        && at >= *since + jump_split
+                    {
+                        span.playing.push((*since, at));
+                        *since = at;
+                    }
                 }
                 Command::SetPlaying { deck, playing } if deck < open.len() => {
                     if let Some((span, since)) = open[deck].as_mut() {
@@ -1288,6 +1461,11 @@ impl Session {
     /// recorded before grids were kept).
     pub fn add_grid(&mut self, path: PathBuf, grid: Grid) {
         self.grids.entry(path).or_insert(grid);
+    }
+
+    /// Each track's outline (see [`Outline`]), every `step` frames.
+    pub fn outlines(&self, step: usize) -> HashMap<PathBuf, Outline> {
+        self.tracks.iter().map(|(path, audio)| (path.clone(), Outline::of(audio, step))).collect()
     }
 
     /// Each track's file and length in seconds.
@@ -1522,10 +1700,47 @@ impl Session {
                 if *d == deck && (span.from..span.to).contains(&(at - start)))
         });
         for (at, open) in cuts {
-            let at = self.snap(at).clamp(span.from, span.to.saturating_sub(1));
+            // Inside the clip, on a buffer start like every event.
+            let at = self.snap(at);
+            let at = if at >= span.to { self.block_floor(span.to.saturating_sub(1)) } else { at };
+            let at = at.max(span.from);
             self.events.push((start + at, Logged::Command(Command::Gate { deck, open })));
         }
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        self.drop_deleted();
+    }
+
+    /// Takes out the clips nothing of is heard: cut out whole (deleted), or
+    /// loaded and never played. What their deck did for them (the load,
+    /// plays, jumps, cuts) goes, as if the track had not been loaded there;
+    /// the deck stays stopped. Clips the recording began with stay. Returns
+    /// how many went.
+    pub fn drop_deleted(&mut self) -> usize {
+        let start = self.snapshot.clock;
+        let spans = self.tracks();
+        let mut dropped = 0;
+        for (k, span) in spans.iter().enumerate() {
+            let deck = span.deck;
+            let loaded_here = self.events.iter().any(|(at, e)| {
+                *at == start + span.from
+                    && matches!(e, Logged::Command(Command::Load { deck: d, .. }) if *d == deck)
+            });
+            // Played and all cut out, or (split off where the deck stood
+            // still) loaded and never played: nothing heard, gone.
+            if !self.heard(span).is_empty() || !loaded_here {
+                continue;
+            }
+            let (from, to) = (start + span.from, start + span.to);
+            self.events.retain(|(at, e)| !((from..to).contains(at) && gives_way(e, deck, true)));
+            // The track before it, which the load stopped, stops there still.
+            let before = k.checked_sub(1).map(|i| &spans[i]).filter(|t| t.deck == deck && t.to == span.from);
+            if before.is_some_and(|t| t.playing.last().is_some_and(|p| p.1 == span.from)) {
+                let i = self.events.partition_point(|(t, _)| *t < from);
+                self.events.insert(i, (from, Logged::Command(Command::SetPlaying { deck, playing: false })));
+            }
+            dropped += 1;
+        }
+        dropped
     }
 
     /// When `deck`'s Master Tempo (key lock: the key kept when the tempo
@@ -1725,6 +1940,22 @@ impl Session {
         (from + (offset + size / 2) / size * size).saturating_sub(start)
     }
 
+    /// The buffer start at or before `at`.
+    fn block_floor(&self, at: u64) -> u64 {
+        let start = self.snapshot.clock;
+        let (from, size) = self.block_at(at);
+        if size == 0 {
+            return at;
+        }
+        let offset = (start + at).saturating_sub(from);
+        (from + offset / size * size).saturating_sub(start)
+    }
+
+    /// The buffer start at or after `at`.
+    fn block_ceil(&self, at: u64) -> u64 {
+        if self.block_floor(at) == at { at } else { self.next_block(at) }
+    }
+
     /// The first buffer start after `at`.
     fn next_block(&self, at: u64) -> u64 {
         let start = self.snapshot.clock;
@@ -1785,6 +2016,9 @@ impl Session {
         OPENED.set(previous);
         let (curves, events) = read?;
         (self.curves, self.events) = (curves.into_iter().collect(), events);
+        if let Some(end) = self.events.iter().rev().find(|(_, e)| matches!(e, Logged::End)) {
+            self.end = Some(end.0);
+        }
         Ok(())
     }
 
@@ -1808,10 +2042,16 @@ impl Session {
             bail!("the track was on the deck before recording started, so it cannot move");
         }
         let end = spans[index].to;
-        // Not onto the clip before's own start, nor past the session.
-        let low = index.checked_sub(1).map_or(0, |i| spans[i].from + 1);
-        let landing = (from as i64 + by).clamp(low as i64, self.length() as i64 - 1) as u64;
-        let landing = self.snap(landing).max(low);
+        // Not onto the start of the clip heard before it (silent ones give
+        // way).
+        let low = spans[..index]
+            .iter()
+            .rev()
+            .find(|t| !self.heard(t).is_empty())
+            .map_or(0, |t| t.from + 1);
+        let landing = (from as i64 + by).max(low as i64) as u64;
+        let landing = self.snap(landing);
+        let landing = if landing < low { self.block_ceil(low) } else { landing };
         let by = landing as i64 - from as i64;
         if by == 0 {
             return Ok(from);
@@ -1819,7 +2059,11 @@ impl Session {
         let next = spans.get(index + 1).map(|s| s.from);
         let (moved, rest): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.events).into_iter().partition(|(at, event)| {
-                deck_of(event) == Some(deck) && (start + from..start + end).contains(at)
+                deck_of(event) == Some(deck)
+                    && (start + from..start + end).contains(at)
+                    // The stop of the clip before it (split there) stays.
+                    && !(*at == start + from
+                        && matches!(event, Logged::Command(Command::SetPlaying { playing: false, .. })))
             });
         let landed = landing..(end as i64 + by).max(0) as u64;
         self.events = rest
@@ -1840,6 +2084,7 @@ impl Session {
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         // The deck's lanes as edited now follow the events.
         self.curves.retain(|setting, _| setting.deck() != Some(deck));
+        self.stretch_end();
         Ok(landing)
     }
 
@@ -1887,6 +2132,15 @@ impl Session {
         let mut added = Vec::new();
         for (&at, &seconds) in starts.iter().zip(&places.seconds) {
             let (stems, levels, gate) = before_load(&self.events, deck, start + from, at);
+            // Begun by a jump while the play before it went on: that one ends
+            // there (moved apart, it doesn't run on).
+            let pressed = self.events.iter().any(|(t, e)| {
+                *t == at
+                    && matches!(e, Logged::Command(Command::SetPlaying { deck: d, playing: true }) if *d == deck)
+            });
+            if !pressed {
+                added.push((at, Logged::Command(Command::SetPlaying { deck, playing: false })));
+            }
             added.push((at, Logged::Command(Command::Load { deck, audio: audio.clone() })));
             for c in stems.into_iter().chain(levels) {
                 added.push((at, Logged::Command(self.copy(c)?)));
@@ -1895,6 +2149,10 @@ impl Session {
                 added.push((at, Logged::Command(Command::Gate { deck, open: false })));
             }
             added.push((at, Logged::Command(Command::Seek { deck, seconds })));
+            // Begun by a jump while it played: it plays on.
+            if !pressed {
+                added.push((at, Logged::Command(Command::SetPlaying { deck, playing: true })));
+            }
         }
         // In front of what happens at the same moment.
         let mut events = Vec::with_capacity(self.events.len() + added.len());
@@ -1908,6 +2166,178 @@ impl Session {
         events.extend(added);
         self.events = events;
         Ok(true)
+    }
+
+    /// Every nudge in the set, by deck and time.
+    pub fn nudges(&self) -> Vec<Nudge> {
+        let start = self.snapshot.clock;
+        let rate = f64::from(self.rate);
+        let lanes: Vec<Vec<Point>> =
+            (0..crate::engine::DECKS).map(|d| self.lane(Setting::Tempo(d))).collect();
+        // Per deck: the amount now, since when, and the run so far.
+        let mut on: Vec<(f64, u64, Option<(u64, f64)>)> = vec![(0.0, 0, None); crate::engine::DECKS];
+        let mut found = Vec::new();
+        for (at, event) in &self.events {
+            let at = at - start;
+            let Logged::Command(command) = event else { continue };
+            match *command {
+                Command::SetNudge { deck, amount } if deck < on.len() => {
+                    let (now, since, run) = &mut on[deck];
+                    if let Some((_, shift)) = run.as_mut() {
+                        *shift += *now * lane_value(&lanes[deck], *since) * (at - *since) as f64 / rate;
+                    }
+                    let amount = f64::from(amount);
+                    match (run.is_some(), amount != 0.0) {
+                        (false, true) => *run = Some((at, 0.0)),
+                        (true, false) => {
+                            if let Some((from, shift)) = run.take() {
+                                found.push(Nudge { deck, from, to: at, shift });
+                            }
+                        }
+                        _ => {}
+                    }
+                    (*now, *since) = (amount, at);
+                }
+                // A new track starts unnudged.
+                Command::Load { deck, .. } if deck < on.len() => on[deck] = (0.0, at, None),
+                _ => {}
+            }
+        }
+        found.sort_by_key(|n| (n.deck, n.from));
+        // Taps in a row (as the jog's edge is nudged) are one nudge.
+        let gap = (NUDGE_GAP_SECS * rate) as u64;
+        let mut merged: Vec<Nudge> = Vec::with_capacity(found.len());
+        for n in found {
+            match merged.last_mut() {
+                Some(last) if last.deck == n.deck && n.from <= last.to + gap => {
+                    last.to = n.to;
+                    last.shift += n.shift;
+                }
+                _ => merged.push(n),
+            }
+        }
+        merged
+    }
+
+    /// Takes `deck`'s nudges between `from` and `to` (frames) out. With
+    /// `keep_step`, what each moved the track stays: the play it is in
+    /// begins that much further on in the track (shifted as it starts, so
+    /// nothing jumps while heard), and after it all is where it was.
+    /// Returns how many went.
+    pub fn remove_nudges(&mut self, deck: usize, from: u64, to: u64, keep_step: bool) -> usize {
+        let start = self.snapshot.clock;
+        let gone: Vec<Nudge> = self
+            .nudges()
+            .into_iter()
+            .filter(|n| n.deck == deck && n.from < to.max(from + 1) && from <= n.to)
+            .collect();
+        if gone.is_empty() {
+            return 0;
+        }
+        let plays: Vec<(u64, u64)> = self
+            .tracks()
+            .into_iter()
+            .filter(|t| t.deck == deck)
+            .flat_map(|t| t.playing)
+            .collect();
+        let mut shifts: Vec<(u64, f64)> = Vec::new();
+        for n in &gone {
+            let Some(play) = plays.iter().find(|p| p.0 <= n.from && n.from < p.1) else { continue };
+            match shifts.iter_mut().find(|s| s.0 == play.0) {
+                Some(s) => s.1 += n.shift,
+                None => shifts.push((play.0, n.shift)),
+            }
+        }
+        self.events.retain(|(at, e)| {
+            let at = at - start;
+            !(matches!(e, Logged::Command(Command::SetNudge { deck: d, .. }) if *d == deck)
+                && gone.iter().any(|n| n.from <= at && at <= n.to))
+        });
+        if keep_step {
+            for (play, seconds) in shifts {
+                // After what begins the play (its cue, its PLAY).
+                let clock = start + play;
+                let i = self.events.partition_point(|(t, _)| *t <= clock);
+                self.events.insert(i, (clock, Logged::Command(Command::Shift { deck, seconds })));
+            }
+        }
+        gone.len()
+    }
+
+    /// Deletes `from`–`to` (frames) of `deck`, as in a DAW: a clip it
+    /// cuts through is split there, into clips of their own before and
+    /// after, and what is between goes.
+    pub fn delete_range(&mut self, deck: usize, from: u64, to: u64) -> Result<()> {
+        let (from, to) = (self.snap(from), self.snap(to));
+        if from >= to {
+            return Ok(());
+        }
+        for at in [to, from] {
+            if self.tracks().iter().any(|t| t.deck == deck && t.from < at && at < t.to) {
+                self.split_clip(deck, at)?;
+            }
+        }
+        let inside: Vec<TrackSpan> = self
+            .tracks()
+            .into_iter()
+            .filter(|t| t.deck == deck && from <= t.from && t.to <= to)
+            .collect();
+        for span in inside {
+            self.set_pieces(&span, &[]);
+        }
+        Ok(())
+    }
+
+    /// Splits `deck`'s clip at `at` into two clips of their own (to move,
+    /// resize and delete apart): the track is loaded again there, where it
+    /// was, playing if it was, with its stems and cut as they were, so it
+    /// sounds the same. Returns where it was split (a buffer start).
+    pub fn split_clip(&mut self, deck: usize, at: u64) -> Result<u64> {
+        let start = self.snapshot.clock;
+        let at = self.snap(at);
+        let Some(span) = self.tracks().into_iter().find(|t| t.deck == deck && t.from < at && at < t.to)
+        else {
+            bail!("no clip on deck {} there", deck + 1);
+        };
+        let clock = start + at;
+        let mut places = Places { deck, at: vec![clock], seconds: Vec::new(), tempo: Vec::new() };
+        self.find_places(&mut places)?;
+        let seconds =
+            places.seconds.first().copied().ok_or_else(|| anyhow!("past the end of the session"))?;
+        let audio = self
+            .events
+            .iter()
+            .rev()
+            .find_map(|(t, e)| match e {
+                Logged::Command(Command::Load { deck: d, audio }) if *d == deck && *t <= start + span.from => {
+                    Some(audio.clone())
+                }
+                _ => None,
+            })
+            .or_else(|| self.snapshot.deck(deck).0.cloned())
+            .ok_or_else(|| anyhow!("no track on deck {}", deck + 1))?;
+        let playing = span.playing.iter().any(|p| p.0 < at && at < p.1);
+        let (stems, levels, gate) = before_load(&self.events, deck, start + span.from, clock);
+        let mut added = Vec::new();
+        // The first ends there (moved apart, it doesn't run on).
+        if playing {
+            added.push(Logged::Command(Command::SetPlaying { deck, playing: false }));
+        }
+        added.push(Logged::Command(Command::Load { deck, audio }));
+        for c in stems.into_iter().chain(levels) {
+            added.push(Logged::Command(self.copy(c)?));
+        }
+        if !gate {
+            added.push(Logged::Command(Command::Gate { deck, open: false }));
+        }
+        added.push(Logged::Command(Command::Seek { deck, seconds }));
+        if playing {
+            added.push(Logged::Command(Command::SetPlaying { deck, playing: true }));
+        }
+        // In front of what happens at that moment.
+        let i = self.events.partition_point(|(t, _)| *t < clock);
+        self.events.splice(i..i, added.into_iter().map(|e| (clock, e)));
+        Ok(at)
     }
 
     /// What of `span` is heard: where it played and wasn't cut out.
@@ -1927,13 +2357,26 @@ impl Session {
     /// Where in its track (seconds) `deck`'s play starting at `from` began,
     /// after what was done at that moment (a jump), and the deck's tempo.
     fn play_place(&self, deck: usize, from: u64) -> Result<(f64, f64)> {
+        Ok(self.play_place_and(deck, from, None)?.0)
+    }
+
+    /// [`Session::play_place`], and where the deck is (and its tempo) at
+    /// `also` (after `from`), from one replay.
+    fn play_place_and(
+        &self,
+        deck: usize,
+        from: u64,
+        also: Option<u64>,
+    ) -> Result<((f64, f64), Option<(f64, f64)>)> {
         let start = self.snapshot.clock;
-        let mut places =
-            Places { deck, at: vec![start + from], seconds: Vec::new(), tempo: Vec::new() };
+        let mut at = vec![start + from];
+        at.extend(also.filter(|&a| a > from).map(|a| start + a));
+        let mut places = Places { deck, at, seconds: Vec::new(), tempo: Vec::new() };
         self.find_places(&mut places)?;
         let (Some(&before), Some(&tempo)) = (places.seconds.first(), places.tempo.first()) else {
             bail!("the play is past the end of the session");
         };
+        let there = places.seconds.get(1).copied().zip(places.tempo.get(1).copied());
         let mut seconds = before;
         for (at, event) in &self.events {
             if *at != start + from {
@@ -1947,20 +2390,14 @@ impl Session {
                 _ => {}
             }
         }
-        Ok((seconds.max(0.0), tempo.max(0.01)))
+        Ok(((seconds.max(0.0), tempo.max(0.01)), there))
     }
 
-    /// `at` on a buffer start inside `low`–`high` (as near as there is one).
-    fn snap_within(&self, at: u64, low: u64, high: u64) -> u64 {
-        let snapped = self.snap(at.clamp(low, high));
-        if snapped < low {
-            self.next_block(low).min(high)
-        } else if snapped > high {
-            let (_, size) = self.block_at(high);
-            snapped.saturating_sub(size.max(1)).max(low)
-        } else {
-            snapped
-        }
+    /// The buffer start nearest `at` inside `low`–`high`; `None` if no
+    /// buffer starts there.
+    fn snap_within(&self, at: u64, low: u64, high: u64) -> Option<u64> {
+        let (low, high) = (self.block_ceil(low), self.block_floor(high));
+        (low <= high).then(|| self.snap(at).clamp(low, high))
     }
 
     /// How far the edges of the play `from`–`to` on `deck` (one of
@@ -1968,8 +2405,9 @@ impl Session {
     /// Its start: back to the track's beginning (the audio before the place
     /// it began), but not into what is heard before it on the deck; later,
     /// not past a jump inside it; it stays put when it began with the
-    /// recording. Its end: on to the clip's end. Whatever the deck did in
-    /// between (cue hits, cut out or not, jumps) gives way. With more
+    /// recording. Its end: on to the next thing heard on the deck. Whatever
+    /// the deck did in between (cue hits, cut out or not, jumps, other
+    /// tracks loaded and not heard) gives way. With more
     /// plays in its clip: not into the plays around it nor across a jump.
     pub fn play_edges(&self, deck: usize, from: u64, to: u64) -> Option<PlayEdges> {
         let spans: Vec<TrackSpan> = self.tracks().into_iter().filter(|t| t.deck == deck).collect();
@@ -1987,10 +2425,38 @@ impl Session {
             *t == start + from
                 && matches!(e, Logged::Command(Command::SetPlaying { deck: d, playing: true }) if *d == deck)
         });
-        let first_jump = jumps.iter().filter(|&&j| from < j && j < to).min().copied();
-        let latest_start = first_jump.unwrap_or(to).saturating_sub(1).max(from);
+        // Later: up to its end, where it had got to (jog touches, nudges
+        // and jumps on the way give way), but not into a loop it set.
+        let first_loop = self
+            .events
+            .iter()
+            .filter(|(at, e)| {
+                deck_of(e) == Some(deck)
+                    && matches!(e, Logged::Command(Command::SetLoop { .. }))
+                    && start + from < *at
+                    && *at < start + to
+            })
+            .map(|(at, _)| at - start)
+            .min();
+        let latest_start = first_loop.unwrap_or(to).saturating_sub(1).max(from);
         let (earliest, latest) = if span.playing.len() == 1 {
-            let (place, tempo) = self.play_place(deck, from).ok()?;
+            // Where it is heard to, and where the deck is in the track then.
+            let heard_end = self
+                .heard(span)
+                .into_iter()
+                .filter(|h| from <= h.0 && h.1 <= to)
+                .map(|h| h.1)
+                .max()
+                .unwrap_or(to);
+            let ((place, tempo), there) = self.play_place_and(deck, from, Some(heard_end)).ok()?;
+            // Not on past the track's end (silence).
+            let track_end = match (self.tracks.get(&span.path), there) {
+                (Some(audio), Some((at, pace))) if pace > 0.0 => {
+                    let left = (audio.duration_secs() - at).max(0.0);
+                    heard_end + (left / pace * f64::from(self.rate)) as u64
+                }
+                _ => OPEN_END,
+            };
             let track_start =
                 from.saturating_sub((place / tempo * f64::from(self.rate)).floor() as u64);
             let heard_before = spans[..k]
@@ -2000,7 +2466,15 @@ impl Session {
                 .filter(|&end| end <= from)
                 .max()
                 .unwrap_or(0);
-            (track_start.max(heard_before).min(from), span.to.max(to))
+            // On over what isn't heard after it (deleted cue hits, a track
+            // loaded and cut): up to the next thing heard on the deck.
+            let heard_after = spans[k + 1..]
+                .iter()
+                .flat_map(|t| self.heard(t))
+                .map(|h| h.0)
+                .min()
+                .unwrap_or(OPEN_END);
+            (track_start.max(heard_before).min(from), heard_after.min(track_end).max(to))
         } else {
             let before = i.checked_sub(1).map_or(span.from, |i| span.playing[i].1 + 1);
             let after = span.playing.get(i + 1).map_or(span.to, |p| p.0.saturating_sub(1));
@@ -2035,65 +2509,36 @@ impl Session {
         let edges = self
             .play_edges(deck, from, to)
             .ok_or_else(|| anyhow!("deck {} didn't play there", deck + 1))?;
-        let new_from = self.snap_within(new_from, edges.start.0, edges.start.1);
-        let new_to = self.snap_within(new_to, edges.end.0.max(new_from + 1), edges.end.1);
+        let new_from = self.snap_within(new_from, edges.start.0, edges.start.1).unwrap_or(from);
+        let own = self
+            .tracks()
+            .into_iter()
+            .find(|t| t.deck == deck && t.playing.contains(&(from, to)))
+            .ok_or_else(|| anyhow!("deck {} didn't play there", deck + 1))?;
+        // Where it is heard to (a cut may end it before it stops).
+        let heard_end = self
+            .heard(&own)
+            .into_iter()
+            .filter(|h| from <= h.0 && h.1 <= to)
+            .map(|h| h.1)
+            .max()
+            .unwrap_or(to);
+        let new_to = if new_to == heard_end {
+            heard_end
+        } else {
+            self.snap_within(new_to, edges.end.0.max(new_from + 1), edges.end.1).unwrap_or(heard_end)
+        };
         let start = self.snapshot.clock;
         let mine = |e: &Logged| deck_of(e) == Some(deck);
         let is_play = |e: &Logged, playing: bool| {
             matches!(e, Logged::Command(Command::SetPlaying { deck: d, playing: p }) if *d == deck && *p == playing)
         };
         let is_gate = |e: &Logged| matches!(e, Logged::Command(Command::Gate { deck: d, .. }) if *d == deck);
-        // Whether `deck` is heard (not cut) just after what happens at `at`.
-        let gate_at = |events: &[(u64, Logged)], at: u64| {
-            let mut open = true;
-            for (t, e) in events.iter().take_while(|(t, _)| *t <= start + at) {
-                match e {
-                    Logged::Command(Command::Gate { deck: d, open: o }) if *d == deck => open = *o,
-                    Logged::Command(Command::Load { deck: d, .. }) if *d == deck => open = true,
-                    _ => {}
-                }
-                let _ = t;
-            }
-            open
-        };
-        // What the deck does that gives way to the track laid over it.
-        let gives_way = |e: &Logged, loads: bool| {
-            mine(e)
-                && (is_jump(e)
-                    || is_gate(e)
-                    || matches!(
-                        e,
-                        Logged::Command(
-                            Command::SetPlaying { .. }
-                                | Command::ClearLoop { .. }
-                                | Command::MoveTrack { .. }
-                        )
-                    )
-                    || loads
-                        && matches!(
-                            e,
-                            Logged::Command(
-                                Command::Load { .. }
-                                    | Command::Unload { .. }
-                                    | Command::SetStems { .. }
-                                    | Command::SetStemLevels { .. }
-                            )
-                        ))
-        };
+        let gives_way = |e: &Logged, loads: bool| gives_way(e, deck, loads);
         let (place, tempo) = self.play_place(deck, from)?;
-        if new_to != to {
-            if new_to > to {
-                let heard_after = gate_at(&self.events, new_to);
-                self.events.retain(|(at, e)| {
-                    !(start + to < *at && *at <= start + new_to && gives_way(e, false))
-                });
-                if !heard_after {
-                    self.events.push((
-                        start + new_to,
-                        Logged::Command(Command::Gate { deck, open: false }),
-                    ));
-                }
-            }
+        if new_to > heard_end {
+            self.extend_play(deck, &own, heard_end, new_to)?;
+        } else if new_to < heard_end {
             match self.events.iter().position(|(at, e)| *at == start + to && is_play(e, false)) {
                 Some(i) => self.events[i].0 = start + new_to,
                 None => self.events.push((
@@ -2104,7 +2549,8 @@ impl Session {
             self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         }
         if new_from != from {
-            let seconds = place - (from as f64 - new_from as f64) / f64::from(self.rate) * tempo;
+            let mut seconds = place - (from as f64 - new_from as f64) / f64::from(self.rate) * tempo;
+            let mut held = false;
             let mut moved: Vec<Logged> = Vec::new();
             if new_from < from {
                 // Loaded again there, as it was when it began.
@@ -2144,27 +2590,147 @@ impl Session {
                         || *at == start + from && mine(e) && (is_gate(e) || matches!(e, Logged::Command(Command::Load { .. } | Command::SetStems { .. } | Command::SetStemLevels { .. }))))
                 });
             } else {
-                // Starts later, where it had got to.
-                self.events.retain(|(at, e)| {
-                    !(*at == start + from
+                // Starts later, where the deck had really got to there
+                // (whatever the jog and jumps did on the way); what was done
+                // before it, now silent, goes.
+                let (at, upto) = (start + from, start + new_from);
+                let mut places = Places { deck, at: vec![upto], seconds: Vec::new(), tempo: Vec::new() };
+                self.find_places(&mut places)?;
+                seconds = places
+                    .seconds
+                    .first()
+                    .copied()
+                    .ok_or_else(|| anyhow!("past the end of the session"))?;
+                // The jog still held there: held from the start.
+                for (_, e) in self.events.iter().filter(|(t, e)| at <= *t && *t < upto && mine(e)) {
+                    if let Logged::Command(Command::Hold { held: h, .. }) = e {
+                        held = *h;
+                    }
+                }
+                self.events.retain(|(t, e)| {
+                    !(at <= *t
+                        && *t < upto
                         && mine(e)
-                        && (is_play(e, true)
-                            || matches!(
-                                e,
-                                Logged::Command(
-                                    Command::Seek { .. } | Command::Shift { .. } | Command::MoveTrack { .. }
-                                )
-                            )))
+                        && (is_jump(e)
+                            || is_play(e, true)
+                            || matches!(e, Logged::Command(Command::MoveTrack { .. }))))
                 });
             }
             moved.push(Logged::Command(Command::Seek { deck, seconds: seconds.max(0.0) }));
             moved.push(Logged::Command(Command::SetPlaying { deck, playing: true }));
+            if held {
+                moved.push(Logged::Command(Command::Hold { deck, held: true }));
+            }
             let at = start + new_from;
             let i = self.events.partition_point(|(t, _)| *t < at);
             self.events.splice(i..i, moved.into_iter().map(|e| (at, e)));
         }
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        self.stretch_end();
         Ok((new_from, new_to))
+    }
+
+    /// Makes `deck`'s track in `own` play on, heard, from `heard_end` to
+    /// `new_to` (buffer starts) as if nothing had been done there: what the
+    /// deck did in between gives way (jumps, cuts, the stop, cue hits and
+    /// tracks loaded after it), and from `new_to` on the deck is as it was.
+    fn extend_play(&mut self, deck: usize, own: &TrackSpan, heard_end: u64, new_to: u64) -> Result<()> {
+        let start = self.snapshot.clock;
+        let spans: Vec<TrackSpan> = self.tracks().into_iter().filter(|t| t.deck == deck).collect();
+        let there = spans.iter().find(|t| t.from <= new_to && new_to < t.to);
+        // It fades out at `new_to` (as a cut does); a buffer on, when there
+        // is room before anything else is heard, the deck goes on as it was.
+        let heard_next = spans
+            .iter()
+            .flat_map(|t| self.heard(t))
+            .map(|h| h.0)
+            .filter(|&h| h >= new_to)
+            .min()
+            .unwrap_or(OPEN_END);
+        let next_load = spans.iter().map(|t| t.from).filter(|&f| f > new_to).min().unwrap_or(u64::MAX);
+        let limit = heard_next.min(next_load).min(there.map_or(u64::MAX, |t| t.to));
+        // Another track is loaded (or none) where it ends: that cuts it
+        // off at once, so it fades out first.
+        let swaps = match there {
+            Some(t) => t.from < new_to && t.from != own.from,
+            // Unloaded after it (not just the end of the set).
+            None => own.to <= new_to && own.to < self.length(),
+        };
+        let resume = match self.next_block(new_to) {
+            r if r < limit && swaps => r,
+            _ => new_to,
+        };
+        let clock = start + resume;
+        let place = |s: &Self| -> Result<f64> {
+            let mut places = Places { deck, at: vec![clock], seconds: Vec::new(), tempo: Vec::new() };
+            s.find_places(&mut places)?;
+            places.seconds.first().copied().ok_or_else(|| anyhow!("past the end of the session"))
+        };
+        let stop = || Logged::Command(Command::SetPlaying { deck, playing: false });
+        let mut fade = Vec::new();
+        if resume > new_to {
+            fade.push(Logged::Command(Command::Gate { deck, open: false }));
+        }
+        // How the deck goes on from `resume`, as it was.
+        let mut after = Vec::new();
+        match there {
+            Some(t) if t.from < new_to => {
+                let playing = t.playing.iter().any(|p| p.0 < resume && resume < p.1);
+                let (stems, levels, gate) = before_load(&self.events, deck, start + t.from, clock);
+                if t.from == own.from {
+                    // Its own track goes on unheard (nothing of its play is
+                    // heard after this): no jump, which would click.
+                    if !playing {
+                        after.push(stop());
+                    }
+                    if !gate && fade.is_empty() {
+                        after.push(Logged::Command(Command::Gate { deck, open: false }));
+                    }
+                } else {
+                    // A track loaded in between: loaded again here.
+                    let audio = self
+                        .events
+                        .iter()
+                        .find_map(|(at, e)| match e {
+                            Logged::Command(Command::Load { deck: d, audio })
+                                if *d == deck && *at == start + t.from =>
+                            {
+                                Some(audio.clone())
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| anyhow!("no track on deck {}", deck + 1))?;
+                    after.push(stop());
+                    after.push(Logged::Command(Command::Load { deck, audio }));
+                    for c in stems.into_iter().chain(levels) {
+                        after.push(Logged::Command(self.copy(c)?));
+                    }
+                    if !gate {
+                        after.push(Logged::Command(Command::Gate { deck, open: false }));
+                    }
+                    after.push(Logged::Command(Command::Seek { deck, seconds: place(self)? }));
+                    if playing {
+                        after.push(Logged::Command(Command::SetPlaying { deck, playing: true }));
+                    }
+                }
+            }
+            // A track loaded right there: it takes over.
+            Some(_) => after.push(stop()),
+            None => {
+                after.push(stop());
+                if swaps {
+                    after.push(Logged::Command(Command::Unload { deck }));
+                }
+            }
+        }
+        self.events.retain(|(at, e)| {
+            !(start + heard_end <= *at && *at < clock && gives_way(e, deck, *at >= start + own.to))
+        });
+        let i = self.events.partition_point(|(t, _)| *t < clock);
+        self.events.splice(i..i, after.into_iter().map(|e| (clock, e)));
+        let i = self.events.partition_point(|(t, _)| *t < start + new_to);
+        self.events.splice(i..i, fade.into_iter().map(|e| (start + new_to, e)));
+        Ok(())
     }
 
     /// How far the play `from`–`to` on `deck` (frames from the start; one
@@ -2175,7 +2741,9 @@ impl Session {
             self.tracks().into_iter().find(|t| t.deck == deck && t.from <= from && to <= t.to)?;
         let i = span.playing.iter().position(|&p| p == (from, to))?;
         let before = i.checked_sub(1).map_or(span.from, |i| span.playing[i].1 + 1);
-        let after = span.playing.get(i + 1).map_or(span.to, |p| p.0.saturating_sub(1));
+        // The deck's last clip: on past the end of the set.
+        let last = if span.to >= self.length() { OPEN_END } else { span.to };
+        let after = span.playing.get(i + 1).map_or(last, |p| p.0.saturating_sub(1));
         Some((before as i64 - from as i64, after as i64 - to as i64))
     }
 
@@ -2194,6 +2762,13 @@ impl Session {
             return (from, to);
         }
         let start = self.snapshot.clock;
+        // What happens as it stops (the stop, CUE's jump back) goes along;
+        // ended by a jump (a hot cue), that jump begins the next play.
+        let stops = self.events.iter().any(|(at, e)| {
+            *at == start + to
+                && matches!(e, Logged::Command(Command::SetPlaying { deck: d, playing: false }) if *d == deck)
+        });
+        let end = if stops { to + 1 } else { to };
         let (moved, rest): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.events).into_iter().partition(|(at, event)| {
                 deck_of(event) == Some(deck)
@@ -2201,13 +2776,14 @@ impl Session {
                         event,
                         Logged::Command(Command::Load { .. } | Command::Unload { .. })
                     )
-                    && (start + from..=start + to).contains(at)
+                    && (start + from..start + end).contains(at)
             });
         self.events = rest;
         self.events.extend(moved.into_iter().map(|(at, event)| ((at as i64 + by) as u64, event)));
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         // The deck's lanes as edited now follow the events.
         self.curves.retain(|setting, _| setting.deck() != Some(deck));
+        self.stretch_end();
         (landing, (to as i64 + by) as u64)
     }
 
@@ -2287,6 +2863,9 @@ impl Session {
     ) -> Result<u64> {
         let start = self.snapshot.clock;
         let mut mixer = Offline::new(self.rate, &self.snapshot);
+        if run.positions_only() {
+            mixer.positions_only();
+        }
         let mut clock = start;
         let mut frames = 0usize;
         let mut buffer = Vec::new();
@@ -2295,10 +2874,9 @@ impl Session {
             while let Some((at, _)) = events.peek()
                 && *at <= clock
             {
-                let Some((at, event)) = events.next() else { break };
-                if *at < clock {
-                    bail!("the session is out of step at frame {at}");
-                }
+                // One between buffer starts (from an older version's edit)
+                // takes effect at the next one.
+                let Some((_, event)) = events.next() else { break };
                 run.event(event);
                 match event {
                     Logged::Block(n) => frames = *n as usize,
@@ -2368,6 +2946,7 @@ impl Session {
             start: self.snapshot.clock,
             rate: f64::from(self.rate),
             last: [None; crate::engine::DECKS],
+            begins: [0.0; crate::engine::DECKS],
             decks: vec![Played::default(); crate::engine::DECKS],
             mix: Vec::new(),
         };
@@ -2523,6 +3102,29 @@ pub struct Played {
     pub lows: Vec<f32>,
     /// Where the track's beats fell, and whether each starts a bar.
     pub beats: Vec<(u64, bool)>,
+    /// For each buffer (as [`Played::levels`]): where in its track (seconds)
+    /// the deck was as it began, after what was done then (a jump), and
+    /// as it ended.
+    pub places: Vec<(f64, f64)>,
+}
+
+impl Played {
+    /// Where the deck played through `seconds` of its track, moving on (a
+    /// cue point passed, or jumped to and played from): frames from the
+    /// start.
+    pub fn passes(&self, seconds: f64) -> Vec<u64> {
+        let mut at = Vec::new();
+        for (i, &(from, to)) in self.places.iter().enumerate() {
+            if from <= seconds && seconds < to {
+                let Some(&(start, _, _)) = self.levels.get(i) else { break };
+                let end = self.levels.get(i + 1).map_or(start, |l| l.0);
+                // Where in the buffer, if it is the next one on.
+                let share = (seconds - from) / (to - from);
+                at.push(start + (share * end.saturating_sub(start) as f64).round() as u64);
+            }
+        }
+        at
+    }
 }
 
 /// Where two decks' low end (bass, kick) went into the mix together, in
@@ -2583,6 +3185,8 @@ struct Playing<'a> {
     /// Each deck after the last buffer: when (frames from the start), and
     /// where in its track (seconds).
     last: [Option<(u64, f64)>; crate::engine::DECKS],
+    /// Where each deck is as the buffer begins (after what was done then).
+    begins: [f64; crate::engine::DECKS],
     decks: Vec<Played>,
     /// The mix's level after each buffer: start, peak, RMS.
     mix: Vec<(u64, f32, f32)>,
@@ -2596,6 +3200,15 @@ impl Run for Playing<'_> {
             self.tracks[*deck] = source_of(&TRACKS, audio);
             self.last[*deck] = None;
         }
+    }
+
+    fn before(&mut self, _clock: u64, mixer: &mut Offline) -> Result<()> {
+        // Where they are after what was done now (a cue's jump).
+        mixer.settle();
+        for (deck, begins) in self.begins.iter_mut().enumerate() {
+            *begins = mixer.deck(deck).seconds;
+        }
+        Ok(())
     }
 
     fn after(&mut self, clock: u64, buffer: &[f32], mixer: &mut Offline) -> Result<()> {
@@ -2613,6 +3226,7 @@ impl Run for Playing<'_> {
             }
             self.decks[deck].levels.push((from, played, heard));
             self.decks[deck].lows.push(low);
+            self.decks[deck].places.push((self.begins[deck], view.seconds));
             let grid = self.tracks[deck].as_ref().and_then(|path| self.grids.get(path));
             // The beats passed, moving forward and not jumping (a cue, a
             // loop's end): placed between the buffers' ends.
@@ -2637,8 +3251,26 @@ impl Run for Playing<'_> {
     }
 }
 
+/// What a set stretched by an edit keeps after the last thing in it
+/// (seconds), to ring out.
+pub const TAIL_SECS: f64 = 1.0;
+
+/// How far past its end an edit can put a clip (frames): no limit to speak
+/// of; the end moves out after it.
+const OPEN_END: u64 = u64::MAX / 4;
+
+/// A jump while a deck plays makes a play (a clip) of its own from there,
+/// once the play before it is this long (seconds).
+pub const JUMP_SPLIT_SECS: f64 = 0.2;
+
 /// What runs along with a session through the mixer.
 trait Run {
+    /// Only where the decks are is wanted (no sound): the replay is many
+    /// times quicker.
+    fn positions_only(&self) -> bool {
+        false
+    }
+
     /// Each event, as the mixer takes it.
     fn event(&mut self, _event: &Logged) {}
 
@@ -2678,6 +3310,32 @@ fn before_load(
     (stems, levels, gate)
 }
 
+/// What `deck` does that gives way to its track laid over it: jumps, cuts,
+/// plays and stops, loops, moves; with `loads`, loading and stems too.
+fn gives_way(e: &Logged, deck: usize, loads: bool) -> bool {
+    deck_of(e) == Some(deck)
+        && (is_jump(e)
+            || matches!(
+                e,
+                Logged::Command(
+                    Command::Gate { .. }
+                        | Command::SetPlaying { .. }
+                        | Command::ClearLoop { .. }
+                        | Command::MoveTrack { .. }
+                )
+            )
+            || loads
+                && matches!(
+                    e,
+                    Logged::Command(
+                        Command::Load { .. }
+                            | Command::Unload { .. }
+                            | Command::SetStems { .. }
+                            | Command::SetStemLevels { .. }
+                    )
+                ))
+}
+
 /// How [`Places`] stops the replay once it has them all.
 const PLACES_FOUND: &str = "places found";
 
@@ -2693,6 +3351,10 @@ struct Places {
 }
 
 impl Run for Places {
+    fn positions_only(&self) -> bool {
+        true
+    }
+
     fn after(&mut self, clock: u64, _buffer: &[f32], mixer: &mut Offline) -> Result<()> {
         while self.seconds.len() < self.at.len() && self.at[self.seconds.len()] <= clock {
             let view = mixer.deck(self.deck);
@@ -3192,6 +3854,205 @@ mod tests {
         let rendered = session.render_to_wav(&out, Some(&recorded), |_| {}).unwrap();
         let secs = rendered.frames as f64 / f64::from(session.sample_rate());
         eprintln!("{secs:.0} s rendered in {:?}: {:?}", started.elapsed(), rendered.comparison);
+    }
+
+    /// Prints deck 1's clips, plays, edges and events in a real session
+    /// (read only): `DECKHAND_SESSION=… cargo test -p deckhand-audio
+    /// real_deck -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_deck() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let deck: usize = std::env::var("DECKHAND_DECK").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
+        let session = Session::read(&path, Files).unwrap();
+        let start = session.snapshot.clock;
+        println!("length {} warnings {:?}", session.length(), session.warnings());
+        for n in session.nudges() {
+            println!("nudge deck {} {:.2}s–{:.2}s: {:+.1} ms", n.deck + 1, n.from as f64 / f64::from(session.rate), n.to as f64 / f64::from(session.rate), n.shift * 1000.0);
+        }
+        for span in session.tracks().into_iter().filter(|t| t.deck == deck) {
+            println!("clip {:?} {}..{} plays {:?} heard {:?}", span.path.file_name(), span.from, span.to, span.playing, session.heard(&span));
+            for &(from, to) in &span.playing {
+                println!("  play {from}..{to}: edges {:?}", session.play_edges(deck, from, to));
+            }
+        }
+        for (at, e) in &session.events {
+            if deck_of(e) == Some(deck) {
+                let text = match e {
+                    Logged::Command(c) => serde_json::to_string(c).unwrap_or_default().chars().take(90).collect(),
+                    Logged::Jog(_, steps) => format!("jog {steps}"),
+                    _ => String::new(),
+                };
+                println!("{:>9} {text}", at - start);
+            }
+        }
+    }
+
+    /// Moves the start of deck 1's first play 2 s later in a real session,
+    /// in memory, and compares what is heard after it (read only).
+    #[test]
+    #[ignore]
+    fn real_shrink() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let mut session = Session::read(&path, Files).unwrap();
+        let span = session.tracks().into_iter().find(|t| t.deck == 0 && !t.playing.is_empty()).unwrap();
+        let play = span.playing[0];
+        let before = rendered(&session);
+        let wanted = play.0 + 2 * u64::from(session.rate);
+        let edges = session.play_edges(0, play.0, play.1).unwrap();
+        println!("play {play:?} edges {edges:?}");
+        let now = session.resize_play(0, play, (wanted, play.1)).unwrap();
+        println!("now {now:?}");
+        let after = rendered(&session);
+        let from = now.0 as usize * 2 + 2048;
+        let worst = (from..before.len().min(after.len())).map(|i| (before[i] - after[i]).abs()).fold(0f32, f32::max);
+        let early = (0..now.0 as usize * 2).map(|i| (before[i] - after[i]).abs()).fold(0f32, f32::max);
+        println!("after the new start: worst {worst}; before it (deck 1 gone there): {early}");
+        assert!(worst < 1e-3);
+    }
+
+    /// Times what an edit costs in a real session (read only).
+    #[test]
+    #[ignore]
+    fn real_timing() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let mut session = Session::read(&path, Files).unwrap();
+        println!("{} events", session.events.len());
+        let time = |what: &str, f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            f();
+            println!("{what:>28}: {:?}", t.elapsed());
+        };
+        time("tracks", &mut || { session.tracks(); });
+        let spans = session.tracks();
+        time("pieces (all clips)", &mut || { for t in &spans { session.pieces(t); } });
+        let settings = Setting::all(crate::engine::DECKS);
+        time(&format!("lanes ({})", settings.len()), &mut || { for s in &settings { session.lane(*s); } });
+        time("backup (undo step)", &mut || { session.backup().unwrap(); });
+        time("duplicate", &mut || { session.duplicate().unwrap(); });
+        time("played_and_mix (replay)", &mut || { session.played_and_mix().unwrap(); });
+        let span = spans.iter().find(|t| t.deck == 1).unwrap().clone();
+        time("move_clip", &mut || { session.move_clip(1, span.from, 48_000).unwrap(); });
+    }
+
+    /// Compares where each deck is in its track by its tempo lane (as the
+    /// editor draws clips) with where the replay has it (read only).
+    #[test]
+    #[ignore]
+    fn real_drift() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let session = Session::read(&path, Files).unwrap();
+        let rate = f64::from(session.rate);
+        let (played, _) = session.played_and_mix().unwrap();
+        for span in session.tracks() {
+            let lane = session.lane(Setting::Tempo(span.deck));
+            let grid = session.grid(&span.path).map(|g| g.bpm);
+            println!("deck {} {:?} grid {grid:?} tempo lane {:?}", span.deck + 1, span.path.file_name(), lane.iter().take(4).map(|p| (p.at, p.value)).collect::<Vec<_>>());
+            let d = &played[span.deck];
+            for &(from, to) in &span.playing {
+                let i = d.levels.partition_point(|l| l.0 < from);
+                let Some(&(anchor, _)) = d.places.get(i) else { continue };
+                let (mut t, mut model) = (from, anchor);
+                let step = (0.05 * rate) as u64;
+                let mut next_print = from;
+                while t < to {
+                    let j = d.levels.partition_point(|l| l.0 < t);
+                    if t >= next_print && let Some(&(real, _)) = d.places.get(j) && d.levels.get(j).is_some_and(|l| l.0 == t) {
+                        println!("  {:6.1}s model {:8.3} real {:8.3} drift {:+7.1} ms", t as f64 / rate, model, real, (model - real) * 1000.0);
+                        next_print = t + 10 * rate as u64;
+                    }
+                    let n = (t + step).min(to);
+                    model += (n - t) as f64 / rate * lane_value(&lane, t);
+                    t = n;
+                }
+            }
+        }
+    }
+
+    /// Times grabbing and dropping a clip's edge late in a real session
+    /// (read only; in memory).
+    #[test]
+    #[ignore]
+    fn real_resize_timing() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let mut session = Session::read(&path, Files).unwrap();
+        let rate = f64::from(session.rate);
+        let span = session.tracks().into_iter().filter(|t| !t.playing.is_empty()).max_by_key(|t| t.from).unwrap();
+        println!("{} s set; clip at {:.0} s with {} plays", session.length() as f64 / rate, span.from as f64 / rate, span.playing.len());
+        println!("{} events", session.events.len());
+        struct Nothing;
+        impl Run for Nothing {
+            fn positions_only(&self) -> bool { true }
+        }
+        let t = std::time::Instant::now();
+        session.run(session.events.iter(), &mut Nothing).unwrap();
+        println!("whole positions-only replay: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        for (_, e) in &session.events {
+            if let Logged::Command(c) = e { let _ = session.copy(c).unwrap(); }
+        }
+        println!("copying every command: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        session.split_plays(span.deck, span.from).unwrap();
+        println!("split_plays (grab): {:?}", t.elapsed());
+        let span = session.tracks().into_iter().filter(|t| t.deck == span.deck && !t.playing.is_empty()).max_by_key(|t| t.from).unwrap();
+        let play = span.playing[0];
+        let t = std::time::Instant::now();
+        let edges = session.play_edges(span.deck, play.0, play.1).unwrap();
+        println!("play_edges (grab): {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        session.resize_play(span.deck, play, (play.0, (play.1 + 48_000).min(edges.end.1))).unwrap();
+        println!("resize_play (drop, longer): {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        session.duplicate().unwrap();
+        println!("duplicate (redraw copy): {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        session.played_and_mix().unwrap();
+        println!("played_and_mix (redraw, background): {:?}", t.elapsed());
+    }
+
+    /// The quick (positions only) replay puts every deck where the full one
+    /// does, in a real session (read only).
+    #[test]
+    #[ignore]
+    fn real_positions_match() {
+        struct Every {
+            quick: bool,
+            seen: Vec<[f64; crate::engine::DECKS]>,
+        }
+        impl Run for Every {
+            fn positions_only(&self) -> bool {
+                self.quick
+            }
+            fn after(&mut self, _: u64, _: &[f32], mixer: &mut Offline) -> Result<()> {
+                self.seen.push(std::array::from_fn(|d| mixer.deck(d).seconds));
+                Ok(())
+            }
+        }
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let session = Session::read(&path, Files).unwrap();
+        let mut full = Every { quick: false, seen: Vec::new() };
+        let mut quick = Every { quick: true, seen: Vec::new() };
+        session.run(session.events.iter(), &mut full).unwrap();
+        session.run(session.events.iter(), &mut quick).unwrap();
+        assert_eq!(full.seen.len(), quick.seen.len());
+        let worst = full
+            .seen
+            .iter()
+            .zip(&quick.seen)
+            .flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs()))
+            .fold(0.0, f64::max);
+        println!("{} buffers, worst difference {:.9} s", full.seen.len(), worst);
+        let mut shown = 0;
+        for (i, (a, b)) in full.seen.iter().zip(&quick.seen).enumerate() {
+            for d in 0..crate::engine::DECKS {
+                if (a[d] - b[d]).abs() > 1e-6 && shown < 6 {
+                    println!("  buffer {i} deck {}: full {:.6} quick {:.6} (before: {:.6} / {:.6})", d + 1, a[d], b[d], full.seen[i.saturating_sub(1)][d], quick.seen[i.saturating_sub(1)][d]);
+                    shown += 1;
+                }
+            }
+        }
+        assert!(worst < 1e-6);
     }
 
     /// A grid of `bpm` from the start, `secs` long.
@@ -3843,7 +4704,9 @@ mod tests {
         // Back to the track's beginning (it began 1 s in), on to the clip's
         // end (the jump gives way).
         assert_eq!(edges.start.0, from - 48_000);
-        assert_eq!(edges.end.1, session.tracks()[0].to);
+        // On to where the 6 s track runs out (it is 1 s + the play in).
+        let runs_out = to + ((6.0 - 1.0 - (to - from) as f64 / 48_000.0) * 48_000.0) as u64;
+        assert!(edges.end.1.abs_diff(runs_out) <= 1, "{} {runs_out}", edges.end.1);
         // Half a second sooner, half a second longer.
         let (wider_from, wider_to) =
             session.resize_play(0, (from, to), (from - 47 * block, to + 47 * block)).unwrap();
@@ -3968,6 +4831,488 @@ mod tests {
         assert!(bad.is_empty(), "the track, from earlier: {} frames, {:?}..{:?}, from {from}", bad.len(), bad.first(), bad.last());
         assert!(worst(&longer, &before, play.0, play.1) < 1e-4, "the old part in place");
         let _ = std::fs::remove_dir_all(reference_file.parent().unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Every event on a buffer start, as the mixer takes them.
+    fn on_grid(s: &Session) -> Vec<u64> {
+        let mut block = (s.snapshot.clock, 0u64);
+        let mut off = Vec::new();
+        for (at, event) in &s.events {
+            if let Logged::Block(frames) = event {
+                block = (*at, u64::from(*frames));
+            } else if block.1 > 0 && (at - block.0) % block.1 != 0 {
+                off.push(at - s.snapshot.clock);
+            }
+        }
+        off
+    }
+
+    /// A session with `events` (frames from the start) on deck 0, which
+    /// has an 8 s track loaded, and one as played `reference`.
+    fn deck_session(name: &str, events: Vec<(u64, Command)>) -> (Session, PathBuf) {
+        let a = track(48_000, 8.0, 3);
+        let path = PathBuf::from(format!("/music/{name}.wav"));
+        remember_track(&a, &path);
+        let file = record(name, vec![Command::Load { deck: 0, audio: a.clone() }], 6.0);
+        let mut session = Session::read(&file, Tracks([(path, a)].into_iter().collect())).unwrap();
+        let start = session.snapshot.clock;
+        for (at, command) in events {
+            session.events.push((start + at, Logged::Command(command)));
+        }
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        (session, file)
+    }
+
+    fn rendered(s: &Session) -> Vec<f32> {
+        let mut out = Vec::new();
+        s.render(|b| Ok(out.extend_from_slice(b))).unwrap();
+        out
+    }
+
+    fn worst(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max)
+    }
+
+    /// A play made longer runs on over the cue hits deleted after it (each
+    /// a clip of its own, hidden): the track on from where it was, not the
+    /// hits.
+    #[test]
+    fn a_longer_play_takes_over_deleted_cue_hits_after_it() {
+        let block = 512u64;
+        let cue = |at| (at, Command::Seek { deck: 0, seconds: 1.0 });
+        let play = (40 * block, 100 * block);
+        let mut events = vec![cue(10 * block)];
+        for (from, to) in [play, (150 * block, 160 * block), (200 * block, 210 * block)] {
+            events.push((from, Command::SetPlaying { deck: 0, playing: true }));
+            events.push((to, Command::SetPlaying { deck: 0, playing: false }));
+            events.push(cue(to));
+        }
+        let (mut session, file) = deck_session("longer", events);
+        assert!(session.split_plays(0, 0).unwrap());
+        for hit in &session.tracks()[1..] {
+            session.set_pieces(hit, &[]);
+        }
+        let edges = session.play_edges(0, play.0, play.1).unwrap();
+        // On over the hidden hits, to where the 8 s track runs out.
+        let runs_out =
+            play.1 + ((8.0 - 1.0 - (play.1 - play.0) as f64 / 48_000.0) * 48_000.0) as u64;
+        assert!(edges.end.1.abs_diff(runs_out) <= 1, "{} {runs_out}", edges.end.1);
+        let end = 300 * block;
+        assert_eq!(session.resize_play(0, play, (play.0, end)).unwrap(), (play.0, end));
+        let heard: Vec<_> = session.tracks().iter().flat_map(|t| session.heard(t)).collect();
+        assert_eq!(heard, vec![(play.0, end)]);
+        assert!(on_grid(&session).is_empty());
+        let (reference, reference_file) = deck_session("longer-ref", vec![
+            cue(10 * block),
+            (play.0, Command::SetPlaying { deck: 0, playing: true }),
+            (end, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        assert!(worst(&rendered(&session), &rendered(&reference)) < 1e-4, "the track, played on");
+        let _ = std::fs::remove_dir_all(reference_file.parent().unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A play whose end was cut out, made longer: the cut part comes back
+    /// as the track went on, jumps there giving way.
+    #[test]
+    fn a_longer_play_brings_back_its_cut_tail() {
+        let block = 512u64;
+        let play = (40 * block, 300 * block);
+        let (mut session, file) = deck_session("tail", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (play.0, Command::SetPlaying { deck: 0, playing: true }),
+            (100 * block, Command::Gate { deck: 0, open: false }),
+            (150 * block, Command::Seek { deck: 0, seconds: 4.0 }),
+            (play.1, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        // The jump made a clip of its own (as the editor shows it).
+        assert!(session.split_plays(0, 0).unwrap());
+        let first = (play.0, 150 * block);
+        assert_eq!(session.tracks()[0].playing, vec![first]);
+        let end = 200 * block;
+        session.resize_play(0, first, (play.0, end)).unwrap();
+        let heard: Vec<_> = session.tracks().iter().flat_map(|t| session.heard(t)).collect();
+        assert_eq!(heard, vec![(play.0, end)]);
+        let (reference, reference_file) = deck_session("tail-ref", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (play.0, Command::SetPlaying { deck: 0, playing: true }),
+            (end, Command::Gate { deck: 0, open: false }),
+            (play.1, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        let (got, want) = (rendered(&session), rendered(&reference));
+        let bad: Vec<usize> =
+            (0..got.len().min(want.len())).filter(|&i| (got[i] - want[i]).abs() > 1e-4).map(|i| i / 2).collect();
+        assert!(bad.is_empty(), "{} frames differ, {:?}..{:?}; events {:?}", bad.len(), bad.first(), bad.last(),
+            session.events.iter().filter(|(_, e)| deck_of(e) == Some(0)).map(|(at, e)| (at - session.snapshot.clock, match e { Logged::Command(c) => serde_json::to_string(c).unwrap_or_default().chars().take(60).collect::<String>(), _ => String::new() })).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(reference_file.parent().unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A play made longer up into a track loaded after it, before that is
+    /// heard: the later track is loaded where the play ends now, as it was.
+    #[test]
+    fn a_longer_play_leaves_the_next_track_as_it_was() {
+        let block = 512u64;
+        let play = (40 * block, 100 * block);
+        let later = (250 * block, 350 * block);
+        let events = |end: u64, load: u64| {
+            vec![
+                (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+                (play.0, Command::SetPlaying { deck: 0, playing: true }),
+                (end, Command::SetPlaying { deck: 0, playing: false }),
+                (load, Command::Seek { deck: 0, seconds: 2.0 }),
+                (later.0, Command::SetPlaying { deck: 0, playing: true }),
+                (later.1, Command::SetPlaying { deck: 0, playing: false }),
+            ]
+        };
+        let reload = |s: &mut Session, at: u64| {
+            let audio = s.events.iter().find_map(|(_, e)| match e {
+                Logged::Command(Command::Load { audio, .. }) => Some(audio.clone()),
+                _ => None,
+            }).unwrap();
+            let start = s.snapshot.clock;
+            let i = s.events.partition_point(|(t, _)| *t < start + at);
+            s.events.insert(i, (start + at, Logged::Command(Command::Load { deck: 0, audio })));
+        };
+        let (mut session, file) = deck_session("next", events(play.1, 150 * block));
+        reload(&mut session, 150 * block);
+        let edges = session.play_edges(0, play.0, play.1).unwrap();
+        assert_eq!(edges.end.1, later.0, "up to where the next is heard");
+        let end = 200 * block;
+        session.resize_play(0, play, (play.0, end)).unwrap();
+        assert!(on_grid(&session).is_empty());
+        // As if played that way: cut there (faded out), the next track
+        // loaded a buffer on.
+        let mut played = events(end + block, end + block);
+        played.push((end, Command::Gate { deck: 0, open: false }));
+        let (mut reference, reference_file) = deck_session("next-ref", played);
+        reload(&mut reference, end + block);
+        let heard = |s: &Session| s.tracks().iter().flat_map(|t| s.heard(t)).collect::<Vec<_>>();
+        assert_eq!(heard(&session), heard(&reference));
+        assert!(worst(&rendered(&session), &rendered(&reference)) < 1e-4);
+        let _ = std::fs::remove_dir_all(reference_file.parent().unwrap());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Cue hits deleted are gone from the session, not just silenced; a
+    /// track the deleted one was loaded over stops where it did.
+    #[test]
+    fn deleted_clips_are_gone() {
+        let block = 512u64;
+        let cue = |at| (at, Command::Seek { deck: 0, seconds: 1.0 });
+        let play = (40 * block, 100 * block);
+        let mut events = vec![cue(10 * block)];
+        for (from, to) in [play, (150 * block, 160 * block), (200 * block, 210 * block)] {
+            events.push((from, Command::SetPlaying { deck: 0, playing: true }));
+            events.push((to, Command::SetPlaying { deck: 0, playing: false }));
+            events.push(cue(to));
+        }
+        let (mut session, file) = deck_session("gone", events);
+        session.split_plays(0, 0).unwrap();
+        let hits: Vec<TrackSpan> = session.tracks()[1..].to_vec();
+        for hit in &hits {
+            session.set_pieces(hit, &[]);
+        }
+        let plays = |s: &Session| {
+            s.events.iter().filter(|(_, e)| matches!(e, Logged::Command(Command::SetPlaying { .. }))).count()
+        };
+        assert_eq!(session.tracks().len(), 1, "one clip left");
+        assert_eq!(plays(&session), 2, "the play and its stop");
+        let (reference, reference_file) = deck_session("gone-ref", vec![
+            cue(10 * block),
+            (play.0, Command::SetPlaying { deck: 0, playing: true }),
+            (play.1, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        assert!(worst(&rendered(&session), &rendered(&reference)) < 1e-4);
+
+        // Loaded over the play, then deleted: the play stops there.
+        let (mut session, file2) = deck_session("over", vec![
+            cue(10 * block),
+            (play.0, Command::SetPlaying { deck: 0, playing: true }),
+        ]);
+        let audio = session.events.iter().find_map(|(_, e)| match e {
+            Logged::Command(Command::Load { audio, .. }) => Some(audio.clone()),
+            _ => None,
+        }).unwrap();
+        let start = session.snapshot.clock;
+        for (at, command) in [
+            (play.1, Command::Load { deck: 0, audio }),
+            (play.1, Command::SetPlaying { deck: 0, playing: true }),
+            (150 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ] {
+            session.events.push((start + at, Logged::Command(command)));
+        }
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        let over = session.tracks()[1].clone();
+        session.set_pieces(&over, &[]);
+        assert_eq!(session.tracks().len(), 1);
+        assert!(worst(&rendered(&session), &rendered(&reference)) < 1e-4, "stops where it was loaded over");
+        for f in [file, file2, reference_file] {
+            let _ = std::fs::remove_dir_all(f.parent().unwrap());
+        }
+    }
+
+    /// A play made to start sooner can be made to start later again.
+    #[test]
+    fn a_sooner_play_shrinks_back() {
+        let block = 512u64;
+        let play = (40 * block, 300 * block);
+        let (mut session, file) = deck_session("back", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (play.0, Command::SetPlaying { deck: 0, playing: true }),
+            (play.1, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        let sooner = session.resize_play(0, play, (20 * block, play.1)).unwrap();
+        assert_eq!(sooner, (20 * block, play.1));
+        let edges = session.play_edges(0, sooner.0, sooner.1);
+        eprintln!("{edges:?} tracks {:?}", session.tracks().iter().map(|t| (t.from, t.to, t.playing.clone())).collect::<Vec<_>>());
+        let edges = edges.expect("still a play");
+        assert!(edges.start.1 > sooner.0, "can start later: {edges:?}");
+        let later = session.resize_play(0, sooner, (60 * block, play.1)).unwrap();
+        assert_eq!(later, (60 * block, play.1));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A session exported with its songs opens, and sounds the same, with
+    /// the songs gone from where they were.
+    #[test]
+    fn an_exported_session_finds_its_songs() {
+        // A song on disk: a recording of a track playing.
+        let t = track(48_000, 3.0, 2);
+        remember_track(&t, Path::new("/music/export-src.wav"));
+        let made = record("export-song", vec![
+            Command::Load { deck: 0, audio: t.clone() },
+            Command::SetPlaying { deck: 0, playing: true },
+        ], 2.5);
+        let song_dir = std::env::temp_dir().join(format!("deckhand-export-music-{}", std::process::id()));
+        std::fs::create_dir_all(&song_dir).unwrap();
+        let song = song_dir.join("song.wav");
+        std::fs::copy(made.with_extension("wav"), &song).unwrap();
+        let audio = Arc::new(crate::decode::decode_file(&song).unwrap());
+        remember_track(&audio, &song);
+        let file = record("export-set", vec![
+            Command::Load { deck: 0, audio },
+            Command::SetPlaying { deck: 0, playing: true },
+        ], 2.0);
+        let session = Session::read(&file, Files).unwrap();
+        let before = rendered(&session);
+
+        let out = std::env::temp_dir().join(format!("deckhand-exported-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        session.write(&out.join("set.session")).unwrap();
+        let tracks: Vec<PathBuf> = session.track_files().into_iter().map(|t| t.0).collect();
+        let done = export_files(&out, &tracks, None).unwrap();
+        assert_eq!((done.tracks, done.missing.len()), (1, 0));
+        drop(session);
+        std::fs::remove_dir_all(&song_dir).unwrap();
+
+        let exported = Session::read(&out.join("set.session"), Files).unwrap();
+        assert!(exported.warnings().is_empty(), "{:?}", exported.warnings());
+        assert!(worst(&rendered(&exported), &before) < 1e-6);
+        assert_eq!(exported.track_files()[0].0, song, "named as it was");
+        for dir in [out, made.parent().unwrap().to_path_buf(), file.parent().unwrap().to_path_buf()] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A hot cue pressed while playing starts a clip of its own there;
+    /// a jump just after the play began (dragging the needle) doesn't.
+    /// Separated, it sounds the same.
+    #[test]
+    fn a_hot_cue_starts_a_clip() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("hotcue", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (42 * block, Command::Seek { deck: 0, seconds: 1.5 }),
+            (150 * block, Command::Seek { deck: 0, seconds: 4.0 }),
+            (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        assert_eq!(session.tracks()[0].playing, vec![(40 * block, 150 * block), (150 * block, 300 * block)]);
+        let before = rendered(&session);
+        assert!(session.split_plays(0, 0).unwrap());
+        let spans = session.tracks();
+        assert_eq!(
+            spans.iter().map(|t| t.playing.clone()).collect::<Vec<_>>(),
+            [vec![(40 * block, 150 * block)], vec![(150 * block, 300 * block)]]
+        );
+        assert!(worst(&rendered(&session), &before) < 1e-5, "sounds the same");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A play made longer past the end of the set: the set grows to take
+    /// it, the track playing on.
+    #[test]
+    fn a_play_runs_on_past_the_end() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("past", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 0.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (100 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        let length = session.length();
+        let play = (40 * block, 100 * block);
+        let end = session.snap(length + 48_000);
+        assert_eq!(session.resize_play(0, play, (play.0, end)).unwrap(), (play.0, end));
+        assert!(session.length() >= end + 48_000 - block, "{} for {end}", session.length());
+        let heard: Vec<_> = session.tracks().iter().flat_map(|t| session.heard(t)).collect();
+        assert_eq!(heard, vec![(play.0, end)]);
+        let out = rendered(&session);
+        assert_eq!(out.len() as u64, session.length() * 2);
+        // The track (a click every so often) still sounding past the old end.
+        let past = &out[(length as usize + 1000) * 2..(end as usize - 1000) * 2];
+        assert!(past.iter().any(|s| s.abs() > 0.01));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A cue point is found where the deck played through it, and where a
+    /// jump landed on it and played on, not where it jumped away.
+    #[test]
+    fn cue_passes() {
+        let played = Played {
+            levels: (0..6).map(|i| (i * 100, 0.5, 0.5)).collect(),
+            lows: vec![0.0; 6],
+            beats: Vec::new(),
+            // Plays 1.0 → 1.2, jumps back to 1.0 (a hot cue) and plays on,
+            // then stops at 2.0.
+            places: vec![(0.8, 0.9), (0.9, 1.1), (1.1, 1.2), (1.0, 1.1), (2.0, 2.0), (2.0, 2.0)],
+        };
+        assert_eq!(played.passes(1.0), vec![150, 300]);
+        assert!(played.passes(2.0).is_empty(), "stopped there, not played through");
+    }
+
+    /// A clip split in two: two clips of their own, sounding the same.
+    #[test]
+    fn a_split_clip_is_two_clips() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("split2", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        let before = rendered(&session);
+        assert_eq!(session.split_clip(0, 150 * block + 100).unwrap(), 150 * block);
+        let spans = session.tracks();
+        assert_eq!(
+            spans.iter().map(|t| t.playing.clone()).collect::<Vec<_>>(),
+            [vec![(40 * block, 150 * block)], vec![(150 * block, 300 * block)]]
+        );
+        assert!(worst(&rendered(&session), &before) < 1e-5, "sounds the same");
+        // The second moves on its own, the first stays.
+        session.move_clip(0, 150 * block, 20 * block as i64).unwrap();
+        assert_eq!(session.tracks()[0].playing, vec![(40 * block, 150 * block)]);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A nudge is found with what it moved the track; taken out keeping
+    /// step, all after it sounds as it did.
+    #[test]
+    fn nudges_come_out_in_step() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("nudge", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (100 * block, Command::SetNudge { deck: 0, amount: 0.1 }),
+            (110 * block, Command::SetNudge { deck: 0, amount: 0.05 }),
+            (120 * block, Command::SetNudge { deck: 0, amount: 0.0 }),
+            (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        let nudges = session.nudges();
+        assert_eq!(nudges.len(), 1);
+        let n = nudges[0];
+        assert_eq!((n.from, n.to), (100 * block, 120 * block));
+        let expected = (0.1 + 0.05) * (10 * block) as f64 / 48_000.0;
+        assert!((n.shift - expected).abs() < 1e-9, "{} {expected}", n.shift);
+        let before = rendered(&session);
+        assert_eq!(session.remove_nudges(0, 0, session.length(), true), 1);
+        assert!(session.nudges().is_empty());
+        let after = rendered(&session);
+        let from = (120 * block) as usize * 2;
+        let worst = (from..before.len().min(after.len())).map(|i| (before[i] - after[i]).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-3, "in step after it: {worst}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Deleting the middle of a clip leaves two clips of their own, the
+    /// rest sounding as it did.
+    #[test]
+    fn deleting_the_middle_leaves_two_clips() {
+        let block = 512u64;
+        let events = vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ];
+        let (mut session, file) = deck_session("middle", events);
+        let before = rendered(&session);
+        session.delete_range(0, 100 * block, 200 * block).unwrap();
+        let spans = session.tracks();
+        let heard: Vec<_> = spans.iter().flat_map(|t| session.heard(t)).collect();
+        assert_eq!(heard, vec![(40 * block, 100 * block), (200 * block, 300 * block)]);
+        assert_eq!(spans.iter().filter(|t| !t.playing.is_empty()).count(), 2, "two clips");
+        let after = rendered(&session);
+        let same = |a: u64, b: u64| (a as usize * 2..b as usize * 2).map(|i| (before[i] - after[i]).abs()).fold(0f32, f32::max);
+        assert!(same(0, 100 * block) < 1e-5, "before it as it was");
+        assert!(same(200 * block, 300 * block) < 1e-5, "after it as it was");
+        assert!(after[(110 * block) as usize * 2..(190 * block) as usize * 2].iter().all(|s| s.abs() < 1e-6), "silent between");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A delete cutting where the deck stood still leaves no silent clips
+    /// behind: only what is heard stays in the session.
+    #[test]
+    fn deleting_leaves_no_silent_clips() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("silent", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (100 * block, Command::SetPlaying { deck: 0, playing: false }),
+            (200 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        // From before the first play to the gap after it (both still).
+        session.delete_range(0, 20 * block, 150 * block).unwrap();
+        let spans = session.tracks();
+        assert!(spans.iter().all(|t| !session.heard(t).is_empty()), "{:?}", spans.iter().map(|t| (t.from, t.to, t.playing.clone())).collect::<Vec<_>>());
+        let heard: Vec<_> = spans.iter().flat_map(|t| session.heard(t)).collect();
+        assert_eq!(heard, vec![(200 * block, 300 * block)]);
+        let loads = session.events.iter().filter(|(_, e)| matches!(e, Logged::Command(Command::Load { .. }))).count();
+        assert_eq!(loads, 1, "one load, for the clip left");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Edits keep every event on a buffer start, and a session that has one
+    /// off them (from an older version) still plays.
+    #[test]
+    fn edits_stay_on_buffer_starts() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("grid", vec![
+            (0, Command::SetPlaying { deck: 0, playing: true }),
+        ]);
+        // A second clip: the track loaded again.
+        let audio = session.snapshot.deck(0).0.cloned().or_else(|| session.events.iter().find_map(|(_, e)| match e {
+            Logged::Command(Command::Load { audio, .. }) => Some(audio.clone()),
+            _ => None,
+        })).unwrap();
+        let start = session.snapshot.clock;
+        session.events.push((start + 200 * block, Logged::Command(Command::Load { deck: 0, audio })));
+        session.events.push((start + 200 * block, Logged::Command(Command::SetPlaying { deck: 0, playing: true })));
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        // Up against the clip before it.
+        let landed = session.move_clip(0, 200 * block, -(250 * block as i64)).unwrap();
+        assert_eq!(landed, block);
+        assert!(on_grid(&session).is_empty(), "{:?}", on_grid(&session));
+        // A piece ending just before its clip does.
+        let span = session.tracks()[0].clone();
+        session.set_pieces(&span, &[(0, span.to - 10)]);
+        assert!(on_grid(&session).is_empty(), "{:?}", on_grid(&session));
+        // One off: played at the next buffer start.
+        let start = session.snapshot.clock;
+        session.events.push((start + 300 * block + 7, Logged::Command(Command::Gate { deck: 0, open: false })));
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        rendered(&session);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 

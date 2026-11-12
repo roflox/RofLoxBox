@@ -188,6 +188,8 @@ pub struct Preferences {
     pub key_notation: crate::deck::KeyNotation,
     /// The track lists light up keys that mix with the master deck's.
     pub highlight_compatible_keys: bool,
+    /// EDIT: the view moves along with the playhead while playing.
+    pub edit_follow_playhead: bool,
     pub theme: Theme,
     /// Text size in percent of the normal size.
     pub text_scale: u32,
@@ -312,6 +314,7 @@ impl Default for Preferences {
             memory_call_lock: true,
             key_notation: Default::default(),
             highlight_compatible_keys: false,
+            edit_follow_playhead: false,
             theme: Theme::Dark,
             text_scale: 100,
             stem_model: String::new(),
