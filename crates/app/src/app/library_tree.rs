@@ -567,7 +567,7 @@ impl DeckhandApp {
             ui.add_space(6.0);
             if ui
                 .small_button("Open export folder…")
-                .on_hover_text("A folder holding a rekordbox export (with a PIONEER folder)")
+                .on_hover_text("A folder with a PIONEER folder")
                 .clicked()
                 && let Some(root) = rfd::FileDialog::new()
                     .set_title("Choose the root of a rekordbox USB export")
@@ -646,7 +646,7 @@ impl DeckhandApp {
                 && ui
                     .small_button("Import")
                     .on_hover_text(
-                        "Copy its music and rekordbox's analysis to this computer and add its tracks, cues and playlists to the collection",
+                        "Copy tracks, cues and playlists to this computer",
                     )
                     .clicked()
             {
@@ -657,7 +657,7 @@ impl DeckhandApp {
             } else if removable {
                 if ui
                     .small_button("Eject")
-                    .on_hover_text("Eject safely: decks keep playing what they have loaded")
+                    .on_hover_text("Eject; loaded decks keep playing")
                     .clicked()
                 {
                     action = Some(true);

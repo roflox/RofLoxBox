@@ -48,6 +48,9 @@ pub struct Config {
     /// Beat grid edit was moved next to GATE in saved layouts once.
     #[serde(default)]
     pub grid_moved: bool,
+    /// Tours (by id) finished or skipped; auto tours don't run again.
+    #[serde(default)]
+    pub tours_done: Vec<String>,
     #[serde(default)]
     pub prefs: Preferences,
     /// Collection folders shown closed in the sidebar.
@@ -468,6 +471,7 @@ impl Default for Config {
             number_column_added: true,
             preview_column_added: true,
             grid_moved: true,
+            tours_done: Vec::new(),
             prefs: Preferences::default(),
             recordings_dir: None,
             collapsed_folders: Vec::new(),

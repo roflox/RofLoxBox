@@ -249,21 +249,23 @@ impl ViewSettings {
 }
 
 impl LayoutPreset {
-    /// Presets that come with the app.
-    pub fn built_in() -> Vec<LayoutPreset> {
+    /// Presets that come with the app; "Default" is the one for the deck
+    /// count (`four`).
+    pub fn built_in(four: bool) -> Vec<LayoutPreset> {
+        let default = if four { DeckLayout::four_decks() } else { DeckLayout::default() };
         let preset = |name: &str, layout, view| LayoutPreset {
             name: name.to_owned(),
             layout,
             view: Some(view),
         };
         vec![
-            preset("Default", DeckLayout::default(), ViewSettings::default()),
+            preset("Default", default.clone(), ViewSettings::default()),
             preset("Everything", DeckLayout::everything(), ViewSettings::default()),
             // The controller is the mixer: waveforms between the decks, no
             // mixer on screen.
             preset(
                 "Vertical, mixer on the controller",
-                DeckLayout::default(),
+                default,
                 ViewSettings {
                     vertical_waveforms: true,
                     show_mixer: false,
@@ -306,9 +308,13 @@ impl DeckLayout {
 }
 
 impl DeckLayout {
-    /// The four-deck default (the same as for two decks).
+    /// The four-deck default: as for two decks, plus the memory cue jumps
+    /// and MEMORY / DELETE (on the GATE row).
     pub fn four_decks() -> Self {
-        Self::default()
+        let mut layout = Self::default();
+        layout.set_shown(DeckElement::MemoryCall, true);
+        layout.set_shown(DeckElement::MemorySet, true);
+        layout
     }
 
     pub fn is_shown(&self, element: DeckElement) -> bool {
@@ -433,6 +439,17 @@ mod tests {
             DeckElement::GROUPS.iter().flat_map(|(_, e)| e.iter().copied()).collect();
         assert_eq!(grouped.len(), DeckElement::ALL.len());
         assert!(DeckElement::ALL.iter().all(|e| grouped.contains(e)));
+    }
+
+    #[test]
+    fn four_deck_default_jumps_to_memory_cues() {
+        let four = DeckLayout::four_decks();
+        assert!(four.is_shown(DeckElement::MemoryCall));
+        assert!(four.is_shown(DeckElement::MemorySet));
+        assert!(!DeckLayout::default().is_shown(DeckElement::MemoryCall));
+        let default = |four| LayoutPreset::built_in(four).remove(0).layout;
+        assert_eq!(default(true), four);
+        assert_eq!(default(false), DeckLayout::default());
     }
 
     #[test]

@@ -4,9 +4,11 @@ use eframe::egui::{self, RichText, Ui};
 
 use crate::config::{CrossfaderCurveSetting, FaderCurveSetting, Preferences, Theme};
 use crate::deck::TempoRange;
+use crate::widgets::help;
 
 /// Pages of the Preferences window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PrefsTab {
     #[default]
     Deck,
@@ -42,9 +44,15 @@ impl PrefsTab {
     }
 }
 
-fn section(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
+/// A titled group; `help` (if any) sits behind a "?" after the title.
+fn section(ui: &mut Ui, title: &str, help: &str, body: impl FnOnce(&mut Ui)) {
     ui.add_space(6.0);
-    ui.label(RichText::new(title).strong().size(15.0));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong().size(15.0));
+        if !help.is_empty() {
+            crate::widgets::help(ui, help);
+        }
+    });
     ui.indent(title, body);
 }
 
@@ -62,29 +70,19 @@ fn lock(ui: &mut Ui, locked: &mut bool) -> bool {
 /// anything changed.
 pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
     let before = (p.theme, p.text_scale);
-    section(ui, "Theme", |ui| {
+    section(ui, "Theme", "Waveforms stay dark.", |ui| {
         ui.radio_value(&mut p.theme, Theme::Dark, "Dark");
         ui.radio_value(&mut p.theme, Theme::Light, "Light");
         ui.radio_value(&mut p.theme, Theme::System, "System")
-            .on_hover_text("Follows the system's light or dark appearance.");
-        ui.label(
-            RichText::new("Waveforms stay dark, so their colors keep reading.").small().weak(),
-        );
+            .on_hover_text("Follows the system");
     });
-    section(ui, "Text size", |ui| {
+    section(ui, "Text size", "Lists, menus and windows; not deck labels.", |ui| {
         ui.horizontal(|ui| {
             ui.add(egui::Slider::new(&mut p.text_scale, 50..=200).suffix(" %").step_by(5.0));
             if ui.add_enabled(p.text_scale != 100, egui::Button::new("Reset")).clicked() {
                 p.text_scale = 100;
             }
         });
-        ui.label(
-            RichText::new(
-                "Text in lists, menus and windows. Deck and waveform labels keep their size.",
-            )
-            .small()
-            .weak(),
-        );
     });
     (p.theme, p.text_scale) != before
 }
@@ -93,140 +91,70 @@ pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
 pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
     let before = p.clone();
     egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
-        section(ui, "Eject/Load Lock", |ui| {
+        section(ui, "Eject/Load Lock", "Locked: no loading onto a playing deck.", |ui| {
             lock(ui, &mut p.load_lock);
-            ui.label(RichText::new("Locked: no loading onto a playing deck.").small().weak());
         });
-        section(ui, "Auto Gain", |ui| {
+        section(ui, "Auto Gain", "Evens out loudness. Drag a deck's dB value to change it.", |ui| {
             ui.checkbox(&mut p.auto_gain, "Play tracks at their track gain");
-            ui.label(
-                RichText::new(
-                    "Each track gets a gain from its loudness when it is first loaded, so tracks \
-                     play equally loud. Drag the dB value on a deck to change it; collection \
-                     tracks keep it.",
-                )
-                .small()
-                .weak(),
-            );
         });
-        section(ui, "Track End Warning", |ui| {
+        section(ui, "Track End Warning", "Blinks the deck red this long before the end.", |ui| {
             ui.add(
                 egui::Slider::new(&mut p.track_end_warning, 0..=60)
                     .suffix(" s")
                     .custom_formatter(|v, _| if v == 0.0 { "Off".into() } else { format!("{v:.0}") }),
             );
-            ui.label(
-                RichText::new(
-                    "The small waveform and the remaining time of a playing deck blink red this \
-                     long before the end, faster in the last 10 seconds.",
-                )
-                .small()
-                .weak(),
-            );
         });
-        section(ui, "Needle Lock", |ui| {
+        section(ui, "Needle Lock", "Locked: the small waveform of a playing deck doesn't jump.", |ui| {
             lock(ui, &mut p.needle_lock);
-            ui.label(RichText::new("Locked: clicking the small waveform of a playing deck does not jump. The big waveform always jumps.").small().weak());
         });
-        section(ui, "EDIT", |ui| {
+        section(ui, "EDIT", "The view scrolls along while playing.", |ui| {
             ui.checkbox(&mut p.edit_follow_playhead, "Follow playhead");
-            ui.label(
-                RichText::new("While a set plays in EDIT, the view moves along when the playhead runs off it. Also on EDIT's toolbar.")
-                    .small()
-                    .weak(),
-            );
         });
-        section(ui, "Key display format", |ui| {
+        section(ui, "Key display format", "On decks and in lists.", |ui| {
             use crate::deck::KeyNotation;
             ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
             ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
-            ui.label(RichText::new("On the decks and in the track lists, whatever the tags say.").small().weak());
-            ui.checkbox(&mut p.highlight_compatible_keys, "Highlight compatible keys in the track lists");
-            ui.label(
-                RichText::new("Keys that mix with the master deck's (same key, ±1 on the wheel, relative major/minor) light up green.")
-                    .small()
-                    .weak(),
-            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut p.highlight_compatible_keys, "Highlight compatible keys in the track lists");
+                help(ui, "Keys that mix with the master deck's turn green.");
+            });
         });
-        section(ui, "Waveform detail", |ui| {
+        section(ui, "Waveform detail", "High is sharper when zoomed in. For newly loaded tracks.", |ui| {
             use crate::waveform::WaveformDetail;
             ui.radio_value(&mut p.waveform_detail, WaveformDetail::Standard, "Standard (rekordbox's)");
             ui.radio_value(&mut p.waveform_detail, WaveformDetail::High, "High (4× finer)");
-            ui.label(
-                RichText::new(
-                    "High works the decks' waveforms out from the audio at 600 columns a second \
-                     instead of 150: sharper when zoomed in, a finer overview, colours from the \
-                     bands. For tracks loaded from now on.",
-                )
-                .small()
-                .weak(),
-            );
         });
-        section(ui, "Analysis", |ui| {
+        section(ui, "Analysis", "For tracks rekordbox hasn't analysed.", |ui| {
             use crate::deck::AnalysisMethod;
             ui.radio_value(&mut p.analysis, AnalysisMethod::Rekordbox, "rekordbox-compatible");
             ui.radio_value(&mut p.analysis, AnalysisMethod::Deckhand, "RofLoxBox (quicker)");
-            ui.label(
-                RichText::new(
-                    "Waveforms for tracks rekordbox has not analysed, on the decks and on exported \
-                     sticks. rekordbox-compatible ones are identical to rekordbox's.",
-                )
-                .small()
-                .weak(),
-            );
-            ui.checkbox(&mut p.analyze_on_load, "Analyze BPM, beat grid and key on load");
-            ui.label(
-                RichText::new(
-                    "A loaded track without a beat grid or key gets them detected in the \
-                     background (RofLoxBox's own detection; rekordbox's grids and keys and \
-                     ones you edited are kept). Collection tracks keep the result.",
-                )
-                .small()
-                .weak(),
-            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut p.analyze_on_load, "Analyze BPM, beat grid and key on load");
+                help(ui, "Only for tracks missing them; edited ones are kept.");
+            });
         });
-        section(ui, "Tempo ranges", |ui| {
+        section(ui, "Tempo ranges", "TEMPO RANGE steps through these. WIDE is ±100 %.", |ui| {
             tempo_ranges(ui, &mut p.tempo_ranges);
         });
-        section(ui, "Beat Sync master", |ui| {
+        section(ui, "Beat Sync master", "The loudest playing deck takes over.", |ui| {
             ui.checkbox(&mut p.auto_master, "Pass MASTER on when the master deck leaves the mix");
-            ui.label(
-                RichText::new(
-                    "When the master is paused, ejected or faded out (channel fader or \
-                     crossfader), the loudest other playing deck becomes the master; synced \
-                     decks then follow it.",
-                )
-                .small()
-                .weak(),
-            );
         });
-        section(ui, "Memory Cue Call Lock", |ui| {
+        section(ui, "Memory Cue Call Lock", "Locked: no memory cue calls on a playing deck.", |ui| {
             lock(ui, &mut p.memory_call_lock);
-            ui.label(RichText::new("Locked: memory cues are not called on a playing deck.").small().weak());
         });
-        section(ui, "CALL ◀ ▶ during loop playback", |ui| {
+        section(ui, "CALL ◀ ▶ during loop playback", "Loop ½ / ×2 can also be mapped in Controller.", |ui| {
             ui.radio_value(&mut p.call_resizes_loop, false, "Moves between memory cues and loops");
             ui.radio_value(&mut p.call_resizes_loop, true, "Halves / doubles the loop (Pioneer)");
-            ui.label(
-                RichText::new("Loop ½ / ×2 can also get buttons of their own: map loop_resize_half / loop_resize_double in the Controller window.")
-                    .small()
-                    .weak(),
-            );
         });
-        section(ui, "Hot Cue Gate", |ui| {
+        section(ui, "Hot Cue Gate", "On: a hot cue on a playing deck also stops on release.", |ui| {
             ui.checkbox(&mut p.gate_while_playing, "Gate also while playing");
-            ui.label(
-                RichText::new("With GATE on, a hot cue pressed on a paused deck plays while held, then returns and pauses. Off (like rekordbox): on a playing deck it just jumps and keeps playing. On: it stops on release there too.")
-                    .small()
-                    .weak(),
-            );
         });
-        section(ui, "Load", |ui| {
-            ui.checkbox(&mut p.start_at_first_cue, "Playback starts at Memory/Hot Cue nearest to the beginning of the track");
+        section(ui, "Load", "", |ui| {
+            ui.checkbox(&mut p.start_at_first_cue, "Start at the first cue");
             ui.checkbox(&mut p.instant_doubles, "Instant Doubles")
-                .on_hover_text("Loading a track that plays on another deck continues from the same position, at the same tempo");
+                .on_hover_text("Loading a playing track picks up where it is");
         });
-        section(ui, "Auto Cue", |ui| {
+        section(ui, "Auto Cue", "On load, cue where the music starts.", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Auto Cue Level");
                 egui::ComboBox::from_id_salt("auto cue level")
@@ -242,18 +170,16 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
                     ui.checkbox(&mut p.auto_cue[deck], format!("Deck {}", deck + 1));
                 }
             });
-            ui.label(RichText::new("On load, the cue point goes to where the music starts (louder than the level).").small().weak());
         });
-        section(ui, "Vinyl Speed Adjust", |ui| {
+        section(ui, "Vinyl Speed Adjust", "0 s is instant.", |ui| {
             ui.add(egui::Slider::new(&mut p.vinyl_start, 0.0..=1.0).suffix(" s").text("Touch/Release (start up)"));
             ui.add(egui::Slider::new(&mut p.vinyl_brake, 0.0..=3.0).suffix(" s").text("Brake (stop)"));
-            ui.label(RichText::new("0 s starts and stops instantly; longer feels like a turntable motor.").small().weak());
         });
-        section(ui, "Jog", |ui| {
+        section(ui, "Jog", "", |ui| {
             ui.add(egui::Slider::new(&mut p.scratch_sensitivity, 0.25..=3.0).text("Scratch sensitivity"))
-                .on_hover_text("Touching the top with VINYL on");
+                .on_hover_text("Jog top, VINYL on");
             ui.add(egui::Slider::new(&mut p.bend_sensitivity, 0.25..=4.0).text("Pitch bend sensitivity"))
-                .on_hover_text("Spinning the side (or the top with VINYL off): faster spin, bigger bend");
+                .on_hover_text("Jog side, or top with VINYL off");
         });
         ui.add_space(8.0);
         if ui.button("Reset to defaults").clicked() {
@@ -289,23 +215,23 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
 /// Mixer settings; returns whether anything changed.
 pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
     let before = p.clone();
-    section(ui, "Crossfader Curve", |ui| {
+    section(ui, "Crossfader Curve", "", |ui| {
         for curve in CrossfaderCurveSetting::ALL {
             ui.radio_value(&mut p.crossfader_curve, curve, curve.label());
         }
     });
-    section(ui, "Channel Fader Curve", |ui| {
+    section(ui, "Channel Fader Curve", "", |ui| {
         for curve in FaderCurveSetting::ALL {
             ui.radio_value(&mut p.fader_curve, curve, curve.label());
         }
     });
-    section(ui, "EQ Type", |ui| {
+    section(ui, "EQ Type", "Defaults as on the DJM-900NXS2.", |ui| {
         ui.radio_value(
             &mut p.isolator,
             true,
-            "Isolator: splits into 3 bands, fully left removes a band (+6 dB … −∞)",
+            "Isolator (+6 dB … −∞)",
         );
-        ui.radio_value(&mut p.isolator, false, "EQ: shelf / peak filters (+6 dB … −26 dB)");
+        ui.radio_value(&mut p.isolator, false, "EQ (+6 dB … −26 dB)");
         let hz =
             |ui: &mut Ui, value: &mut f32, label: &str, range: std::ops::RangeInclusive<f32>| {
                 ui.add(egui::Slider::new(value, range).logarithmic(true).suffix(" Hz").text(label));
@@ -318,20 +244,15 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             hz(ui, &mut p.eq_mid_hz, "MID", 300.0..=4_000.0);
             hz(ui, &mut p.eq_high_hz, "HI", 3_000.0..=16_000.0);
         }
-        ui.label(
-            RichText::new("Defaults: EQ 70 Hz / 1 kHz / 13 kHz like Pioneer's DJM-900NXS2; isolator split 250 Hz / 4 kHz.")
-                .small()
-                .weak(),
-        );
     });
-    section(ui, "Waveform", |ui| {
+    section(ui, "Waveform", "", |ui| {
         ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
-            .on_hover_text("Bands turned down with the EQ knobs shrink in the waveforms");
+            .on_hover_text("Cut bands shrink in the waveforms");
         ui.checkbox(&mut p.scroll_zoom, "Scroll over a waveform to zoom").on_hover_text(
-            "The mouse wheel, or a trackpad's scroll or pinch, zooms the scrolling waveforms",
+            "Wheel, scroll or pinch",
         );
     });
-    section(ui, "Master Limiter", |ui| {
+    section(ui, "Master Limiter", "", |ui| {
         ui.checkbox(&mut p.limiter, "Soften peaks before they clip");
     });
     ui.add_space(8.0);
@@ -385,12 +306,4 @@ fn tempo_ranges(ui: &mut Ui, ranges: &mut Vec<TempoRange>) {
             ranges.sort();
         }
     });
-    ui.label(
-        RichText::new(
-            "TEMPO RANGE steps through these, and each deck's range menu offers them. WIDE is \
-             ±100 %.",
-        )
-        .small()
-        .weak(),
-    );
 }

@@ -1,0 +1,21 @@
+# Shown once on first start. See crates/app/src/tour.rs for the format.
+id = "first-start"
+name = "First start"
+auto = true
+
+[[step]]
+target = "view-menu"
+title = "Customize the screen"
+text = "Choose what's shown, which deck buttons appear, and save layouts."
+wait = ["performance"]
+
+[[step]]
+target = "preferences"
+title = "Your rekordbox library"
+text = """
+RofLoxBox can save your cues, grids and playlists back into rekordbox. \
+It stays off until you turn it on in Preferences > Library."""
+warn = "Back up first: in rekordbox, File > Library > Backup Library."
+when = ["rekordbox-write-off"]
+wait = ["performance", "prefs-closed"]
+action = { label = "Open Library settings", open-prefs = "library" }

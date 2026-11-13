@@ -1,0 +1,87 @@
+# How EDIT mode works.
+id = "edit"
+name = "Edit a recorded set"
+
+[[step]]
+target = "mode-edit"
+title = "EDIT mode"
+text = """
+Fix a recorded set afterwards: move songs, redo fader and knob moves, \
+cut mistakes, then render a new WAV."""
+when = ["performance"]
+
+[[step]]
+target = "edit-open"
+title = "Open a recording"
+text = """
+Each recording leaves a .session file next to its WAV. Open one. \
+The recording itself is never changed."""
+when = ["no-session"]
+wait = ["edit"]
+
+[[step]]
+target = "edit-play"
+title = "Listen"
+text = """
+Space plays from the cursor. Click the ruler to move the cursor.
+
+⌘-scroll or pinch to zoom; scroll sideways to move along. Fit shows the whole set."""
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-markers"
+title = "Your markers"
+text = "The spots you marked while recording (🚩). Pick one to jump there."
+when = ["has-markers"]
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-tools"
+title = "Two tools"
+text = """
+Normal: drag a song's clip to move it, or drag points on a lane.
+
+Select: drag across to pick a stretch, then Delete it, or Flatten or Ramp the moves in it."""
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-lanes"
+title = "Lanes"
+text = """
+Every fader and knob has a lane of points over time. \
++ shows more lanes for a deck or the mixer."""
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-snap"
+title = "Snap"
+text = "Moves land on the beat grid. Hold ⌘ to move freely, ⇧ for fine steps."
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-undo"
+title = "Undo anything"
+text = "⌘Z undoes, ⇧⌘Z redoes. History lists every change."
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-save"
+title = "Save your edit"
+text = "Saves the changes as a new .session, to come back to later."
+wait = ["edit", "session-open"]
+click-advances = false
+
+[[step]]
+target = "edit-render"
+title = "Render"
+text = """
+Plays the edited set into a new WAV next to the session. \
+To render a part, drag along the ruler with Select first."""
+wait = ["edit", "session-open"]
+click-advances = false

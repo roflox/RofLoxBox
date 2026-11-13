@@ -33,6 +33,7 @@ use eframe::egui::{
 use crate::browser::{Row, TableOptions, sort_rows, track_table};
 use crate::config::{AudioQuality, Config};
 use crate::controller::Controller;
+use crate::tour::{Tag as _, Target};
 use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, display_key, key_sync_shift};
 use crate::effects::Effects;
 use crate::library::find_exports;
@@ -150,6 +151,11 @@ pub struct DeckhandApp {
     /// How the last preset export or import went.
     preset_note: Option<String>,
     moved_window: bool,
+    /// Guided tours, and the one showing.
+    tours: Vec<crate::tour::Tour>,
+    tour: Option<crate::tour::Running>,
+    /// "Add a preset" on the Stems page opens (for a tour step).
+    open_stem_presets: bool,
     hotplug: hotplug::Hotplug,
     /// Each deck's jog bend at the last frame, to notice it ending.
     was_bending: [bool; DECKS],
@@ -330,6 +336,9 @@ impl DeckhandApp {
             },
             edit_view: mix_editor::EditView::default(),
             moved_window: false,
+            tours: Vec::new(),
+            tour: None,
+            open_stem_presets: false,
             hotplug: Default::default(),
             was_bending: [false; DECKS],
             show_diagnostics: std::env::var_os("DECKHAND_DIAGNOSTICS").is_some(),
@@ -364,6 +373,7 @@ impl DeckhandApp {
             preset_note: None,
             config,
         };
+        app.load_tours();
         app.restore_session();
         // Test aid: record into this folder from the start.
         let record_to = std::env::var_os("DECKHAND_RECORD").map(PathBuf::from);
@@ -708,7 +718,7 @@ impl DeckhandApp {
             preset.layout == current && preset.view.as_ref().is_none_or(|v| v.matches(&view))
         };
         let mut chosen = None;
-        for preset in LayoutPreset::built_in() {
+        for preset in LayoutPreset::built_in(four) {
             if ui.selectable_label(is_current(&preset), &preset.name).clicked() {
                 chosen = Some(preset);
             }
@@ -751,14 +761,14 @@ impl DeckhandApp {
             let any = !self.config.layout_presets.is_empty();
             if ui
                 .add_enabled(any, egui::Button::new("Export presets…"))
-                .on_hover_text("Saves your presets to a file, to keep or use on another computer")
+                .on_hover_text("Save presets to a file")
                 .clicked()
             {
                 self.preset_note = Some(export_presets(&self.config.layout_presets));
             }
             if ui
                 .button("Import presets…")
-                .on_hover_text("Adds the presets in a file; ones with the same name are replaced")
+                .on_hover_text("Add presets from a file")
                 .clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .set_title("Import view presets")
@@ -1709,21 +1719,171 @@ impl eframe::App for DeckhandApp {
             self.moved_window = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
         }
+        self.run_tour(ctx);
+        if std::env::var_os("DECKHAND_TARGETS").is_some() {
+            crate::tour::show_targets(ctx);
+        }
         self.handle_screenshot(ctx);
     }
 }
 
 impl DeckhandApp {
+    /// Loads the tours and starts the first auto one not done yet.
+    /// Test aid: `DECKHAND_TOUR=id` or `id:step` (from 1) shows that one.
+    fn load_tours(&mut self) {
+        let (tours, errors) = crate::tour::load(&crate::config::data_dir().join("tours"));
+        self.tours = tours;
+        if !errors.is_empty() {
+            self.status = Some(errors.join("; "));
+        }
+        if let Ok(forced) = std::env::var("DECKHAND_TOUR") {
+            let (id, step) = forced.split_once(':').unwrap_or((&forced, "1"));
+            self.start_tour(id);
+            if let Some(run) = &mut self.tour {
+                run.step = step.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            }
+            self.reveal_tour_step();
+        } else if self.screenshot.is_none() {
+            let done = &self.config.tours_done;
+            let id = self.tours.iter().find(|t| t.auto && !done.contains(&t.id)).map(|t| t.id.clone());
+            if let Some(id) = id {
+                self.start_tour(&id);
+            }
+        }
+    }
+
+    fn start_tour(&mut self, id: &str) {
+        self.tour = self
+            .tours
+            .iter()
+            .position(|t| t.id == id)
+            .map(|tour| crate::tour::Running { tour, step: 0 });
+        self.reveal_tour_step();
+    }
+
+    /// Whether `c` holds now, for tour steps.
+    fn tour_holds(&self, c: crate::tour::Condition) -> bool {
+        use crate::tour::Condition;
+        match c {
+            Condition::Performance => self.mode == mix_editor::Mode::Performance,
+            Condition::Edit => self.mode == mix_editor::Mode::Edit,
+            Condition::PrefsOpen => self.show_prefs,
+            Condition::PrefsClosed => !self.show_prefs,
+            Condition::Recording => self.recording.is_some(),
+            Condition::NotRecording => self.recording.is_none(),
+            Condition::TwoDecks => !self.config.four_decks,
+            Condition::FourDecks => self.config.four_decks,
+            Condition::RekordboxWriteOn => self.config.prefs.rekordbox_write,
+            Condition::RekordboxWriteOff => !self.config.prefs.rekordbox_write,
+            Condition::MacOs => cfg!(target_os = "macos"),
+            Condition::Windows => cfg!(windows),
+            Condition::Linux => cfg!(target_os = "linux"),
+            Condition::SessionOpen => self.edit_view.session_open(),
+            Condition::NoSession => !self.edit_view.session_open(),
+            Condition::HasMarkers => self.edit_view.has_markers(),
+            Condition::PrefsTab(tab) => self.show_prefs && self.prefs_tab == tab,
+            Condition::NotPrefsTab(tab) => !(self.show_prefs && self.prefs_tab == tab),
+        }
+    }
+
+    /// Brings up the part of the app the current tour step points at: its
+    /// Preferences page, EDIT, or the library.
+    fn reveal_tour_step(&mut self) {
+        // Revealing can make that step skip itself (its page now open):
+        // then bring up the next one's too.
+        let mut last = None;
+        for _ in 0..4 {
+            let Some(run) = self.tour else { return };
+            let Some(target) = crate::tour::upcoming(&self.tours, run, |c| self.tour_holds(c))
+            else {
+                return;
+            };
+            if last == Some(target) {
+                return;
+            }
+            last = Some(target);
+            self.reveal(target);
+        }
+    }
+
+    fn reveal(&mut self, target: crate::tour::Target) {
+        use crate::tour::Target;
+        let page = match target {
+            Target::PrefsDeck => Some(PrefsTab::Deck),
+            Target::PrefsMixer => Some(PrefsTab::Mixer),
+            Target::PrefsKeyboard => Some(PrefsTab::Keyboard),
+            Target::PrefsStems | Target::StemModels | Target::LiveStems => Some(PrefsTab::Stems),
+            Target::StemPresets => {
+                self.open_stem_presets = true;
+                Some(PrefsTab::Stems)
+            }
+            Target::PrefsLibrary | Target::RekordboxWrite => Some(PrefsTab::Library),
+            Target::PrefsAppearance => Some(PrefsTab::Appearance),
+            Target::PrefsAudio => Some(PrefsTab::Audio),
+            _ => None,
+        };
+        if let Some(tab) = page {
+            self.show_prefs = true;
+            self.prefs_tab = tab;
+        }
+        match target {
+            Target::EditOpen
+            | Target::EditSave
+            | Target::EditRender
+            | Target::EditPlay
+            | Target::EditMarkers
+            | Target::EditTools
+            | Target::EditUndo
+            | Target::EditLanes
+            | Target::EditRuler
+            | Target::EditSnap => self.mode = mix_editor::Mode::Edit,
+            Target::LibrarySearch => {
+                self.mode = mix_editor::Mode::Performance;
+                self.config.show_library = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Shows the step of the tour going on; a finished tour is remembered.
+    fn run_tour(&mut self, ctx: &egui::Context) {
+        use crate::tour::{Condition, Outcome};
+        let Some(mut run) = self.tour else { return };
+        let holds = |c: Condition| self.tour_holds(c);
+        match crate::tour::show(ctx, &self.tours, &mut run, holds, CUE_COLOR, WARN) {
+            Outcome::Showing => self.tour = Some(run),
+            Outcome::Next(open_prefs) => {
+                if let Some(tab) = open_prefs {
+                    self.show_prefs = true;
+                    self.prefs_tab = tab;
+                }
+                self.tour = Some(run);
+                self.reveal_tour_step();
+            }
+            Outcome::Finished => {
+                self.tour = None;
+                let id = &self.tours[run.tour].id;
+                if !self.config.tours_done.contains(id) {
+                    self.config.tours_done.push(id.clone());
+                    self.config.save();
+                }
+            }
+        }
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
+        let mut start = None;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(crate::APP_NAME).on_hover_text(format!("Version {}", crate::VERSION));
                 ui.separator();
                 use mix_editor::Mode;
                 ui.selectable_value(&mut self.mode, Mode::Performance, "PERFORMANCE")
-                    .on_hover_text("Play: decks, mixer and library");
+                    .on_hover_text("Decks, mixer and library")
+                    .tour(Target::ModePerformance);
                 ui.selectable_value(&mut self.mode, Mode::Edit, "EDIT")
-                    .on_hover_text("Change a recorded set: its tracks and every knob and fader");
+                    .on_hover_text("Edit a recorded set")
+                    .tour(Target::ModeEdit);
                 ui.separator();
 
                 let device = self
@@ -1731,13 +1891,17 @@ impl DeckhandApp {
                     .as_ref()
                     .map_or_else(|| "No audio".to_owned(), |e| e.info().device.clone());
                 let mut chosen = None;
-                egui::ComboBox::from_id_salt("audio").selected_text(device).show_ui(ui, |ui| {
-                    for name in Engine::output_devices() {
-                        if ui.selectable_label(false, &name).clicked() {
-                            chosen = Some(name);
+                egui::ComboBox::from_id_salt("audio")
+                    .selected_text(device)
+                    .show_ui(ui, |ui| {
+                        for name in Engine::output_devices() {
+                            if ui.selectable_label(false, &name).clicked() {
+                                chosen = Some(name);
+                            }
                         }
-                    }
-                });
+                    })
+                    .response
+                    .tour(Target::AudioDevice);
                 if let Some(name) = chosen {
                     self.start_engine(Some(name));
                 }
@@ -1745,21 +1909,23 @@ impl DeckhandApp {
                     let info = engine.info();
                     ui.label(format!("{} Hz · {} ch", info.sample_rate, info.channels));
                 }
-                ui.toggle_value(&mut self.show_prefs, "⚙ Preferences");
+                ui.toggle_value(&mut self.show_prefs, "⚙ Preferences").tour(Target::Preferences);
                 ui.toggle_value(&mut self.status_bar.log_open, "📜 Log")
-                    .on_hover_text("Every message of this session, with its time");
+                    .on_hover_text("All messages")
+                    .tour(Target::Log);
                 ui.separator();
                 self.record_button(ui);
                 ui.separator();
                 let mut four = self.config.four_decks;
-                ui.selectable_value(&mut four, false, "2 decks");
-                ui.selectable_value(&mut four, true, "4 decks");
+                let two_decks = ui.selectable_value(&mut four, false, "2 decks");
+                let four_decks = ui.selectable_value(&mut four, true, "4 decks");
+                two_decks.union(four_decks).tour(Target::DeckCount);
                 if four != self.config.four_decks {
                     self.config.four_decks = four;
                     self.config.save();
                 }
                 ui.separator();
-                egui::containers::menu::MenuButton::new("View")
+                let (view_button, _) = egui::containers::menu::MenuButton::new("View")
                     .config(
                         egui::containers::menu::MenuConfig::new()
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
@@ -1868,20 +2034,28 @@ impl DeckhandApp {
                             self.config.save();
                         }
                     });
+                view_button.tour(Target::ViewMenu);
+                ui.menu_button("Tours", |ui| {
+                    for tour in &self.tours {
+                        if ui.button(&tour.name).clicked() {
+                            start = Some(tour.id.clone());
+                        }
+                    }
+                });
                 ui.separator();
                 let label = self
                     .controller
                     .port()
                     .map_or_else(|| "🎛 Controller".to_owned(), |p| format!("🎛 {p}"));
-                ui.toggle_value(&mut self.show_controller, label);
+                ui.toggle_value(&mut self.show_controller, label).tour(Target::Controller);
                 ui.separator();
                 let mut stems = self.config.prefs.live_stems;
                 if ui
                     .toggle_value(&mut stems, "STEMS")
                     .on_hover_text(
-                        "Stems on the decks. Off: nothing is separated and the separating \
-                         helper quits, for more performance",
+                        "Stems on the decks. Off saves CPU",
                     )
+                    .tour(Target::Stems)
                     .changed()
                 {
                     self.set_live_stems(stems);
@@ -1889,6 +2063,9 @@ impl DeckhandApp {
                 }
             });
         });
+        if let Some(id) = start {
+            self.start_tour(&id);
+        }
     }
 
     /// Horizontal waveform strip: one row per deck, in mixer channel order.
@@ -2005,7 +2182,7 @@ impl DeckhandApp {
             ui.label("Grid");
             let grid = ui
                 .add(Slider::new(&mut self.config.grid_strength, 0.0..=1.5).show_value(false))
-                .on_hover_text("Beat grid brightness; all the way left hides it");
+                .on_hover_text("Beat grid brightness");
             if grid.drag_stopped() || (grid.changed() && !grid.dragged()) {
                 self.config.save();
             }
@@ -2022,7 +2199,7 @@ impl DeckhandApp {
             ui.horizontal(|ui| {
                 ui.colored_label(
                     CUE_COLOR,
-                    "Editing the layout: drag a deck element onto another (left or right half), onto + at the end of a row or the side column, onto New row, or onto Hide. Drag the decks, waveforms or mixer by their bar onto an edge of another block.",
+                    "Editing the layout: drag elements onto each other, + , New row or Hide. Drag blocks by their bar.",
                 );
                 if ui.button("Done").clicked() {
                     self.editing_layout = false;
@@ -2169,7 +2346,7 @@ impl DeckhandApp {
                             });
                     })
                     .response
-                    .on_hover_text("Drag onto an edge of another block");
+                    .on_hover_text("Drag to another block's edge");
                     height -= BAR + ui.spacing().item_spacing.y;
                 }
                 match block {
@@ -2612,7 +2789,7 @@ impl DeckhandApp {
                     None => "TAP".to_owned(),
                 };
                 let response = toggle(ui, fx.tapped_bpm.is_some(), &tap).on_hover_text(
-                    "Tap the effect's tempo; right-click to follow the master deck again",
+                    "Tap tempo; right-click: follow master",
                 );
                 if response.clicked() {
                     fx.tap();
@@ -2645,7 +2822,7 @@ impl DeckhandApp {
                     fx.toggle_on();
                 }
                 if toggle(ui, fx.release, "RELEASE")
-                    .on_hover_text("Release FX: cut the source and let the echo play out")
+                    .on_hover_text("Cut the source, let the echo ring")
                     .clicked()
                 {
                     fx.toggle_release();
@@ -2688,7 +2865,7 @@ impl DeckhandApp {
                     ui.separator();
                 }
                 if toggle(ui, fx.master_cue, "MASTER CUE")
-                    .on_hover_text("Hear the master mix in the headphones")
+                    .on_hover_text("Master in headphones")
                     .clicked()
                 {
                     fx.toggle_master_cue(engine);
@@ -2717,7 +2894,7 @@ impl DeckhandApp {
                         crate::widgets::lit_button_sized(ui, &label, playing, ACTIVE, 11.0, 6.0)
                             .on_hover_text(
                                 name.as_deref()
-                                    .unwrap_or("Empty: put audio files in the samples folder"),
+                                    .unwrap_or("Empty: add files to the samples folder"),
                             );
                     if response.clicked() {
                         engine.send(Command::SamplerPlay { slot });
@@ -2728,7 +2905,7 @@ impl DeckhandApp {
                 }
                 if ui
                     .small_button("…")
-                    .on_hover_text("Open the samples folder; files load at start-up")
+                    .on_hover_text("Open the samples folder")
                     .clicked()
                 {
                     let dir = crate::config::samples_dir();
@@ -2810,7 +2987,8 @@ impl DeckhandApp {
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search title, artist, album, genre")
                     .desired_width(320.0),
-            );
+            )
+            .tour(Target::LibrarySearch);
             if let Some(id) = self.selected {
                 ui.separator();
                 for deck in 0..deck_count {
@@ -2971,7 +3149,8 @@ impl DeckhandApp {
                             &mut self.prefs_tab,
                             tab,
                             RichText::new(tab.label()).strong(),
-                        );
+                        )
+                        .tour(Target::prefs_tab(tab));
                     }
                 });
                 ui.separator();
@@ -3048,9 +3227,9 @@ impl DeckhandApp {
                 ui.horizontal(|ui| {
                     let mut quality = self.config.audio_quality;
                     ui.selectable_value(&mut quality, AudioQuality::Standard, "Standard")
-                        .on_hover_text("Linear interpolation: least CPU");
+                        .on_hover_text("Least CPU");
                     ui.selectable_value(&mut quality, AudioQuality::High, "High")
-                        .on_hover_text("Cubic interpolation: cleaner highs when the tempo or sample rate differs");
+                        .on_hover_text("Cleaner highs");
                     if quality != self.config.audio_quality {
                         self.config.audio_quality = quality;
                         self.config.save();
@@ -3077,7 +3256,7 @@ impl DeckhandApp {
                     ));
                 }
                 ui.label(
-                RichText::new("Smaller buffers make the controller respond sooner; raise the buffer if you hear crackles or dropouts.")
+                RichText::new("Smaller is snappier; raise it if you hear crackles.")
                     .small()
                     .weak(),
             );
@@ -3155,25 +3334,25 @@ impl DeckhandApp {
                         }
                     });
                     if let Some(i) = choice
-                        && ui.button("Import from rekordbox").on_hover_text("Replace the mapping with rekordbox's mapping for this controller").clicked()
+                        && ui.button("Import from rekordbox").on_hover_text("Use rekordbox's mapping").clicked()
                     {
                         self.controller.import_from(&files[i].1);
                     }
                     if let Some(i) = choice
                         && ui
                             .button("Add missing only")
-                            .on_hover_text("Keep your mapping; add only functions and lights it does not have yet (on controls not used already)")
+                            .on_hover_text("Add only what's missing")
                             .clicked()
                     {
                         self.controller.import_missing_from(&files[i].1);
                     }
                 });
-                    ui.label(RichText::new("Reads the mapping file of your installed rekordbox; nothing is copied into RofLoxBox.").small().weak());
+                    ui.label(RichText::new("Uses your installed rekordbox's mapping.").small().weak());
                 }
                 ui.horizontal(|ui| {
                 if ui
                     .button("Import mapping file…")
-                    .on_hover_text("Use a rekordbox .midi.csv mapping, e.g. from rekordbox 6 or another computer")
+                    .on_hover_text("Import a rekordbox .midi.csv")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new().add_filter("rekordbox mapping", &["csv"]).pick_file()
                 {
@@ -3181,7 +3360,7 @@ impl DeckhandApp {
                 }
                 if ui
                     .button("Open mappings folder")
-                    .on_hover_text("Put rekordbox .midi.csv files here (e.g. from rekordbox 6) to use them automatically")
+                    .on_hover_text("Drop .midi.csv files here to use them")
                     .clicked()
                 {
                     let dir = crate::config::extra_mapping_dir();
@@ -3198,7 +3377,7 @@ impl DeckhandApp {
                 ui.horizontal(|ui| {
                 let count = self.controller.mapping().shift_controls.len();
                 ui.label(format!("Shift buttons: {}", if count == 0 { "none".to_owned() } else { count.to_string() }))
-                    .on_hover_text("While a Shift button is held, functions marked Shift take over their control");
+                    .on_hover_text("Shift functions apply while Shift is held");
                 if ui.small_button("Learn Shift button").clicked() {
                     self.controller.learn_shift();
                 }
@@ -3211,7 +3390,7 @@ impl DeckhandApp {
                         ui.horizontal(|ui| {
                         ui.colored_label(
                             CUE_COLOR,
-                            format!("Learning {action}: press or move that control (hold Shift for a Shift combination)…"),
+                            format!("Learning {action}: move the control (hold Shift for a Shift combo)…"),
                         );
                         if ui.button("Cancel").clicked() {
                             self.controller.cancel_learn();
@@ -3227,7 +3406,7 @@ impl DeckhandApp {
                         });
                     }
                     None => {
-                        ui.label("To change a control: press Learn next to a function, then press or move it on the controller. Hold a Shift button while doing so to make a Shift combination.");
+                        ui.label("Press Learn, then move a control. Hold Shift for a Shift combo.");
                     }
                 }
                 ui.horizontal(|ui| {
@@ -3300,7 +3479,7 @@ impl DeckhandApp {
                                 let mut shift = b.shift;
                                 if ui
                                     .checkbox(&mut shift, "Shift")
-                                    .on_hover_text("Only while a Shift button is held")
+                                    .on_hover_text("While Shift is held")
                                     .changed()
                                 {
                                     self.controller.set_shifted(action, shift);

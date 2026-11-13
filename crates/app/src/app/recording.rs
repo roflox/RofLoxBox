@@ -1,5 +1,6 @@
 //! Recording the master output: the REC button and where files go.
 
+use crate::tour::Tag as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,6 +152,21 @@ impl DeckhandApp {
         }
     }
 
+    /// Marks this moment of the recording, to find in EDIT.
+    pub(super) fn add_marker(&mut self) {
+        let Some(recording) = self.recording.as_ref() else { return };
+        let secs = recording.duration().as_secs();
+        let sent = self
+            .engine
+            .as_mut()
+            .is_some_and(|e| e.send(deckhand_audio::Command::Marker));
+        self.status = Some(if sent {
+            format!("Marker at {}:{:02}", secs / 60, secs % 60)
+        } else {
+            "Marker not set: the audio is busy".to_owned()
+        });
+    }
+
     /// Finishes a recording before the audio output goes away.
     pub(super) fn finish_recording(&mut self) {
         if self.recording.is_some() {
@@ -189,20 +205,29 @@ impl DeckhandApp {
         let dropped = recording.map_or(0, |r| r.dropped_frames());
         if dropped > 0 {
             ui.label(RichText::new(format!("{dropped} frames lost")).small().color(WARN))
-                .on_hover_text("The disk could not keep up; try another folder or drive");
+                .on_hover_text("Disk too slow; try another drive");
         }
         response = response.on_hover_text(match recording {
-            Some(r) => format!("Recording the master to {}; click to stop", r.path().display()),
-            None => format!("Record the master output to {}", self.recordings_dir().display()),
+            Some(r) => format!("Recording to {}", r.path().display()),
+            None => format!("Record to {}", self.recordings_dir().display()),
         });
+        let response = response.tour(crate::tour::Target::Record);
         if response.clicked() {
             self.toggle_recording();
         }
+        let marker = ui
+            .add_enabled(self.recording.is_some(), egui::Button::new("🚩"))
+            .on_hover_text("Add marker (⇧↩)")
+            .on_disabled_hover_text("Add marker (while recording)")
+            .tour(crate::tour::Target::Marker);
+        if marker.clicked() {
+            self.add_marker();
+        }
         // The recording going on, else the last one, in the file manager.
-        let what = if self.recording.is_some() { "the recording going on" } else { "the last recording" };
+        let what = if self.recording.is_some() { "this recording" } else { "the last recording" };
         let folder = ui
             .button(super::collection_view::reveal_label())
-            .on_hover_text(format!("Opens the folder with {what}"));
+            .on_hover_text(format!("Show {what}"));
         if folder.clicked() {
             let dir = self.recordings_dir();
             let shown = match self.recording.as_ref() {
@@ -223,7 +248,10 @@ impl DeckhandApp {
     /// The recording part of the Audio preferences.
     pub(super) fn recording_prefs(&mut self, ui: &mut Ui) {
         ui.add_space(6.0);
-        ui.label(RichText::new("Recording").strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Recording").strong().size(15.0));
+            crate::widgets::help(ui, "Each recording: a WAV, a .session to edit in EDIT, and the stems used.");
+        });
         ui.horizontal(|ui| {
             ui.label("Folder");
             ui.label(RichText::new(self.recordings_dir().display().to_string()).monospace());
@@ -247,22 +275,11 @@ impl DeckhandApp {
                 self.config.save();
             }
         });
-        ui.label(
-            RichText::new(
-                "Each recording gets a folder: the master output as you hear it (a 24-bit WAV at \
-                 the output's sample rate), a .session file with everything played (the tracks, \
-                 every knob, fader, button and jog movement, to play or edit the set again) and \
-                 the stems the decks used, as they had them.",
-            )
-            .small()
-            .weak(),
-        );
         ui.horizontal(|ui| {
             let button = ui
                 .add_enabled(self.replay.is_none(), egui::Button::new("Replay a session…"))
                 .on_hover_text(
-                    "Plays a recorded session through the mixer again into a new WAV, and \
-                     compares it with the recording",
+                    "Re-renders a session and compares it",
                 );
             if button.clicked()
                 && let Some(path) = rfd::FileDialog::new()

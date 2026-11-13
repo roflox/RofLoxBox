@@ -2,6 +2,7 @@
 //! time, and a lane of automation for each knob and fader, to change and
 //! play into a new WAV.
 
+use crate::tour::Tag as _;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +43,8 @@ const SNAP: Color32 = Color32::from_rgb(120, 220, 255);
 const RANGE: Color32 = Color32::from_rgb(90, 160, 255);
 /// The playhead.
 const PLAY: Color32 = Color32::from_rgb(255, 200, 60);
+/// Markers set while recording.
+const MARKER: Color32 = Color32::from_rgb(255, 70, 160);
 /// Width of the names left of the timeline.
 const LABELS: f32 = 150.0;
 const RULER: f32 = 34.0;
@@ -82,6 +85,17 @@ pub(super) struct EditView {
     opening: Option<Opening>,
     /// `DECKHAND_EDIT_SESSION` was opened (a test aid).
     opened_at_start: bool,
+}
+
+impl EditView {
+    pub(super) fn session_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// The open session has recording markers.
+    pub(super) fn has_markers(&self) -> bool {
+        self.editor.as_ref().is_some_and(|e| !e.markers.is_empty())
+    }
 }
 
 /// A session open for editing.
@@ -138,6 +152,8 @@ struct MixEditor {
     /// Each nudge in the set (jog edge, pitch bend): marked on its clip,
     /// right-click one to take it out.
     nudges: Vec<deckhand_audio::Nudge>,
+    /// Markers set while recording (frames from the start).
+    markers: Vec<u64>,
     /// The Beat FX row and the Color FX overview are shown.
     show_beat_fx: bool,
     show_color_fx: bool,
@@ -768,6 +784,7 @@ impl MixEditor {
             .collect();
         let (moves, fx) = (session.moves(), session.beat_fx());
         let nudges = session.nudges();
+        let markers = session.markers();
         let pieces = tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
         let key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
         let decks = tracks.iter().map(|t| t.deck + 1).max().unwrap_or(0);
@@ -826,6 +843,7 @@ impl MixEditor {
             anchors: HashMap::new(),
             replayed: HashSet::new(),
             nudges,
+            markers,
             show_beat_fx: true,
             show_color_fx: true,
             original,
@@ -1053,6 +1071,7 @@ impl MixEditor {
     fn refresh(&mut self, session: &Session) {
         self.length = session.length();
         self.nudges = session.nudges();
+        self.markers = session.markers();
         self.tracks = session.tracks();
         self.key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
         self.pieces = self.tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
@@ -1248,12 +1267,81 @@ impl MixEditor {
         ctx.request_repaint();
     }
 
+    /// The marker under `x` on the ruler, if one.
+    fn marker_near(&self, area: Rect, x: f32) -> Option<u64> {
+        self.markers
+            .iter()
+            .copied()
+            .filter(|&at| (self.x_of(area, at) + 5.0 - x).abs() <= GRAB + 4.0)
+            .min_by(|&a, &b| {
+                let off = |at| (self.x_of(area, at) - x).abs();
+                off(a).total_cmp(&off(b))
+            })
+    }
+
+    /// On the ruler: a marker's flag puts the cursor on it; right-click
+    /// takes it out.
+    fn marker_clicks(&mut self, ui: &Ui, area: Rect, response: &egui::Response) {
+        let Some(pos) = response.hover_pos().or(response.interact_pointer_pos()) else { return };
+        let Some(at) = self.marker_near(area, pos.x) else { return };
+        let number = self.markers.iter().position(|&m| m == at).map_or(0, |i| i + 1);
+        let secs = at as f64 / self.rate;
+        response.clone().on_hover_text(format!(
+            "Marker {number} · {}:{:05.2}\nRight-click: remove",
+            (secs / 60.0) as u64,
+            secs % 60.0
+        ));
+        if response.clicked() {
+            self.range = None;
+            self.cursor = at;
+            if self.player.is_some() {
+                self.play_from(at);
+            }
+        }
+        if response.secondary_clicked() {
+            self.remove_marker(at);
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    /// Puts the cursor on `at` and shows it.
+    fn go_to(&mut self, at: u64) {
+        self.cursor = at;
+        let secs = at as f64 / self.rate;
+        if secs < self.view_from || secs > self.view_from + self.view_secs {
+            self.view_from = secs - self.view_secs * 0.5;
+            self.clamp_view();
+        }
+        if self.player.is_some() {
+            self.play_from(at);
+        }
+    }
+
+    fn remove_marker(&mut self, at: u64) {
+        let shared = self.session.clone();
+        let Ok(mut session) = shared.lock() else { return };
+        let Some(before) = pack(&session) else { return };
+        if session.remove_markers(at, at) == 0 {
+            return;
+        }
+        self.refresh(&session);
+        drop(session);
+        self.record("Marker removed".into(), Edit::Events(before));
+    }
+
     /// The cursor (where playing starts) and the playhead, down `area`.
     fn play_marks(&self, painter: &egui::Painter, area: Rect) {
         if let Some((from, to)) = self.range {
             let band =
                 Rect::from_x_y_ranges(self.x_of(area, from)..=self.x_of(area, to), area.y_range());
             painter.rect_filled(band, 0.0, RANGE.gamma_multiply(0.12));
+        }
+        for &at in &self.markers {
+            let x = self.x_of(area, at);
+            painter.line_segment(
+                [pos2(x, area.top()), pos2(x, area.bottom())],
+                Stroke::new(1.0_f32, MARKER.gamma_multiply(0.7)),
+            );
         }
         let x = self.x_of(area, self.cursor);
         painter.line_segment(
@@ -1412,7 +1500,8 @@ impl MixEditor {
             ui.add_space(6.0);
             ui.menu_button(RichText::new("+").strong(), |ui| menu(self, ui))
                 .response
-                .on_hover_text("Add or remove lanes");
+                .on_hover_text("Add or remove lanes")
+                .tour(crate::tour::Target::EditLanes);
         });
     }
 
@@ -1510,7 +1599,8 @@ impl MixEditor {
         let label = if playing { "⏹ Stop" } else { "▶ Play" };
         if ui
             .add(egui::Button::new(label).selected(playing))
-            .on_hover_text("Plays the set as edited from the cursor (Space). Click the ruler to put the cursor somewhere")
+            .on_hover_text("Play from the cursor (Space)")
+            .tour(crate::tour::Target::EditPlay)
             .clicked()
         {
             self.toggle_play();
@@ -1520,13 +1610,33 @@ impl MixEditor {
         if self.player.as_ref().is_some_and(|p| !p.ready()) {
             ui.spinner().on_hover_text("Getting to the cursor…");
         }
+        if !self.markers.is_empty() {
+            let mut chosen = None;
+            ui.menu_button(format!("🚩 {}", self.markers.len()), |ui| {
+                for (i, &at) in self.markers.iter().enumerate() {
+                    let secs = at as f64 / self.rate;
+                    let text = format!("{}  {}:{:05.2}", i + 1, (secs / 60.0) as u64, secs % 60.0);
+                    if ui.button(text).clicked() {
+                        chosen = Some(at);
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Go to a marker")
+            .tour(crate::tour::Target::EditMarkers);
+            if let Some(at) = chosen {
+                self.go_to(at);
+            }
+        }
         ui.separator();
+        let mut tools: Option<egui::Response> = None;
         for (tool, label, hint) in [
-            (Tool::Normal, "Normal", "Move and edit clips, points and effects"),
+            (Tool::Normal, "Normal", "Move and edit"),
             (
                 Tool::Select,
                 "Select",
-                "Drag a stretch of a deck's clips, the Beat FX or a lane; Delete removes it",
+                "Drag to select; Delete removes",
             ),
         ] {
             let keys = &self.tool_keys;
@@ -1535,9 +1645,17 @@ impl MixEditor {
                 Tool::Select => &keys[1],
             };
             let hint = if key.is_empty() { hint.to_owned() } else { format!("{hint} ({key})") };
-            if tool_button(ui, tool, label, self.tool == tool).on_hover_text(hint).clicked() {
+            let button = tool_button(ui, tool, label, self.tool == tool).on_hover_text(hint);
+            if button.clicked() {
                 self.tool = tool;
             }
+            tools = Some(match tools {
+                Some(t) => t.union(button),
+                None => button,
+            });
+        }
+        if let Some(tools) = tools {
+            tools.tour(crate::tour::Target::EditTools);
         }
         ui.separator();
         ui.label(RichText::new(&self.name).strong());
@@ -1545,7 +1663,7 @@ impl MixEditor {
         ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).weak());
         if ui
             .button(super::collection_view::reveal_label())
-            .on_hover_text("The recorded performance's folder")
+            .on_hover_text("Show the folder")
             .clicked()
         {
             super::collection_view::reveal(&self.path);
@@ -1553,8 +1671,7 @@ impl MixEditor {
         if ui
             .add_enabled(self.export.is_none(), egui::Button::new("Export with songs…"))
             .on_hover_text(
-                "Copies the session as edited, the songs it plays and its stems into a folder, \
-                 to open on another computer",
+                "Copy the session with its songs",
             )
             .clicked()
         {
@@ -1568,8 +1685,7 @@ impl MixEditor {
             && ui
                 .button("Remove nudges")
                 .on_hover_text(
-                    "Takes the nudges in the selection out; each play starts where the nudges \
-                     had put it, so it stays in step (⌥: just take them out)",
+                    "Keeps the beat in step (⌥: don't)",
                 )
                 .clicked()
         {
@@ -1584,6 +1700,7 @@ impl MixEditor {
         if ui
             .add_enabled(idle && undo.is_some(), egui::Button::new("Undo"))
             .on_hover_text(undo.unwrap_or_default())
+            .tour(crate::tour::Target::EditUndo)
             .clicked()
         {
             self.undo();
@@ -1600,25 +1717,25 @@ impl MixEditor {
         let selected = idle && self.selection.is_some();
         if ui
             .add_enabled(selected, egui::Button::new("Flatten"))
-            .on_hover_text("Holds the value from before the selection through it (Delete joins its sides in a straight line instead)")
+            .on_hover_text("Hold the value through the selection")
             .clicked()
         {
             self.flatten();
         }
         if ui
             .add_enabled(selected, egui::Button::new("Ramp"))
-            .on_hover_text("One line (or S-curve, with Smooth chosen) through the selection")
+            .on_hover_text("Straight line through the selection")
             .clicked()
         {
             self.ramp();
         }
         ui.separator();
         for (curve, label, hint) in [
-            (Curve::Step, "Step", "Holds, then jumps: as knobs are recorded"),
-            (Curve::Line, "Line", "A straight line to the next point"),
-            (Curve::Smooth, "Smooth", "Eases out of one value and into the next"),
+            (Curve::Step, "Step", "Hold, then jump"),
+            (Curve::Line, "Line", "Straight line"),
+            (Curve::Smooth, "Smooth", "Ease in and out"),
         ] {
-            let hint = format!("{hint}. New points get it; selected ones too");
+            let hint = format!("{hint} (new and selected points)");
             if ui.selectable_label(self.shape == curve, label).on_hover_text(hint).clicked() {
                 self.shape = curve;
                 if idle && self.selection.is_some() {
@@ -1633,15 +1750,13 @@ impl MixEditor {
             "Bass clashes".to_owned()
         };
         ui.toggle_value(&mut self.show_clashes, clashes).on_hover_text(
-            "Marks where two decks' low end (bass, kick, below 150 Hz) goes into the mix at \
-             the same time, as heard: after EQ, faders and crossfader",
+            "Where two decks' bass overlaps",
         );
         if self.heard_stale
             && ui
                 .button("⟳ Waveforms")
                 .on_hover_text(
-                    "Mix changes (EQ, faders, filter, FX) aren't drawn into the bright \
-                     waveforms until asked: working them out replays the whole set",
+                    "Redraw with mix changes",
                 )
                 .clicked()
         {
@@ -1650,18 +1765,15 @@ impl MixEditor {
         if !self.sync.is_empty() {
             ui.separator();
             ui.checkbox(&mut self.follow, "Synced decks follow").on_hover_text(
-                "After a tempo change, sync is done again: synced decks take the master's \
-                 tempo and stay on its beat",
+                "Synced decks follow tempo changes",
             );
         }
         ui.separator();
-        ui.toggle_value(&mut self.snap, "Snap").on_hover_text(
-            "Dragged clips land on the master grid (beats zoomed in, bars out); dragged audio \
-             sticks to it when close. ⌘ while dragging: free; ⇧: fine, no snap",
-        );
+        ui.toggle_value(&mut self.snap, "Snap")
+            .on_hover_text("Snap to the grid (⌘: free, ⇧: fine)")
+            .tour(crate::tour::Target::EditSnap);
         ui.toggle_value(&mut self.follow_playhead, "Follow playhead").on_hover_text(
-            "While playing, the view moves along when the playhead runs off it; off, the view \
-             stays where you put it",
+            "Scroll along while playing",
         );
         if ui.button("Fit").on_hover_text("The whole set on view").clicked() {
             (self.view_from, self.view_secs) = (0.0, self.secs().max(1.0));
@@ -1680,6 +1792,7 @@ impl MixEditor {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
         }
         let (ruler, response) = ui.allocate_exact_size(vec2(width, RULER), Sense::click_and_drag());
+        let response = response.tour(crate::tour::Target::EditRuler);
         let area = Rect::from_min_max(pos2(ruler.left() + LABELS, ruler.top()), ruler.max);
         self.ruler(ui, area);
         // A click (or drag) on the ruler puts the cursor there; playing
@@ -1755,6 +1868,7 @@ impl MixEditor {
                 self.play_from(self.cursor);
             }
         }
+        self.marker_clicks(ui, area, &response);
         // The range on the ruler, bright, with its times.
         if let Some((from, to)) = self.range {
             let band = Rect::from_x_y_ranges(
@@ -1975,6 +2089,23 @@ impl MixEditor {
         }
         self.grid_ruler(ui, &painter, area);
         self.play_marks(&painter, area);
+        // Markers: a flag each, numbered.
+        for (i, &at) in self.markers.iter().enumerate() {
+            let x = self.x_of(area, at);
+            let top = area.top() + 1.0;
+            painter.add(Shape::convex_polygon(
+                vec![pos2(x, top), pos2(x + 16.0, top + 6.0), pos2(x, top + 12.0)],
+                MARKER,
+                Stroke::NONE,
+            ));
+            painter.text(
+                pos2(x + 2.0, top + 6.0),
+                egui::Align2::LEFT_CENTER,
+                (i + 1).to_string(),
+                egui::FontId::proportional(9.0),
+                Color32::BLACK,
+            );
+        }
         // The cursor's handle.
         let x = self.x_of(area, self.cursor);
         painter.add(Shape::convex_polygon(
@@ -4803,8 +4934,7 @@ impl MixEditor {
                             .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                     )
                     .on_hover_text(
-                        "Where both edges start; drag them apart afterwards (e.g. 90% to 30%). \
-                         0%: the sound as it is · 100%: only the effect",
+                        "Start depth for both edges; drag them apart later",
                     );
                 });
                 ui.add_space(6.0);
@@ -4877,7 +5007,7 @@ impl MixEditor {
             let mut release = span.release;
             if ui
                 .checkbox(&mut release, "Release FX")
-                .on_hover_text("The sound is cut and the echoes play out")
+                .on_hover_text("Cut the sound, let echoes ring")
                 .changed()
             {
                 let (from, to) = (span.from, span.to);
@@ -4906,7 +5036,7 @@ impl MixEditor {
             }
         })
         .response
-        .on_hover_text("0%: the sound as it is · 50%: half each · 100%: only the effect");
+        .on_hover_text("0% dry · 100% only the effect");
         ui.separator();
         if ui.button("Remove").clicked() {
             let changes = remove_fx(&self.fx, span);
@@ -5318,7 +5448,7 @@ impl MixEditor {
                 if let Some((_, from, to)) = selected {
                     if ui
                         .button("Reset selection to original")
-                        .on_hover_text("The selection goes back to how it was recorded")
+                        .on_hover_text("Back to as recorded")
                         .clicked()
                     {
                         self.reset(setting, from, to);
@@ -5540,8 +5670,7 @@ fn value_tag(painter: &egui::Painter, area: Rect, pos: Pos2, text: &str) {
 /// EDIT mode is not finished: says so.
 fn wip(ui: &mut Ui) {
     ui.label(RichText::new("WORK IN PROGRESS").small().strong().color(WARN)).on_hover_text(
-        "EDIT mode is new and not finished: expect rough edges and changes. Edits are saved as \
-         new files; your recordings are never changed, but keep them.",
+        "EDIT is unfinished. Edits save as new files; recordings stay untouched.",
     );
 }
 
@@ -5584,7 +5713,10 @@ impl DeckhandApp {
         // Wraps onto more rows when the window is too narrow for it all.
         ui.horizontal_wrapped(|ui| {
             let opening = self.edit_view.opening.is_some();
-            if ui.add_enabled(!opening, egui::Button::new("Open session…")).clicked()
+            if ui
+                .add_enabled(!opening, egui::Button::new("Open session…"))
+                .tour(crate::tour::Target::EditOpen)
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .set_title("Session to edit")
                     .set_directory(self.recordings_dir())
@@ -5599,7 +5731,7 @@ impl DeckhandApp {
             }
             let Some(editor) = self.edit_view.editor.as_mut() else { return };
             let idle = !editor.busy();
-            if ui.add_enabled(idle, egui::Button::new("Save edit…")).clicked() {
+            if ui.add_enabled(idle, egui::Button::new("Save edit…")).tour(crate::tour::Target::EditSave).clicked() {
                 message = editor.save();
             }
             let (label, hint) = match editor.range {
@@ -5614,7 +5746,12 @@ impl DeckhandApp {
                      mark it on the ruler with the Select tool",
                 ),
             };
-            if ui.add_enabled(idle, egui::Button::new(label)).on_hover_text(hint).clicked() {
+            if ui
+                .add_enabled(idle, egui::Button::new(label))
+                .on_hover_text(hint)
+                .tour(crate::tour::Target::EditRender)
+                .clicked()
+            {
                 editor.start_render();
             }
             // What is going on, in a slot of its own size whether or not
@@ -5658,9 +5795,7 @@ impl DeckhandApp {
                 ui.label(RichText::new("Edit a recorded set").size(18.0).strong());
                 wip(ui);
                 ui.label(
-                    "Every recording keeps a .session file next to its WAV: the tracks, and \
-                     every knob, fader, button and jog movement. Open one to change it and \
-                     play it into a new WAV.",
+                    "Open a recording's .session to edit it and render a new WAV.",
                 );
             });
             return;

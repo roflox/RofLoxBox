@@ -108,6 +108,8 @@ enum KeyAction {
     Zoom(i32),
     ZoomReset,
     Record,
+    /// Marks this moment of the recording.
+    Marker,
     /// EDIT mode: 0 Normal tool, 1 Select tool, 2 split at the selection.
     Edit(u8),
 }
@@ -279,6 +281,7 @@ fn bindings() -> Vec<Binding> {
         (Mods::PLAIN, Key::Minus, KeyAction::Zoom(-1), "Zoom out"),
         (Mods::SHIFT, Key::Equals, KeyAction::ZoomReset, "Reset zoom"),
         (Mods::COMMAND, Key::Enter, KeyAction::Record, "Start/stop recording"),
+        (Mods::SHIFT, Key::Enter, KeyAction::Marker, "Add recording marker"),
     ];
     for (mods, key, action, label) in global {
         let combo = Some(Combo { key, mods });
@@ -424,16 +427,13 @@ impl KeyboardMixer {
     /// The Keyboard page of Preferences; returns whether anything changed
     /// there. New keys arrive through `read`.
     pub(super) fn prefs_ui(&mut self, ui: &mut egui::Ui, prefs: &mut Preferences) -> bool {
-        let mut changed =
-            ui.checkbox(&mut prefs.keyboard_mixing, "Mix with the keyboard").changed();
-        ui.label(
-            RichText::new(
-                "Keys go by position on the keyboard. Click one, then press the new key; \
-                 Esc cancels, Delete leaves the function without a key.",
-            )
-            .small()
-            .weak(),
-        );
+        let mut changed = ui
+            .horizontal(|ui| {
+                let changed = ui.checkbox(&mut prefs.keyboard_mixing, "Mix with the keyboard").changed();
+                crate::widgets::help(ui, "Click, then press a key. Esc cancels, Delete clears.");
+                changed
+            })
+            .inner;
         let reset = egui::Button::new("Reset to rekordbox's Performance 1");
         if ui.add_enabled(!prefs.key_bindings.is_empty(), reset).clicked() {
             prefs.key_bindings.clear();
@@ -605,6 +605,7 @@ impl DeckhandApp {
             }
             KeyAction::ZoomReset => self.seconds_visible = DEFAULT_SECONDS_VISIBLE,
             KeyAction::Record => self.toggle_recording(),
+            KeyAction::Marker => self.add_marker(),
             // EDIT mode reads its own keys.
             KeyAction::Edit(_) => {}
         }

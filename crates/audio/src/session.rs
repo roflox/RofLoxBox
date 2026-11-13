@@ -2168,6 +2168,27 @@ impl Session {
         Ok(true)
     }
 
+    /// The markers set while recording (frames from the start), in order.
+    pub fn markers(&self) -> Vec<u64> {
+        let start = self.snapshot.clock;
+        self.events
+            .iter()
+            .filter(|(_, e)| matches!(e, Logged::Command(Command::Marker)))
+            .map(|(at, _)| at - start)
+            .collect()
+    }
+
+    /// Takes the markers between `from` and `to` (frames from the start,
+    /// both included) out; returns how many went.
+    pub fn remove_markers(&mut self, from: u64, to: u64) -> usize {
+        let start = self.snapshot.clock;
+        let before = self.events.len();
+        self.events.retain(|(at, e)| {
+            !(matches!(e, Logged::Command(Command::Marker)) && (from..=to).contains(&(at - start)))
+        });
+        before - self.events.len()
+    }
+
     /// Every nudge in the set, by deck and time.
     pub fn nudges(&self) -> Vec<Nudge> {
         let start = self.snapshot.clock;
@@ -5232,6 +5253,27 @@ mod tests {
         let from = (120 * block) as usize * 2;
         let worst = (from..before.len().min(after.len())).map(|i| (before[i] - after[i]).abs()).fold(0f32, f32::max);
         assert!(worst < 1e-3, "in step after it: {worst}");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Markers set while recording are found where they were set, change
+    /// nothing heard, and can be taken out.
+    #[test]
+    fn markers_are_found_and_removed() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("markers", vec![
+            (10 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+            (40 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (100 * block, Command::Marker),
+            (200 * block, Command::Marker),
+            (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+        ]);
+        let start = session.snapshot.clock;
+        assert_eq!(session.markers(), vec![100 * block - start, 200 * block - start]);
+        let before = rendered(&session);
+        assert_eq!(session.remove_markers(0, 150 * block - start), 1);
+        assert_eq!(session.markers(), vec![200 * block - start]);
+        assert_eq!(rendered(&session), before);
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 

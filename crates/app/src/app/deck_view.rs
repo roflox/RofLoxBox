@@ -332,7 +332,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 let response = response
                     .interact(Sense::drag())
                     .on_hover_cursor(egui::CursorIcon::Grab)
-                    .on_hover_text("Drag onto a playlist, another deck, a waveform or a mixer channel");
+                    .on_hover_text("Drag to a playlist, deck or channel");
                 p.out.drag_track |= response.drag_started();
             }
             None => {
@@ -387,7 +387,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                             .fixed_decimals(1)
                             .custom_formatter(|v, _| format!("{v:+.1} dB")),
                     )
-                    .on_hover_text("Track gain (Auto Gain): drag to change, right-click to measure again");
+                    .on_hover_text("Track gain: drag; right-click to re-measure");
                 let mut measured = None;
                 response.context_menu(|ui| {
                     if ui.button("Measure again").clicked() {
@@ -495,7 +495,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::Master => p.out.make_master_pressed = toggle_in(ui, p.is_master, "MASTER", CUE_COLOR).clicked(),
         E::Quantize => {
             if toggle_in(ui, deck.quantize, "Q", RED)
-                .on_hover_text("Quantize: snap cues and loops to the beat")
+                .on_hover_text("Snap cues and loops to the beat")
                 .clicked()
             {
                 deck.quantize = !deck.quantize;
@@ -503,7 +503,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Vinyl => {
             if toggle(ui, deck.vinyl, "VINYL")
-                .on_hover_text("Jog top scratches when on, bends when off")
+                .on_hover_text("Jog top scratches")
                 .clicked()
             {
                 deck.vinyl = !deck.vinyl;
@@ -511,7 +511,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Slip => {
             if toggle_in(ui, deck.slip, "SLIP", RED)
-                .on_hover_text("Slip: after scratching, a loop or a held hot cue, the track carries on where it would have been")
+                .on_hover_text("Return where the track would be")
                 .clicked()
             {
                 deck.toggle_slip(engine);
@@ -559,14 +559,14 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             if response.secondary_clicked() {
                 deck.change_jump_size(0.5);
             }
-            response.on_hover_text("Jump size in beats: click to double, right-click to halve");
+            response.on_hover_text("Jump size: click ×2, right-click ½");
             if ui.button("▶").on_hover_text("Beat jump forward").clicked() {
                 deck.beat_jump(deck.jump_size, engine);
             }
         }
         E::Gate => {
             if toggle(ui, deck.hot_cue_gate, "GATE")
-                .on_hover_text("Gate: from pause, hot cues play only while held, then return and pause (see Preferences for playing decks)")
+                .on_hover_text("Hot cues play only while held")
                 .clicked()
             {
                 deck.hot_cue_gate = !deck.hot_cue_gate;
@@ -583,12 +583,12 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::MemorySet => {
             if ui
                 .button("MEMORY")
-                .on_hover_text("Store the cue point (or active loop) as a memory cue")
+                .on_hover_text("Save cue or loop as memory cue")
                 .clicked()
             {
                 deck.memory_set(engine);
             }
-            if ui.button("DELETE").on_hover_text("Delete the memory cue at the cue point").clicked() {
+            if ui.button("DELETE").on_hover_text("Delete memory cue here").clicked() {
                 deck.memory_delete();
             }
         }
@@ -614,7 +614,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 if toggle_in(ui, deck.screen_shift, "SHIFT", CUE_COLOR)
-                    .on_hover_text("Shift for the pads and the ◀ ▶ buttons (or hold the Shift key)")
+                    .on_hover_text("Shift for pads and ◀ ▶")
                     .clicked()
                 {
                     deck.screen_shift = !deck.screen_shift;
@@ -693,7 +693,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::MasterTempo => {
             if toggle_in(ui, deck.key_lock, "MT", RED)
-                .on_hover_text("Master Tempo: keep the key when the tempo changes")
+                .on_hover_text("Keep the key at any tempo")
                 .clicked()
             {
                 deck.toggle_key_lock(engine);
@@ -707,7 +707,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 }
                 if ui
                     .small_button(format!("{:+}", deck.key_shift))
-                    .on_hover_text("Key shift in semitones; click to reset")
+                    .on_hover_text("Semitones; click to reset")
                     .clicked()
                 {
                     deck.set_key_shift(0, engine);
@@ -721,9 +721,9 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 p.out.key_sync = toggle(ui, deck.key_synced, "KEY")
-                    .on_hover_text("Key sync: match the master deck's key")
+                    .on_hover_text("Match the master's key")
                     .clicked();
-                if ui.button("TAP").on_hover_text("Tap four or more times to set the BPM").clicked()
+                if ui.button("TAP").on_hover_text("Tap the BPM").clicked()
                     && let Some(bpm) = deck.tap_bpm()
                 {
                     p.out.status = Some(format!("Deck {}: BPM set to {bpm:.2} by tapping", index + 1));
@@ -732,7 +732,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::GridEdit => {
             if toggle(ui, deck.grid_edit, "GRID")
-                .on_hover_text("Edit the beat grid in place of the pads: set where it starts, move it, set the BPM")
+                .on_hover_text("Edit the beat grid")
                 .clicked()
             {
                 deck.grid_edit = !deck.grid_edit;
@@ -753,7 +753,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             if slider.changed() {
                 deck.set_tempo_fader(-fader, engine);
             }
-            slider.on_disabled_hover_text("Tempo follows the master while SYNC is on");
+            slider.on_disabled_hover_text("Follows the master (SYNC)");
         }
         E::TempoReset => {
             if ui.button("Reset").on_hover_text("Tempo back to ±0").clicked() {
@@ -803,14 +803,14 @@ fn grid_editor(
                 .min_size(vec2(ui.available_width() - renumber.x - PAD_GAP, row_height));
             if ui
                 .add(start)
-                .on_hover_text("Put beat 1 (a downbeat) exactly at the needle; the grid runs on from it at the same BPM")
+                .on_hover_text("Beat 1 here")
                 .clicked()
             {
                 edited |= deck.downbeat_here(position);
             }
             if ui
                 .add(egui::Button::new("1 ↻").min_size(renumber))
-                .on_hover_text("Make the beat nearest the needle beat 1 of its bar (no beat moves)")
+                .on_hover_text("Nearest beat starts the bar")
                 .clicked()
             {
                 edited |= deck.renumber_here(position);
@@ -848,7 +848,7 @@ fn grid_editor(
                         .range(20.0..=999.0)
                         .clamp_existing_to_range(false),
                 )
-                .on_hover_text("The track's BPM: drag, or click and type");
+                .on_hover_text("BPM: drag or type");
             changed |= field.changed() && (field.dragged() || field.has_focus() || field.lost_focus());
             if ui.add(egui::Button::new("+").min_size(w)).on_hover_text("BPM +0.01").clicked() {
                 (bpm, changed) = (bpm + 0.01, true);
@@ -866,7 +866,7 @@ fn grid_editor(
         }
     })
     .response
-    .on_disabled_hover_text("This track's grid changes tempo; only one-tempo grids can be edited for now");
+    .on_disabled_hover_text("Variable-tempo grids can't be edited yet");
     if edited {
         let bpm = deck.track.as_ref().map_or(0.0, |t| t.bpm);
         out.status = Some(format!("Deck {}: beat grid edited ({bpm:.2} BPM)", index + 1));
@@ -925,9 +925,9 @@ fn stems_strip(ui: &Ui, rect: egui::Rect, layers: &deckhand_audio::StemLayers) {
     }
     let share = layers.ready_share();
     ui.interact(rect, ui.id().with("stems strip"), Sense::hover()).on_hover_text(if share < 1.0 {
-        format!("Stems: {:.0}% separated; the dim parts play the original", share * 100.0)
+        format!("Stems {:.0}% ready", share * 100.0)
     } else {
-        "Stems: the whole track is separated".to_owned()
+        "Stems ready".to_owned()
     });
 }
 
@@ -983,7 +983,7 @@ fn stems_pads(
                 .min_size(pads.pad);
             if ui
                 .add_enabled(ready, iso)
-                .on_hover_text("Part Isolator: the HI, MID and LOW knobs set the vocal, instrument and drum levels")
+                .on_hover_text("HI / MID / LOW: vocal, inst, drums")
                 .clicked()
             {
                 deck.toggle_part_isolator(engine);
@@ -1117,7 +1117,7 @@ fn pad_fx_area(
                             .sense(Sense::click_and_drag());
                         let response =
                             ui.add_enabled(deck.track.is_some(), button).on_hover_text(format!(
-                                "Pad {}: hold for {}; Shift or right-click for {}",
+                                "Pad {}: hold {}; Shift {}",
                                 char::from(b'A' + fx as u8),
                                 set.label(),
                                 effects.pad_slot((fx + 8) % 16).label(),
@@ -1160,7 +1160,7 @@ fn pad_fx_area(
                 if deck.pad_fx_settings
                     && ui
                         .small_button("↺")
-                        .on_hover_text("Factory settings for this page's pads")
+                        .on_hover_text("Reset these pads")
                         .clicked()
                 {
                     let defaults = PadFxSlot::defaults().into_iter().enumerate();

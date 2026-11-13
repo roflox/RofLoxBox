@@ -1,6 +1,7 @@
 //! Making tracks from stems (Make → acapella, instrumental, …) and the Stems
 //! page of Preferences.
 
+use crate::tour::Tag as _;
 use std::path::PathBuf;
 
 use deckhand_library::Derived;
@@ -238,6 +239,7 @@ impl DeckhandApp {
         let found = model.as_ref().and_then(stems::helper_python);
         ui.horizontal(|ui| {
             ui.label("Python for Demucs:");
+            crate::widgets::help(ui, "Point to the Python that has Demucs; without it, separating is much slower.");
             let (text, color) = match (&found, &self.config.prefs.demucs_python) {
                 (Some(python), _) if !python.is_file() => {
                     (format!("{} (not there)", python.display()), Some(WARN))
@@ -273,16 +275,6 @@ impl DeckhandApp {
                 self.config.prefs.demucs_python = None;
             }
         });
-        ui.label(
-            RichText::new(
-                "Demucs models separate live stems fastest in a helper that keeps the model \
-                 loaded, run by the Python Demucs is installed in. Without it, each piece \
-                 starts Demucs again and takes several times as long. With pipx on Windows it \
-                 is usually %LOCALAPPDATA%\\pipx\\pipx\\venvs\\demucs\\Scripts\\python.exe.",
-            )
-            .small()
-            .weak(),
-        );
     }
 
     /// Whether separated stems stay on disk, and how much they take.
@@ -304,25 +296,17 @@ impl DeckhandApp {
             });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.config.prefs.keep_stems, "Keep stems on disk");
+            crate::widgets::help(ui, "Keeps stems between runs (up to 2 GB).");
             ui.label(RichText::new(format!("{:.1} GB now", bytes as f64 / 1e9)).small().weak());
             if ui
                 .add_enabled(bytes > 0 && !separating, egui::Button::new("Delete now"))
-                .on_disabled_hover_text("Not while a track is being separated")
+                .on_disabled_hover_text("Not while separating")
                 .clicked()
             {
                 stems::clear_cache();
                 self.stem_cache_size = None;
             }
         });
-        ui.label(
-            RichText::new(
-                "On, tracks separated before load with their stems at once, also after a \
-                 restart (up to 2 GB; the tracks used least recently go first). Off, the \
-                 stems are deleted when the app quits.",
-            )
-            .small()
-            .weak(),
-        );
     }
 
     /// The Stems page of Preferences; returns whether a setting changed.
@@ -338,18 +322,25 @@ impl DeckhandApp {
         );
         let dir = stems::models_dir();
         let chosen = self.stem_model().map(|m| m.id.clone());
-        ui.label(RichText::new("Model").strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Model").strong().size(15.0));
+            crate::widgets::help(ui, "A model is a folder with a model.toml.");
+        });
         if self.stem_models.0.is_empty() {
             ui.label("No models yet. Add one of the presets below, or a folder of your own.");
         }
-        for model in &self.stem_models.0 {
-            ui.horizontal(|ui| {
-                if ui.radio(chosen.as_deref() == Some(model.id.as_str()), &model.name).clicked() {
-                    self.config.prefs.stem_model = model.id.clone();
-                }
-                ui.label(RichText::new(model.stems.join(", ")).small().weak());
-            });
-        }
+        ui.vertical(|ui| {
+            for model in &self.stem_models.0 {
+                ui.horizontal(|ui| {
+                    if ui.radio(chosen.as_deref() == Some(model.id.as_str()), &model.name).clicked() {
+                        self.config.prefs.stem_model = model.id.clone();
+                    }
+                    ui.label(RichText::new(model.stems.join(", ")).small().weak());
+                });
+            }
+        })
+        .response
+        .tour(crate::tour::Target::StemModels);
         for error in &self.stem_models.1 {
             ui.label(RichText::new(format!("Not read: {error}")).small().color(WARN));
         }
@@ -362,16 +353,9 @@ impl DeckhandApp {
                 self.stem_models = stems::load_models(&dir);
             }
         });
-        ui.label(
-            RichText::new(
-                "A model is a folder with a model.toml: its name, its stems and the command that \
-                 separates a track ({input} into {output}). Any separation tool can be used.",
-            )
-            .small()
-            .weak(),
-        );
         ui.add_space(6.0);
-        ui.collapsing("Add a preset", |ui| {
+        let open = std::mem::take(&mut self.open_stem_presets).then_some(true);
+        let presets = egui::CollapsingHeader::new("Add a preset").open(open).show(ui, |ui| {
             for preset in &stems::PRESETS {
                 ui.horizontal(|ui| {
                     let there = self.stem_models.0.iter().any(|m| m.id == preset.id);
@@ -387,16 +371,25 @@ impl DeckhandApp {
                             Err(err) => self.collection_view.error = Some(format!("{err:#}")),
                         }
                     }
-                    ui.label(RichText::new(preset.install).small().monospace().weak());
                 });
+                ui.indent(preset.id, |ui| crate::widgets::command(ui, preset.install));
             }
         });
+        let presets = match presets.body_response {
+            Some(body) => presets.header_response.union(body),
+            None => presets.header_response,
+        };
+        presets.tour(crate::tour::Target::StemPresets);
         ui.add_space(6.0);
-        ui.label(RichText::new("Live stems").strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Live stems").strong().size(15.0));
+            crate::widgets::help(ui, "Stems are made while the track plays. Off keeps the app light.");
+        });
         let mut on = self.config.prefs.live_stems;
         if ui
             .checkbox(&mut on, "Stems on the decks")
-            .on_hover_text("Off: decks play tracks only and nothing is separated for them")
+            .on_hover_text("Off: no separating")
+            .tour(crate::tour::Target::LiveStems)
             .changed()
         {
             self.set_live_stems(on);
@@ -405,21 +398,12 @@ impl DeckhandApp {
             ui.checkbox(&mut self.config.prefs.stems_on_load, "Separate tracks when they load");
             self.demucs_python_prefs(ui);
         });
-        ui.label(
-            RichText::new(
-                "The deck plays the track at once. Its stems are made a piece at a time, \
-                 starting where it plays, and each piece plays as soon as it is ready (at once \
-                 for tracks separated before). VOCAL, INST, BASS and DRUMS then turn parts \
-                 off; with all of them on, the deck plays the original. Separating takes a lot \
-                 of processing while it runs; turn stems off to keep the app light. Making \
-                 tracks from stems works either way.",
-            )
-            .small()
-            .weak(),
-        );
         self.stem_cache_prefs(ui);
         ui.add_space(6.0);
-        ui.label(RichText::new("Made tracks").strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Made tracks").strong().size(15.0));
+            crate::widgets::help(ui, "24-bit WAV, cues and grid stay in place.");
+        });
         let folder = self.stems_folder();
         ui.label(folder.display().to_string());
         ui.horizontal(|ui| {
@@ -437,14 +421,6 @@ impl DeckhandApp {
                 self.config.prefs.stems_folder = None;
             }
         });
-        ui.label(
-            RichText::new(
-                "Saved as 24-bit WAV, which keeps the original's timing exactly, so its cues, \
-                 memory cues, loops and beat grid fit the made track.",
-            )
-            .small()
-            .weak(),
-        );
         let p = &self.config.prefs;
         (
             p.stem_model.clone(),

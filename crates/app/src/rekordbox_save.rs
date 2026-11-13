@@ -20,10 +20,11 @@ use deckhand_library::{Cue, CueKind, Node, NodeKind, Track};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::deck::{KeyNotation, format_key, parse_key};
-use crate::rekordbox_db::{HOT_CUE_COLORS, Usn, integer, now, rekordbox_running, write};
+use crate::rekordbox_db::{Backup, HOT_CUE_COLORS, Usn, integer, now, rekordbox_closed, write};
 
-/// The collection as it is to be saved.
-#[derive(Debug, Clone, Default)]
+/// The collection as it is to be saved; only one read from rekordbox has
+/// one ([`Snapshot::of`]).
+#[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Every track of the collection; matched to rekordbox's by file path.
     pub tracks: Vec<Track>,
@@ -32,7 +33,19 @@ pub struct Snapshot {
     /// leaving rekordbox's playlists as they are.
     pub playlists: Option<Vec<Node>>,
     /// rekordbox's change count when deckhand last read the library.
-    pub read_count: Option<i64>,
+    read_count: i64,
+}
+
+impl Snapshot {
+    /// What of `collection` goes into rekordbox; `None` if it was never
+    /// read from rekordbox (saving would undo all of rekordbox's changes).
+    pub fn of(collection: &deckhand_library::Collection) -> Option<Self> {
+        Some(Self {
+            read_count: collection.rekordbox_count?,
+            tracks: collection.tracks.clone(),
+            playlists: collection.rekordbox_playlists(),
+        })
+    }
 }
 
 /// What a save changed.
@@ -76,15 +89,10 @@ impl std::error::Error for RekordboxRunning {}
 /// rekordbox must be closed ([`RekordboxRunning`] otherwise); the library
 /// is copied into `backups` first.
 pub fn save(path: &Path, key: &str, snapshot: &Snapshot, backups: &Path) -> Result<Saved> {
-    if rekordbox_running() {
-        return Err(RekordboxRunning.into());
-    }
-    let Some(read_count) = snapshot.read_count else {
-        bail!("read rekordbox's library into deckhand first");
-    };
+    let closed = rekordbox_closed().ok_or(RekordboxRunning)?;
     let share = path.parent().unwrap_or(Path::new("")).join("share");
-    let written = write(path, key, backups, |db, usn| {
-        if usn.0 != read_count {
+    let written = write(&closed, path, key, backups, |db, usn| {
+        if usn.0 != snapshot.read_count {
             bail!(
                 "rekordbox changed its library since deckhand read it, and saving would undo \
                  that. Read the rekordbox library again (deckhand's changes to it are replaced), \
@@ -100,8 +108,7 @@ pub fn save(path: &Path, key: &str, snapshot: &Snapshot, backups: &Path) -> Resu
     if let Some(backup) = &written.backup {
         let list = path.with_file_name("masterPlaylists6.xml");
         if !plan.list.is_empty() && list.is_file() {
-            std::fs::copy(&list, backup.join("masterPlaylists6.xml"))?;
-            update_playlist_list(&list, &plan.list)?;
+            update_playlist_list(&list, &plan.list, backup)?;
         }
         for (dat, track) in &plan.grids {
             write_grid(dat, track, &share, backup)
@@ -975,8 +982,9 @@ fn list_id(id: &str) -> String {
 }
 
 /// Applies `changes` to rekordbox's `masterPlaylists6.xml`, keeping the
-/// rest of the file as it is.
-fn update_playlist_list(path: &Path, changes: &[ListChange]) -> Result<()> {
+/// rest of the file as it is (and a copy of it in `backup`).
+fn update_playlist_list(path: &Path, changes: &[ListChange], backup: &Backup) -> Result<()> {
+    backup.keep(path, path.parent().unwrap_or(Path::new("")), "")?;
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let updated = changed_playlist_list(&text, changes, chrono::Utc::now().timestamp_millis());
@@ -1045,17 +1053,12 @@ fn changed_playlist_list(text: &str, changes: &[ListChange], millis: i64) -> Str
 /// Writes a track's beat grid into rekordbox's analysis file `dat` (and
 /// drops the summary of the old grid from the `.EXT` beside it), keeping
 /// copies of both in `backup`.
-fn write_grid(dat: &Path, track: &Track, share: &Path, backup: &Path) -> Result<()> {
+fn write_grid(dat: &Path, track: &Track, share: &Path, backup: &Backup) -> Result<()> {
     let mut file = AnlzFile::open(dat)?;
     let ext_path = dat.with_extension("EXT");
     let ext = AnlzFile::open(&ext_path).ok();
     for original in [Some(dat), ext.as_ref().map(|_| ext_path.as_path())].into_iter().flatten() {
-        let relative = original.strip_prefix(share).unwrap_or(original);
-        let copy = backup.join("share").join(relative);
-        if let Some(dir) = copy.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::copy(original, &copy)?;
+        backup.keep(original, share, "share")?;
     }
     crate::usb_export::replace_grid(&mut file, crate::usb_export::collection_grid(track));
     replace_file(dat, &file.to_bytes())?;
@@ -1135,11 +1138,7 @@ mod tests {
     }
 
     fn snapshot(c: &Collection) -> Snapshot {
-        Snapshot {
-            tracks: c.tracks.clone(),
-            playlists: c.rekordbox_playlists(),
-            read_count: c.rekordbox_count,
-        }
+        Snapshot::of(c).expect("read from rekordbox")
     }
 
     fn plain(root: &Path) -> Connection {
@@ -1360,8 +1359,9 @@ mod tests {
         let err =
             save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b")).unwrap_err();
         assert!(err.to_string().contains("changed its library"), "{err}");
+        // Never read from rekordbox: there's nothing to save with.
         c.rekordbox_count = None;
-        assert!(save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b")).is_err());
+        assert!(Snapshot::of(&c).is_none());
         assert_eq!(std::fs::read(root.join("master.db")).unwrap(), before);
         // Without the rekordbox folder, rekordbox's playlists stay.
         let mut c = collection(&root);

@@ -25,6 +25,7 @@ mod rekordbox_db;
 mod rekordbox_save;
 mod screen_layout;
 mod stems;
+mod tour;
 mod usb_export;
 mod usb_import;
 mod waveform;

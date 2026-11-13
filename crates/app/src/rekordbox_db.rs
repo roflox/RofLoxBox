@@ -170,6 +170,16 @@ fn change_count(db: &rusqlite::Connection) -> Result<i64> {
     Ok(count.flatten().unwrap_or(0))
 }
 
+/// rekordbox was found closed: [`write`] takes this, so nothing writes its
+/// library without asking first. (It could start right after; the change
+/// count checked inside the write catches what it changed.)
+pub(crate) struct Closed(());
+
+/// [`Closed`] if rekordbox isn't running.
+pub(crate) fn rekordbox_closed() -> Option<Closed> {
+    (!rekordbox_running()).then_some(Closed(()))
+}
+
 /// Whether rekordbox is running: its library must not be written then.
 pub fn rekordbox_running() -> bool {
     let output = if cfg!(windows) {
@@ -202,13 +212,33 @@ pub(crate) fn now() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f +00:00").to_string()
 }
 
+/// The folder the library was copied into before [`write`] changed it;
+/// only `write` makes one. Other files of rekordbox's are changed only
+/// through [`Backup::keep`], so they're copied first too.
+pub(crate) struct Backup(PathBuf);
+
+impl Backup {
+    /// Copies `original`, a file under `root`, into the backup (at the same
+    /// place under `name`); then it may be replaced.
+    pub fn keep(&self, original: &Path, root: &Path, name: &str) -> Result<()> {
+        let relative = original.strip_prefix(root).unwrap_or(original);
+        let copy = self.0.join(name).join(relative);
+        if let Some(dir) = copy.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::copy(original, &copy)
+            .with_context(|| format!("backing up {}", original.display()))?;
+        Ok(())
+    }
+}
+
 /// What [`write`] did.
 pub(crate) struct Written<T> {
     /// What the edit returned.
     pub result: T,
-    /// The folder the old library was copied into (also for other files
-    /// about to change); `None` when nothing changed and nothing was written.
-    pub backup: Option<PathBuf>,
+    /// Where the old library was copied; `None` when nothing changed and
+    /// nothing was written.
+    pub backup: Option<Backup>,
     /// rekordbox's change count now.
     pub count: i64,
 }
@@ -218,6 +248,7 @@ pub(crate) struct Written<T> {
 /// itself changes it. The library is copied into a new folder in `backups`
 /// first, and checked whole before the changes are committed.
 pub(crate) fn write<T>(
+    _closed: &Closed,
     path: &Path,
     passphrase: &str,
     backups: &Path,
@@ -257,7 +288,7 @@ pub(crate) fn write<T>(
     // Closing moves the write-ahead log into the file, as rekordbox does.
     db.close().map_err(|(_, e)| e)?;
     keep_newest(backups, 10);
-    Ok(Written { result, backup: Some(backup), count: usn.0 })
+    Ok(Written { result, backup: Some(Backup(backup)), count: usn.0 })
 }
 
 /// Deletes all but the newest `keep` backups (folders, or files from

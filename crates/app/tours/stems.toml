@@ -1,0 +1,78 @@
+# Installing a stem separator and turning stems on.
+id = "stems"
+name = "Set up stems"
+
+[[step]]
+target = "preferences"
+title = "Set up stems"
+text = """
+Stems split a track into vocals, drums, bass and the rest. \
+They need a free separating tool, installed once."""
+when = ["prefs-closed"]
+click-advances = false
+
+[[step]]
+target = "prefs-stems"
+title = "The Stems page"
+text = "Open it to set up a separator."
+when = [{ not-prefs-tab = "stems" }]
+wait = ["prefs-open"]
+
+[[step]]
+target = "stem-presets"
+title = "1. Install pipx"
+text = "pipx installs Python tools. Paste these into Terminal (needs Homebrew, brew.sh):"
+commands = ["brew install pipx", "pipx ensurepath"]
+when = ["mac-os"]
+wait = [{ prefs-tab = "stems" }]
+click-advances = false
+
+[[step]]
+target = "stem-presets"
+title = "1. Install pipx"
+text = "pipx installs Python tools. Paste these into a terminal (needs Python, python.org):"
+commands = ["py -m pip install --user pipx", "py -m pipx ensurepath"]
+when = ["windows"]
+wait = [{ prefs-tab = "stems" }]
+click-advances = false
+
+[[step]]
+target = "stem-presets"
+title = "1. Install pipx"
+text = "pipx installs Python tools. On Debian or Ubuntu:"
+commands = ["sudo apt install pipx", "pipx ensurepath"]
+when = ["linux"]
+wait = [{ prefs-tab = "stems" }]
+click-advances = false
+
+[[step]]
+target = "stem-presets"
+title = "2. Install Demucs"
+text = """
+Demucs does the separating (about 2 GB with its models). \
+In a new terminal window:"""
+commands = ["pipx install demucs && pipx inject demucs numpy soundfile"]
+wait = [{ prefs-tab = "stems" }]
+click-advances = false
+
+[[step]]
+target = "stem-presets"
+title = "3. Add the preset"
+text = "Click Demucs htdemucs (4 stems) under Add a preset."
+wait = [{ prefs-tab = "stems" }]
+click-advances = false
+
+[[step]]
+target = "stem-models"
+title = "4. Pick the model"
+text = "Choose Demucs htdemucs here."
+wait = [{ prefs-tab = "stems" }]
+click-advances = false
+
+[[step]]
+target = "live-stems"
+title = "5. Turn stems on"
+text = """
+Load a track: its stems are ready after a short while. \
+Use the STM pads on the deck to turn vocals, instruments, bass and drums off and on."""
+wait = [{ prefs-tab = "stems" }]

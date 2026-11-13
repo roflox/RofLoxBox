@@ -89,7 +89,7 @@ impl DeckhandApp {
                                 .truncate()
                                 .sense(Sense::click()),
                         )
-                        .on_hover_text("Click for the log: every message in full")
+                        .on_hover_text("Click for the log")
                         .clicked();
                 });
             });

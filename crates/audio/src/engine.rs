@@ -276,6 +276,9 @@ pub enum Command {
         deck: usize,
         later: f64,
     },
+    /// A spot marked while recording, to find again in EDIT (for
+    /// sessions; the mixer ignores it).
+    Marker,
     /// Which deck leads and which follow it (for sessions; the mixer
     /// ignores it).
     SyncState {
@@ -1080,7 +1083,7 @@ impl Mixer {
             Command::SetMasterVolume(level) => self.master = level,
             Command::SetHeadphoneMix(mix) => self.headphone_mix = mix.clamp(0.0, 1.0),
             Command::SetHeadphoneVolume(level) => self.headphone_volume = level,
-            Command::SyncState { .. } | Command::SyncOffset { .. } => {}
+            Command::Marker | Command::SyncState { .. } | Command::SyncOffset { .. } => {}
         }
     }
 

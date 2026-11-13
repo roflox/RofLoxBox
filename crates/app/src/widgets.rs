@@ -410,3 +410,49 @@ pub fn disclosure(ui: &mut Ui, open: bool) -> Response {
     ui.painter().add(Shape::convex_polygon(points, color, Stroke::NONE));
     response
 }
+
+/// A small round "?" that shows `text` when hovered.
+pub fn help(ui: &mut Ui, text: &str) -> Response {
+    let size = ui.text_style_height(&eframe::egui::TextStyle::Body).max(14.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let visuals = ui.style().interact(&response);
+    let color = if response.hovered() { visuals.fg_stroke.color } else { ui.visuals().weak_text_color() };
+    let painter = ui.painter();
+    painter.circle_stroke(rect.center(), size * 0.45, eframe::egui::Stroke::new(1.0_f32, color));
+    painter.text(
+        rect.center(),
+        eframe::egui::Align2::CENTER_CENTER,
+        "?",
+        eframe::egui::FontId::proportional(size * 0.7),
+        color,
+    );
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(320.0);
+        ui.label(text);
+    })
+}
+
+/// A shell command in monospace with a Copy button next to it.
+pub fn command(ui: &mut Ui, command: &str) {
+    ui.horizontal(|ui| {
+        eframe::egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .corner_radius(3.0)
+            .inner_margin(eframe::egui::Margin::symmetric(6, 2))
+            .show(ui, |ui| {
+                ui.add(eframe::egui::Label::new(eframe::egui::RichText::new(command).monospace()).wrap());
+            });
+        let id = ui.id().with(("copied", command));
+        let now = ui.input(|i| i.time);
+        let copied_at: Option<f64> = ui.ctx().data(|d| d.get_temp(id));
+        let recent = copied_at.is_some_and(|t| now - t < 1.5);
+        let label = if recent { "Copied" } else { "Copy" };
+        if ui.small_button(label).on_hover_text("Copy to the clipboard").clicked() {
+            ui.ctx().copy_text(command.to_owned());
+            ui.ctx().data_mut(|d| d.insert_temp(id, now));
+        }
+        if recent {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    });
+}

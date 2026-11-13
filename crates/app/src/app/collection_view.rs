@@ -1,6 +1,7 @@
 //! The browser for deckhand's own collection: folders of playlists on the
 //! left, tracks on the right, adding music by folder, file or drag and drop.
 
+use crate::tour::Tag as _;
 use std::path::PathBuf;
 
 use deckhand_library::{CueKind, NodeKind, Scan};
@@ -334,29 +335,21 @@ impl DeckhandApp {
                     .password(true)
                     .desired_width(320.0),
             );
+            crate::widgets::help(ui, "rekordbox's library is encrypted. The key is downloaded once from pyrekordbox; or enter it yourself.");
         });
-        ui.label(
-            RichText::new(
-                "rekordbox encrypts its library. deckhand doesn't come with the key: the first \
-                 time, it downloads the one the pyrekordbox project publishes and keeps it here. \
-                 Should that ever fail, enter the key yourself.",
-            )
-            .small()
-            .weak(),
-        );
-        ui.checkbox(&mut self.config.prefs.rekordbox_at_start, "Update from rekordbox at start");
-        ui.label(
-            RichText::new(
-                "rekordbox's tracks, tags, beat grids, hot cues, memory cues, loops, ratings, \
-                 colours and playlists come into the collection, with the playlists in the \
-                 rekordbox folder (replacing the ones of the last import). Intelligent \
-                 playlists are not read.",
-            )
-            .small()
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.config.prefs.rekordbox_at_start, "Update from rekordbox at start");
+            crate::widgets::help(ui, "Imports tracks, cues, grids and playlists (into the rekordbox folder). Intelligent playlists are skipped.");
+        });
         let mut writable = self.config.prefs.rekordbox_write;
-        if ui.checkbox(&mut writable, "Write changes back to rekordbox").changed() {
+        let write = ui.horizontal(|ui| {
+            let write = ui
+                .checkbox(&mut writable, "Write changes back to rekordbox")
+                .tour(crate::tour::Target::RekordboxWrite);
+            crate::widgets::help(ui, "On: saving writes your tags, cues, grids and rekordbox-folder playlists into rekordbox's library. rekordbox must be closed; a copy is kept before each save.");
+            write
+        });
+        if write.inner.changed() {
             if writable {
                 self.collection_view.confirm_rekordbox_write = true;
             } else {
@@ -367,25 +360,10 @@ impl DeckhandApp {
             ui.indent("rekordbox autosave", |ui| {
                 ui.checkbox(&mut self.config.prefs.rekordbox_autosave, "Save automatically")
                     .on_hover_text(
-                        "A few seconds after a change, in the background; while rekordbox is \
-                         open, once it's closed; at quit, what's left",
+                        "Shortly after each change, once rekordbox is closed",
                     );
             });
         }
-        ui.label(
-            RichText::new(
-                "Off, rekordbox's files are never changed. On, saving (automatically, or with \
-                 \"Save changes to rekordbox\") makes rekordbox's library what deckhand has: \
-                 tags, ratings, colours, hot cues, \
-                 memory cues, loops and beat grids of its tracks, and the playlists in the \
-                 rekordbox folder (made, renamed, moved, reordered or deleted). Tracks put into \
-                 those playlists are added to rekordbox. rekordbox has to be closed, and must \
-                 not have changed its library since deckhand read it. deckhand keeps a copy of \
-                 the library from before each save.",
-            )
-            .small()
-            .weak(),
-        );
         if self.collection_view.confirm_rekordbox_write {
             self.confirm_rekordbox_write(ui.ctx());
         }
@@ -419,13 +397,12 @@ impl DeckhandApp {
             ui.label(RichText::new("Back up your rekordbox library first").strong().size(16.0));
             ui.add_space(4.0);
             ui.label(
-                "deckhand will change rekordbox's own library. Before turning this on, make a \
-                 backup in rekordbox: File → Library → Backup Library.",
+                "This changes rekordbox's library. Back it up first: File > Library > Backup Library.",
             );
             ui.add_space(4.0);
             ui.label(
                 RichText::new(format!(
-                    "deckhand also keeps a copy of the library from before each save, in {}.",
+                    "A copy is kept before each save, in {}.",
                     backups.display()
                 ))
                 .small()
@@ -459,8 +436,7 @@ impl DeckhandApp {
                 egui::Button::new("Save changes to rekordbox"),
             )
             .on_hover_text(
-                "Writes tags, cues, beat grids and the rekordbox folder's playlists into \
-                 rekordbox's library. Close rekordbox first.",
+                "Write changes to rekordbox's library. Close rekordbox first.",
             )
             .clicked()
             && let Some(path) = path
@@ -469,13 +445,10 @@ impl DeckhandApp {
         }
     }
 
-    /// What of the collection rekordbox's library gets, ready to save.
-    fn rekordbox_snapshot(&self) -> crate::rekordbox_save::Snapshot {
-        crate::rekordbox_save::Snapshot {
-            tracks: self.collection.tracks.clone(),
-            playlists: self.collection.rekordbox_playlists(),
-            read_count: self.collection.rekordbox_count,
-        }
+    /// What of the collection rekordbox's library gets, ready to save;
+    /// `None` until the library was read.
+    fn rekordbox_snapshot(&self) -> Option<crate::rekordbox_save::Snapshot> {
+        crate::rekordbox_save::Snapshot::of(&self.collection)
     }
 
     /// A fingerprint of what saving into rekordbox writes, to tell cheaply
@@ -581,9 +554,7 @@ impl DeckhandApp {
             ui.label(RichText::new("Unsaved changes for rekordbox").strong().size(16.0));
             ui.add_space(4.0);
             ui.label(
-                "rekordbox's library doesn't have your latest changes yet, and they can't be \
-                 saved while rekordbox is open. Please close rekordbox: RofLoxBox then saves \
-                 them and quits.",
+                "Close rekordbox to save your changes into it; RofLoxBox then quits.",
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -596,8 +567,7 @@ impl DeckhandApp {
                 quit = ui
                     .button("Quit anyway")
                     .on_hover_text(
-                        "The changes stay in RofLoxBox and go into rekordbox's library at its \
-                         next start, once rekordbox is closed",
+                        "Saved into rekordbox once it's closed",
                     )
                     .clicked();
             });
@@ -626,14 +596,12 @@ impl DeckhandApp {
             && self.collection.rekordbox_count.is_some()
             && !crate::rekordbox_db::rekordbox_running()
             && let Some(path) = self.rekordbox_db().filter(|p| p.is_file())
+            && let Some(snapshot) = self.rekordbox_snapshot()
         {
             self.collection_view.rekordbox_due = None;
             let print = self.rekordbox_fingerprint();
-            let result = save_into_rekordbox(
-                &path,
-                &self.config.prefs.rekordbox_key,
-                &self.rekordbox_snapshot(),
-            );
+            let result =
+                save_into_rekordbox(&path, &self.config.prefs.rekordbox_key, &snapshot);
             self.rekordbox_saved(result, print, true);
         }
         let _ = self.collection.save();
@@ -642,8 +610,12 @@ impl DeckhandApp {
     /// Writes the collection's changes into rekordbox's library in the
     /// background; `auto`: started by itself, so quiet about it.
     fn save_to_rekordbox(&mut self, path: PathBuf, auto: bool) {
-        let snapshot = self.rekordbox_snapshot();
         let print = self.rekordbox_fingerprint();
+        let Some(snapshot) = self.rekordbox_snapshot() else {
+            let never_read = anyhow::anyhow!("read rekordbox's library into deckhand first");
+            self.rekordbox_saved(Err(never_read), print, auto);
+            return;
+        };
         let key = self.config.prefs.rekordbox_key.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -856,7 +828,7 @@ impl DeckhandApp {
         }
         if ui
             .button("Rescan added folders")
-            .on_hover_text("Look for new and changed files in the added folders")
+            .on_hover_text("Rescan added folders")
             .clicked()
         {
             ui.close();
@@ -865,8 +837,7 @@ impl DeckhandApp {
         if ui
             .button("Import rekordbox library")
             .on_hover_text(
-                "Reads rekordbox's own library on this computer (read only): tracks, playlists, \
-                 beat grids, cues, ratings and colours. Settings in Preferences → Library.",
+                "Read rekordbox's library on this computer",
             )
             .clicked()
         {
@@ -877,7 +848,7 @@ impl DeckhandApp {
         if ui
             .button("Import rekordbox XML…")
             .on_hover_text(
-                "In rekordbox: File → Export Collection in xml format. Brings tracks, playlists, beat grids, hot cues, memory cues, ratings and colours.",
+                "rekordbox: File > Export Collection in xml format",
             )
             .clicked()
         {
@@ -893,8 +864,7 @@ impl DeckhandApp {
         if ui
             .button("Analyze tracks without a grid or key")
             .on_hover_text(
-                "Works out BPM, beat grid and key where a track has none. Grids from rekordbox \
-                 and ones you edited are kept; right-click a track to analyze it again.",
+                "Detect missing BPM, grids and keys",
             )
             .clicked()
         {
@@ -1091,7 +1061,7 @@ impl DeckhandApp {
                     }
                 });
                 ui.label(
-                    RichText::new("Changes stay in RofLoxBox; the audio file is not changed, and rescans keep your edits.")
+                    RichText::new("The audio file isn't changed.")
                         .small()
                         .weak(),
                 );
@@ -1101,7 +1071,7 @@ impl DeckhandApp {
                     if edited {
                         revert = ui
                             .button("Back to the file's tags")
-                            .on_hover_text("Forget the edits and read the tags from the file again")
+                            .on_hover_text("Re-read the file's tags")
                             .clicked();
                     }
                 });
@@ -1281,7 +1251,7 @@ impl DeckhandApp {
                         }
                         if ui
                             .button("Choose folder…")
-                            .on_hover_text("A stick or folder without an export gets a new one")
+                            .on_hover_text("Creates an export if there's none")
                             .clicked()
                         {
                             ui.close();
@@ -1400,7 +1370,8 @@ impl DeckhandApp {
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Search title, artist, album, genre, label")
                     .desired_width(320.0),
-            );
+            )
+            .tour(crate::tour::Target::LibrarySearch);
             if let Some(id) = self.selected {
                 ui.separator();
                 for deck in 0..deck_count {
@@ -1523,7 +1494,7 @@ impl DeckhandApp {
                         if ui
                             .button(format!("Analyze BPM, grid and key{many}"))
                             .on_hover_text(
-                                "Replaces the track's beat grid and key with newly detected ones",
+                                "Detect grid and key again",
                             )
                             .clicked()
                         {
@@ -1541,8 +1512,7 @@ impl DeckhandApp {
                                 if ui
                                     .button("Stems ready for the decks")
                                     .on_hover_text(
-                                        "Separates now, in the background: loaded later, the \
-                                         tracks have their stems at once",
+                                        "Separate stems now",
                                     )
                                     .clicked()
                                 {
@@ -1573,7 +1543,7 @@ impl DeckhandApp {
                             && ui
                                 .button("Update cues from original")
                                 .on_hover_text(
-                                    "Copies the original's cues, grid and key to this track again",
+                                    "Copy cues, grid and key from the original",
                                 )
                                 .clicked()
                         {

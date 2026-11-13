@@ -335,9 +335,9 @@ pub fn track_table(
                         })
                         .inner
                         .on_hover_text(if column.sortable() {
-                            "Click to sort; again to reverse; a third time for playlist order. Drag to move the column. Right-click to choose columns."
+                            "Click: sort. Drag: move. Right-click: columns."
                         } else {
-                            "Drag to move the column. Right-click to choose columns."
+                            "Drag: move. Right-click: columns."
                         });
                     // Dragging a header onto another moves it there (in front
                     // of it, or behind it on its right half).

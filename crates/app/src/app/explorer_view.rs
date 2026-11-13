@@ -170,7 +170,7 @@ impl DeckhandApp {
                 self.explorer.open = !self.explorer.open;
             }
             ui.label(RichText::new("EXPLORER").strong()).on_hover_text(
-                "Folders of this computer: load files without adding them to the collection",
+                "Load files without adding them",
             );
         });
         if !self.explorer.open {
@@ -323,7 +323,7 @@ impl DeckhandApp {
             ui.separator();
             if ui
                 .button("Add folder to collection")
-                .on_hover_text("Adds this folder and its subfolders, and keeps it scanned")
+                .on_hover_text("Add with subfolders, kept scanned")
                 .clicked()
             {
                 self.add_music(vec![folder.clone()]);
