@@ -198,6 +198,11 @@ pub struct Preferences {
     pub highlight_compatible_keys: bool,
     /// EDIT: the view moves along with the playhead while playing.
     pub edit_follow_playhead: bool,
+    /// EDIT: EQ points can go above 0 dB without holding Option/Alt.
+    pub edit_eq_boost: bool,
+    /// EDIT: what deleting a deck's audio takes along without asking
+    /// (`None`: ask each time).
+    pub edit_delete: Option<deckhand_audio::DeleteOptions>,
     pub theme: Theme,
     /// Text size in percent of the normal size.
     pub text_scale: u32,
@@ -326,6 +331,8 @@ impl Default for Preferences {
             key_notation: Default::default(),
             highlight_compatible_keys: true,
             edit_follow_playhead: false,
+            edit_eq_boost: false,
+            edit_delete: None,
             theme: Theme::Dark,
             text_scale: 100,
             stem_model: String::new(),

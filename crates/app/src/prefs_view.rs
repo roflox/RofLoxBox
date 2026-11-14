@@ -107,8 +107,12 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
         section(ui, "Needle Lock", "Locked: the small waveform of a playing deck doesn't jump.", |ui| {
             lock(ui, &mut p.needle_lock);
         });
-        section(ui, "EDIT", "The view scrolls along while playing.", |ui| {
+        section(ui, "EDIT", "The view scrolls along while playing. EQ points stop at 0 dB unless you hold Option/Alt, or allow boosting here.", |ui| {
             ui.checkbox(&mut p.edit_follow_playhead, "Follow playhead");
+            ui.checkbox(&mut p.edit_eq_boost, "EQ can boost above 0 dB");
+            if p.edit_delete.is_some() && ui.button("Ask again before deleting audio").clicked() {
+                p.edit_delete = None;
+            }
         });
         section(ui, "Key display format", "On decks and in lists.", |ui| {
             use crate::deck::KeyNotation;
@@ -192,6 +196,8 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.key_notation = defaults.key_notation;
             p.highlight_compatible_keys = defaults.highlight_compatible_keys;
             p.edit_follow_playhead = defaults.edit_follow_playhead;
+            p.edit_eq_boost = defaults.edit_eq_boost;
+            p.edit_delete = defaults.edit_delete;
             p.analysis = defaults.analysis;
             p.waveform_detail = defaults.waveform_detail;
             p.auto_master = defaults.auto_master;

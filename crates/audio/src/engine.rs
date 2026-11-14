@@ -1719,6 +1719,17 @@ impl Snapshot {
         self.decks[deck].key_lock
     }
 
+    /// What a deck was doing to its record besides playing it: its loop
+    /// (seconds in the track), Vinyl Speed Adjust (start, brake), slip,
+    /// key shift (semitones) and nudge.
+    pub(crate) fn deck_play(&self, deck: usize) -> (Option<(f64, f64)>, (f64, f64), bool, f64, f64) {
+        let d = &self.decks[deck];
+        let rate = d.audio.as_ref().map_or(1.0, |a| f64::from(a.sample_rate));
+        let looped = d.loop_frames.map(|(start, end)| (start / rate, end / rate));
+        let semitones = 12.0 * d.key_ratio.max(1e-9).log2();
+        (looped, (d.start_secs, d.brake_secs), d.slip, semitones, d.nudge)
+    }
+
     /// A deck's stems.
     pub(crate) fn stems(&self, deck: usize) -> Option<&Arc<crate::stems::StemLayers>> {
         self.decks[deck].stems.as_ref()

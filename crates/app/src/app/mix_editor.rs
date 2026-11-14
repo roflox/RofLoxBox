@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use deckhand_audio::{
-    BeatFxKind, BeatFxParams, ColorFxKind, Curve, FxTarget, Point, Session, Setting, SyncSpan,
+    BeatFxKind, BeatFxParams, ColorFxKind, Curve, DeleteOptions, FxTarget, Point, Session, Setting, SyncSpan,
     TrackMove, TrackSpan, fx_spans, lane_value, move_fx, remove_fx, restyle_fx,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
@@ -57,6 +57,10 @@ const DECK_ROW: f32 = 26.0;
 /// A deck's row with its waveform.
 const TRACK_ROW: f32 = 52.0;
 const LANE_ROW: f32 = 56.0;
+/// A deck's Motion row: how fast its record moved.
+const MOTION_ROW: f32 = 40.0;
+/// The Motion row's scale: this many times normal speed, either way.
+const MOTION_MAX: f64 = 2.5;
 const FX_ROW: f32 = 56.0;
 /// How far apart (frames) dragged points stay: saved points move to the
 /// nearest buffer start, and two on one would become one.
@@ -120,6 +124,9 @@ struct MixEditor {
     view_from: f64,
     view_secs: f64,
     selection: Option<(Setting, u64, u64)>,
+    /// Points picked (Normal tool: clicked, or inside a rectangle drawn
+    /// over the lanes), by lane and index.
+    picked_points: Vec<(Setting, usize)>,
     drag: Option<Drag>,
     undo: Vec<Change>,
     redo: Vec<Change>,
@@ -136,6 +143,13 @@ struct MixEditor {
     follow: bool,
     /// The view pages along with the playhead while playing.
     follow_playhead: bool,
+    /// EQ points may go above 0 dB (a preference; else only with
+    /// Option/Alt held).
+    eq_boost: bool,
+    /// What deleting a deck's audio takes along without asking (a
+    /// preference; `None` asks), and the dialog asking.
+    delete_default: Option<DeleteOptions>,
+    deleting: Option<Deleting>,
     resync: Option<Receiver<Result<usize>>>,
     /// The tracks moved, one being dragged, and the one ← and → move.
     moves: Vec<TrackMove>,
@@ -445,6 +459,8 @@ struct Change {
 /// moves, which change much) every event, compressed.
 enum Edit {
     Lane(Setting, Vec<Point>),
+    /// Several lanes at once (picked points moved, deleted, reshaped).
+    Lanes(Vec<(Setting, Vec<Point>)>),
     Move { deck: usize, at: u64, later: f64 },
     Fx(Vec<(u64, BeatFxParams)>),
     /// A deck's stem levels.
@@ -552,6 +568,15 @@ struct FxDrag {
     at: u64,
     from: u64,
     to: u64,
+}
+
+/// The Delete dialog: the stretches of decks to delete, what goes with
+/// them, whether that becomes the default, and where it shows.
+struct Deleting {
+    targets: Vec<(usize, u64, u64)>,
+    options: DeleteOptions,
+    remember: bool,
+    pos: Pos2,
 }
 
 /// A point's value being typed: the lane, the point's moment, the text,
@@ -777,6 +802,12 @@ enum Drag {
     Point { setting: Setting, index: usize, before: Vec<Point>, range: (f64, f64), pinned: bool },
     /// A stretch being selected from here.
     Select { setting: Setting, from: u64 },
+    /// A rectangle drawn from `origin` to `now` (Normal tool, from the lane
+    /// `setting`): the points in it are picked, along with `kept`.
+    Marquee { setting: Setting, origin: Pos2, now: Pos2, kept: Vec<(Setting, usize)> },
+    /// The picked points moved together, from where the pointer took hold:
+    /// their lanes as they were, and each lane's scale then.
+    Points { origin: Pos2, before: Vec<(Setting, Vec<Point>)>, ranges: Vec<(Setting, (f64, f64))>, height: f32 },
 }
 
 /// The edited set being played into a WAV in the background.
@@ -850,6 +881,7 @@ impl MixEditor {
             view_from,
             view_secs,
             selection: None,
+            picked_points: Vec::new(),
             drag: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -860,6 +892,9 @@ impl MixEditor {
             sync,
             follow: true,
             follow_playhead: false,
+            eq_boost: false,
+            delete_default: None,
+            deleting: None,
             resync: None,
             moves,
             move_drag: None,
@@ -984,6 +1019,15 @@ impl MixEditor {
         (lo + share.clamp(0.0, 1.0) * (hi - lo)).clamp(lo, hi)
     }
 
+    /// `value` as a point of `setting` may have it: EQ stops at 0 dB
+    /// unless boosting is allowed or Option/Alt is held.
+    fn capped(&self, setting: Setting, value: f64, alt: bool) -> f64 {
+        match setting {
+            Setting::Eq(..) if !self.eq_boost && !alt => value.min(0.0),
+            _ => value,
+        }
+    }
+
     /// The setting's value at a moment.
     fn value_at(&self, setting: Setting, at: u64) -> f64 {
         lane_value(&self.lanes[&setting], at)
@@ -1024,6 +1068,7 @@ impl MixEditor {
     /// Hands a lane's new points to the session, keeping the old for undo;
     /// `what` names the change.
     fn commit(&mut self, setting: Setting, before: Vec<Point>, what: &str) {
+        self.picked_points.retain(|p| p.0 != setting);
         let Ok(mut session) = self.session.lock() else { return };
         session.set_lane(setting, &self.lanes[&setting]);
         let lane = session.lane(setting);
@@ -1041,6 +1086,71 @@ impl MixEditor {
             self.replayed.retain(|p| p.0 != deck);
         }
         self.follow_tempo(setting);
+    }
+
+    /// [`MixEditor::commit`] for several lanes at once, as one change.
+    fn commit_lanes(&mut self, before: Vec<(Setting, Vec<Point>)>, what: &str) {
+        let Ok(mut session) = self.session.lock() else { return };
+        let mut changed = Vec::new();
+        for (setting, old) in before {
+            session.set_lane(setting, &self.lanes[&setting]);
+            let lane = session.lane(setting);
+            if lane != old {
+                changed.push((setting, old));
+            }
+            self.lanes.insert(setting, lane);
+        }
+        drop(session);
+        if changed.is_empty() {
+            return;
+        }
+        let count: usize = changed.len();
+        for (setting, _) in &changed {
+            if let Setting::Tempo(deck) = setting {
+                self.replayed.retain(|p| p.0 != *deck);
+            }
+        }
+        let tempo: Vec<Setting> = changed.iter().map(|c| c.0).collect();
+        self.record(format!("{what} ({count} lanes)"), Edit::Lanes(changed));
+        for setting in tempo {
+            self.follow_tempo(setting);
+        }
+    }
+
+    /// The picked points' lanes as they are now.
+    fn picked_lanes(&self) -> Vec<(Setting, Vec<Point>)> {
+        let mut settings: Vec<Setting> = self.picked_points.iter().map(|p| p.0).collect();
+        settings.sort();
+        settings.dedup();
+        settings.into_iter().map(|s| (s, self.lanes[&s].clone())).collect()
+    }
+
+    /// Delete: the picked points go (each lane's first stays).
+    fn delete_points(&mut self) {
+        let before = self.picked_lanes();
+        let mut picked = std::mem::take(&mut self.picked_points);
+        picked.sort_by(|a, b| b.cmp(a));
+        for (setting, index) in picked.into_iter().filter(|p| p.1 > 0) {
+            if let Some(lane) = self.lanes.get_mut(&setting)
+                && index < lane.len()
+            {
+                remove_point(lane, index);
+            }
+        }
+        self.commit_lanes(before, "delete points");
+    }
+
+    /// Gives the picked points a shape.
+    fn reshape_points(&mut self, curve: Curve) {
+        let before = self.picked_lanes();
+        for &(setting, index) in &self.picked_points {
+            if let Some(point) = self.lanes.get_mut(&setting).and_then(|l| l.get_mut(index)) {
+                point.curve = curve;
+            }
+        }
+        let picked = self.picked_points.clone();
+        self.commit_lanes(before, "shape");
+        self.picked_points = picked;
     }
 
     /// Keeps a change to undo (the last [`HISTORY`]); a new one ends what
@@ -1074,6 +1184,23 @@ impl MixEditor {
                 drop(session);
                 self.follow_tempo(setting);
                 Edit::Lane(setting, before)
+            }
+            Edit::Lanes(lanes) => {
+                let mut back = Vec::with_capacity(lanes.len());
+                for (setting, points) in lanes {
+                    back.push((setting, self.lanes[&setting].clone()));
+                    session.set_lane(setting, &points);
+                    self.lanes.insert(setting, session.lane(setting));
+                    if let Setting::Tempo(deck) = setting {
+                        self.replayed.retain(|p| p.0 != deck);
+                    }
+                }
+                drop(session);
+                self.picked_points.clear();
+                for (setting, _) in &back {
+                    self.follow_tempo(*setting);
+                }
+                Edit::Lanes(back)
             }
             Edit::Move { deck, at, later } => {
                 let before = session
@@ -1127,6 +1254,7 @@ impl MixEditor {
     }
 
     fn undo(&mut self) {
+        self.picked_points.clear();
         let Some(change) = self.undo.pop() else { return };
         if let Some(back) = self.apply(change.edit) {
             self.redo.push(Change { label: change.label, edit: back });
@@ -1135,6 +1263,7 @@ impl MixEditor {
     }
 
     fn redo(&mut self) {
+        self.picked_points.clear();
         let Some(change) = self.redo.pop() else { return };
         if let Some(back) = self.apply(change.edit) {
             self.undo.push(Change { label: change.label, edit: back });
@@ -1180,6 +1309,7 @@ impl MixEditor {
     fn mix_only(edit: &Edit) -> bool {
         match edit {
             Edit::Lane(setting, _) => !matches!(setting, Setting::Tempo(_)),
+            Edit::Lanes(lanes) => !lanes.iter().any(|(s, _)| matches!(s, Setting::Tempo(_))),
             Edit::Fx(_) | Edit::Stems(..) => true,
             Edit::Move { .. } | Edit::Events(_) => false,
         }
@@ -1781,7 +1911,9 @@ impl MixEditor {
             let hint = format!("{hint} (new and selected points)");
             if ui.selectable_label(self.shape == curve, label).on_hover_text(hint).clicked() {
                 self.shape = curve;
-                if idle && self.selection.is_some() {
+                if idle && !self.picked_points.is_empty() {
+                    self.reshape_points(curve);
+                } else if idle && self.selection.is_some() {
                     self.reshape(curve);
                 }
             }
@@ -2008,6 +2140,13 @@ impl MixEditor {
                         ui.allocate_exact_size(vec2(width, STEM_ROW), Sense::click_and_drag());
                     self.stems_row(ui, row, &response, deck);
                 }
+                // How fast the record moved: scratches, nudges, stops.
+                if let Some(deck) = deck
+                    && self.played.get(deck).is_some_and(|p| !p.levels.is_empty())
+                {
+                    let (row, _) = ui.allocate_exact_size(vec2(width, MOTION_ROW), Sense::hover());
+                    self.motion_row(ui, row, deck);
+                }
                 self.add_button(ui, |editor, ui| editor.lane_menu(ui, deck));
                 for setting in lanes {
                     let (row, response) =
@@ -2049,6 +2188,7 @@ impl MixEditor {
         self.add_fx_dialog(ui.ctx());
         self.stem_dialog(ui.ctx());
         self.point_edit_dialog(ui.ctx());
+        self.delete_dialog(ui.ctx());
     }
 
     /// A click on a group's name folds its lanes away or back; whether
@@ -2172,6 +2312,84 @@ impl MixEditor {
 
     /// A deck's tracks. Dragging one moves its audio (from where it starts
     /// playing, or with ⌥ from where it is grabbed); moves show as marks.
+    /// `deck`'s Motion row: the record's speed through its clips, as the
+    /// edit plays (1× is normal, 0 stopped, below 0 backwards), so
+    /// scratches, nudges, stops and spin-ups show.
+    fn motion_row(&self, ui: &Ui, row: Rect, deck: usize) {
+        let visuals = ui.visuals();
+        let color = DECK_COLORS[deck % DECK_COLORS.len()];
+        ui.painter().text(
+            pos2(row.left() + 4.0, row.top() + 4.0),
+            egui::Align2::LEFT_TOP,
+            "Motion",
+            egui::FontId::proportional(13.0),
+            color,
+        );
+        let area = Rect::from_min_max(pos2(row.left() + LABELS, row.top() + 1.0), row.max - vec2(0.0, 1.0));
+        let painter = ui.painter_at(area);
+        painter.rect_filled(area, 2.0, visuals.extreme_bg_color);
+        let y_of = |speed: f64| {
+            let share = ((speed + MOTION_MAX) / (2.0 * MOTION_MAX)).clamp(0.0, 1.0) as f32;
+            area.bottom() - 2.0 - share * (area.height() - 4.0)
+        };
+        for (speed, label) in [(0.0, "0"), (1.0, "1×")] {
+            let y = y_of(speed);
+            painter.line_segment(
+                [pos2(area.left(), y), pos2(area.right(), y)],
+                Stroke::new(1.0_f32, visuals.weak_text_color().gamma_multiply(0.35)),
+            );
+            painter.text(
+                pos2(area.left() + 3.0, y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::monospace(9.0),
+                visuals.weak_text_color(),
+            );
+        }
+        let Some(played) = self.played.get(deck) else { return };
+        let spans: Vec<(u64, u64)> = self.tracks.iter().filter(|t| t.deck == deck).map(|t| (t.from, t.to)).collect();
+        let view = (
+            (self.view_from.max(0.0) * self.rate) as u64,
+            ((self.view_from + self.view_secs) * self.rate) as u64,
+        );
+        let levels = &played.levels;
+        let first = levels.partition_point(|l| l.0 < view.0).saturating_sub(1);
+        let last = levels.partition_point(|l| l.0 <= view.1).min(played.places.len());
+        // Per column of pixels: the slowest and fastest it went there.
+        let mut columns: Vec<(f32, f64, f64)> = Vec::new();
+        for k in first..last {
+            let from = levels[k].0;
+            let Some(to) = levels.get(k + 1).map(|l| l.0).filter(|&to| to > from) else { continue };
+            if !spans.iter().any(|&(a, b)| a <= from && from < b) {
+                continue;
+            }
+            let (begin, end) = played.places[k];
+            let speed = (end - begin) / ((to - from) as f64 / self.rate);
+            let x = self.x_of(area, from).round();
+            match columns.last_mut() {
+                Some((cx, lo, hi)) if *cx == x => (*lo, *hi) = (lo.min(speed), hi.max(speed)),
+                _ => columns.push((x, speed, speed)),
+            }
+        }
+        let stroke = Stroke::new(1.5_f32, color);
+        let mut line: Vec<Pos2> = Vec::new();
+        for (i, &(x, lo, hi)) in columns.iter().enumerate() {
+            // A gap (between clips): the line breaks.
+            if i > 0 && x - columns[i - 1].0 > 3.0 && line.len() > 1 {
+                painter.add(Shape::line(std::mem::take(&mut line), stroke));
+            } else if i > 0 && x - columns[i - 1].0 > 3.0 {
+                line.clear();
+            }
+            if hi - lo > 0.05 {
+                painter.line_segment([pos2(x, y_of(lo)), pos2(x, y_of(hi))], stroke);
+            }
+            line.push(pos2(x, y_of((lo + hi) / 2.0)));
+        }
+        if line.len() > 1 {
+            painter.add(Shape::line(line, stroke));
+        }
+    }
+
     fn deck_row(&mut self, ui: &Ui, row: Rect, response: &egui::Response, deck: usize) {
         let color = DECK_COLORS[deck % DECK_COLORS.len()];
         let folded = self.collapsed.contains(&Some(deck));
@@ -2218,7 +2436,9 @@ impl MixEditor {
                 || "(not from a file)".to_owned(),
                 |n| n.to_string_lossy().into_owned(),
             );
-            if let Some(bpm) = self.bpms.get(&span.path) {
+            if span.scratch {
+                name = format!("Scratch  ·  {name}");
+            } else if let Some(bpm) = self.bpms.get(&span.path) {
                 name.push_str(&format!("  ·  {bpm:.1} BPM"));
             }
             let mut boxes = Vec::with_capacity(shown.len());
@@ -2231,6 +2451,18 @@ impl MixEditor {
                 );
                 boxes.push(piece);
                 painter.rect_filled(piece, 3.0, clip_color.gamma_multiply(0.22));
+                // A scratch: striped, so it stands apart from the clips
+                // played straight around it.
+                if span.scratch {
+                    let stripes = painter.with_clip_rect(piece.intersect(area));
+                    let stroke = Stroke::new(2.0_f32, clip_color.gamma_multiply(0.35));
+                    let h = piece.height();
+                    let mut x = piece.left() - h;
+                    while x < piece.right() {
+                        stripes.line_segment([pos2(x, piece.bottom()), pos2(x + h, piece.top())], stroke);
+                        x += 8.0;
+                    }
+                }
                 // Its own audio, then what of it reached the mix.
                 let drawn = self.clip_outline(
                     &painter,
@@ -2510,9 +2742,17 @@ impl MixEditor {
             let at = self.at_of(area, pos.x);
             match (near_mark(pos), self.play_at(deck, at)) {
                 (Some((deck, at)), _) => self.set_move(deck, at, 0.0),
-                // On a play still heard: just that play goes.
+                // On the selection, or a play still heard: what to delete
+                // with it.
                 (None, Some((from, to))) if self.heard_at(deck, at) => {
-                    self.cut_out(deck, from, to, "cut out play");
+                    let selected: Vec<(usize, u64, u64)> = self
+                        .selected()
+                        .iter()
+                        .filter(|p| p.deck == deck && p.from <= at && at <= p.to)
+                        .map(|p| (p.deck, p.from, p.to))
+                        .collect();
+                    let targets = if selected.is_empty() { vec![(deck, from, to)] } else { selected };
+                    self.ask_delete(targets, Some(pos));
                 }
                 (None, _) => self.bring_back(deck, at),
             }
@@ -4560,11 +4800,17 @@ impl MixEditor {
     /// Deletes `from`–`to` of `deck`, as in a DAW: a clip it cuts through
     /// becomes two clips of their own.
     fn cut_out(&mut self, deck: usize, from: u64, to: u64, what: &str) {
+        self.cut_out_with(deck, from, to, what, DeleteOptions::default());
+    }
+
+    /// Deletes `deck`'s audio from `from` to `to` (its jog, loops and jumps
+    /// with it), and what `options` say.
+    fn cut_out_with(&mut self, deck: usize, from: u64, to: u64, what: &str, options: DeleteOptions) {
         let shared = self.session.clone();
         let Ok(mut session) = shared.lock() else { return };
         let Some(before) = pack(&session) else { return };
         let after = session.snap(to);
-        match session.delete_range(deck, from, to) {
+        match session.delete_range_with(deck, from, to, options) {
             Ok(()) => {
                 // Where the part after it begins in the track, until the
                 // replay says.
@@ -4592,6 +4838,7 @@ impl MixEditor {
         self.chosen_fx = None;
         self.chosen_stem = None;
         self.picked.clear();
+        self.picked_points.clear();
         self.selection = None;
         self.clip_selection = None;
         self.fx_selection = None;
@@ -4725,6 +4972,7 @@ impl MixEditor {
         self.chosen_fx = None;
         self.chosen_stem = None;
         self.picked.clear();
+        self.picked_points.clear();
         if !matches!(keep, Selected::Lane) {
             self.selection = None;
         }
@@ -4739,11 +4987,14 @@ impl MixEditor {
     /// Delete: cuts the selected stretch out of a deck's clips, takes the
     /// Beat FX off through it, or flattens a lane's selection.
     fn delete_selection(&mut self) {
-        if !self.selected().is_empty() {
-            for p in self.selected() {
-                self.cut_out(p.deck, p.from, p.to, "delete");
+        if !self.picked_points.is_empty() {
+            self.delete_points();
+        } else if !self.selected().is_empty() {
+            let targets = self.selected().iter().map(|p| (p.deck, p.from, p.to)).collect();
+            match self.delete_default {
+                Some(options) => self.delete_audio(targets, options),
+                None => self.ask_delete(targets, None),
             }
-            (self.clip_selection, self.picked) = (None, Vec::new());
         } else if let Some((from, to)) = self.fx_selection.take() {
             let params_at = |at: u64| {
                 self.fx
@@ -4858,6 +5109,75 @@ impl MixEditor {
         self.set_fx(changes, what);
     }
 
+    /// Deletes `targets` (deck, from, to) with `options`, as one change.
+    fn delete_audio(&mut self, targets: Vec<(usize, u64, u64)>, options: DeleteOptions) {
+        for (deck, from, to) in targets {
+            self.cut_out_with(deck, from, to, "delete", options);
+        }
+        (self.clip_selection, self.picked) = (None, Vec::new());
+    }
+
+    /// Asks what deleting `targets` takes along (at `pos`, else the
+    /// pointer).
+    fn ask_delete(&mut self, targets: Vec<(usize, u64, u64)>, pos: Option<Pos2>) {
+        let pos = pos.unwrap_or(Pos2::new(200.0, 200.0));
+        let options = self.delete_default.unwrap_or_default();
+        self.deleting = Some(Deleting { targets, options, remember: false, pos });
+    }
+
+    /// The Delete dialog; Enter deletes, Esc closes.
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.deleting.as_mut() else { return };
+        let (mut done, mut cancel) = (
+            ctx.input(|i| i.key_pressed(egui::Key::Enter)),
+            ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+        );
+        let mut ask_again = false;
+        let had_default = self.delete_default.is_some();
+        let what = match d.targets.as_slice() {
+            [(deck, from, to)] => {
+                let secs = |f: u64| f as f64 / self.rate;
+                format!("Deck {}, {:.2}s – {:.2}s", deck + 1, secs(*from), secs(*to))
+            }
+            many => format!("{} stretches", many.len()),
+        };
+        egui::Window::new("Delete")
+            .id(egui::Id::new("delete audio"))
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(d.pos + vec2(10.0, 10.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(what).strong());
+                ui.add_enabled(false, egui::Checkbox::new(&mut true, "Audio, with its jog, loops and jumps"));
+                ui.checkbox(&mut d.options.eq_filter, "EQ & filter on this deck");
+                ui.checkbox(&mut d.options.volume, "Volume & trim on this deck");
+                ui.checkbox(&mut d.options.beat_fx, "Beat FX in this range");
+                ui.separator();
+                ui.checkbox(&mut d.remember, "Remember as default (don't ask again)");
+                if had_default {
+                    ask_again = ui
+                        .small_button("Ask every time")
+                        .on_hover_text("Delete asks again (also in Preferences)")
+                        .clicked();
+                }
+                ui.horizontal(|ui| {
+                    cancel |= ui.button("Cancel").clicked();
+                    done |= ui.button(RichText::new("Delete").strong()).clicked();
+                });
+            });
+        if ask_again {
+            self.delete_default = None;
+        }
+        if cancel {
+            self.deleting = None;
+        } else if done && let Some(d) = self.deleting.take() {
+            if d.remember {
+                self.delete_default = Some(d.options);
+            }
+            self.delete_audio(d.targets, d.options);
+        }
+    }
+
     /// Opens the dialog to type the value of `setting`'s point at `at`.
     fn open_point_edit(&mut self, setting: Setting, at: u64, pos: Pos2) {
         let bpm = setting.deck().and_then(|d| self.bpm_at(d, at));
@@ -4916,8 +5236,11 @@ impl MixEditor {
         // Within what the mixer takes.
         let value = match edit.setting {
             Setting::Tempo(_) => value.clamp(0.25, 4.0),
-            Setting::Eq(..) => value
-                .clamp(f64::from(deckhand_audio::EQ_MIN_DB), f64::from(deckhand_audio::EQ_MAX_DB)),
+            Setting::Eq(..) => self.capped(
+                edit.setting,
+                value.clamp(f64::from(deckhand_audio::EQ_MIN_DB), f64::from(deckhand_audio::EQ_MAX_DB)),
+                ctx.input(|i| i.modifiers.alt),
+            ),
             Setting::Trim(_) => value.clamp(0.0, 4.0),
             s => {
                 let (lo, hi) = s.range();
@@ -5183,6 +5506,61 @@ impl MixEditor {
         }
     }
 
+    /// Moves the picked points with the pointer, all by the same time and
+    /// the same share of their lanes' scales: none past a point not picked
+    /// (nor the set's end); each lane's first stays at the start.
+    fn drag_points(&mut self, area: Rect, pos: Pos2, alt: bool) {
+        let Some(Drag::Points { origin, before, ranges, height }) = &self.drag else { return };
+        let (origin, height) = (*origin, *height);
+        let shift = self.at_of(area, pos.x) as i64 - self.at_of(area, origin.x) as i64;
+        let rise = f64::from((origin.y - pos.y) / height.max(1.0));
+        let end = self.length.saturating_sub(POINT_GAP) as i64;
+        let gap = POINT_GAP as i64;
+        let picked = |s: Setting, i: usize| self.picked_points.contains(&(s, i));
+        // How far in time they can all go.
+        let (mut least, mut most) = (i64::MIN, i64::MAX);
+        for (setting, lane) in before {
+            for (i, p) in lane.iter().enumerate().filter(|(i, _)| picked(*setting, *i)) {
+                if i == 0 {
+                    continue;
+                }
+                let at = p.at as i64;
+                let low = (0..i).rev().find(|&j| j == 0 || !picked(*setting, j)).map_or(0, |j| {
+                    lane[j].at as i64 + gap * (i - j) as i64
+                });
+                let high = (i + 1..lane.len())
+                    .find(|&k| !picked(*setting, k))
+                    .map_or(end, |k| lane[k].at as i64 - gap * (k - i) as i64);
+                least = least.max(low - at);
+                most = most.min(high - at);
+            }
+        }
+        let shift = if least > most { 0 } else { shift.clamp(least, most) };
+        let mut moved = Vec::with_capacity(before.len());
+        for (setting, lane) in before {
+            let (lo, hi) = ranges.iter().find(|r| r.0 == *setting).map_or(setting.range(), |r| r.1);
+            let mut lane = lane.clone();
+            for (i, p) in lane.iter_mut().enumerate() {
+                if !picked(*setting, i) {
+                    continue;
+                }
+                if i > 0 {
+                    p.at = (p.at as i64 + shift).max(0) as u64;
+                }
+                let value = (p.value + rise * (hi - lo)).clamp(lo, hi);
+                // EQ: not above 0 dB (nor higher than it was, if boosted).
+                p.value = match setting {
+                    Setting::Eq(..) if !self.eq_boost && !alt => value.min(p.value.max(0.0)),
+                    _ => value,
+                };
+            }
+            moved.push((*setting, lane));
+        }
+        for (setting, lane) in moved {
+            self.lanes.insert(setting, lane);
+        }
+    }
+
     fn lane(&mut self, ui: &Ui, row: Rect, response: &egui::Response, setting: Setting) {
         let visuals = ui.visuals().clone();
         // Under its deck's row, so the name alone.
@@ -5347,6 +5725,25 @@ impl MixEditor {
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(i, _)| i)
         };
+        // A rectangle being drawn: this lane's points in it are picked.
+        if let Some(Drag::Marquee { setting: from_lane, origin, now, kept }) = &self.drag {
+            let rect = Rect::from_two_pos(*origin, *now);
+            let inside = spots.iter().filter(|(_, at)| rect.contains(*at) && area.contains(*at)).map(|(i, _)| (setting, *i));
+            let mut picked: Vec<(Setting, usize)> =
+                kept.iter().copied().filter(|p| p.0 == setting).chain(inside).collect();
+            picked.sort();
+            picked.dedup();
+            if *from_lane == setting {
+                let fill = visuals.selection.bg_fill.gamma_multiply(0.25);
+                ui.painter().rect(rect, 0.0, fill, Stroke::new(1.0_f32, visuals.selection.stroke.color), egui::StrokeKind::Inside);
+            }
+            self.picked_points.retain(|p| p.0 != setting);
+            self.picked_points.extend(picked);
+        }
+        for &(_, at) in spots.iter().filter(|(i, _)| self.picked_points.contains(&(setting, *i))) {
+            painter.circle_filled(at, 3.5, color);
+            painter.circle_stroke(at, 5.5, Stroke::new(1.5_f32, visuals.selection.stroke.color));
+        }
         if let Some(pos) = response.hover_pos()
             && area.contains(pos)
         {
@@ -5403,7 +5800,22 @@ impl MixEditor {
         } else if response.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(pointer)
         {
+            let adding = ui.input(|i| i.modifiers.command);
+            let on_picked = near(pos).filter(|&i| self.picked_points.contains(&(setting, i)));
             self.drag = Some(match near(pos).filter(|_| self.tool == Tool::Normal) {
+                // A picked point, with others: all of them move.
+                Some(_) if on_picked.is_some() && self.picked_points.len() > 1 => {
+                    let before = self.picked_lanes();
+                    let ranges = before.iter().map(|(s, _)| (*s, self.range(*s))).collect();
+                    Drag::Points { origin: pos, before, ranges, height: area.height() - 6.0 }
+                }
+                // Away from the points, Normal tool: a rectangle to pick
+                // points with (the Select tool selects stretches).
+                None if self.tool == Tool::Normal => {
+                    let kept = if adding { self.picked_points.clone() } else { Vec::new() };
+                    self.clear_selections();
+                    Drag::Marquee { setting, origin: pos, now: pos, kept }
+                }
                 Some(index) => {
                     self.clear_selections();
                     let range = self.range(setting);
@@ -5429,7 +5841,8 @@ impl MixEditor {
             match self.drag {
                 Some(Drag::Point { setting: s, index, range: (lo, hi), pinned, .. }) if s == setting => {
                     let share = f64::from((area.bottom() - 3.0 - pos.y) / (area.height() - 6.0));
-                    let value = lo + share.clamp(0.0, 1.0) * (hi - lo);
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    let value = self.capped(setting, lo + share.clamp(0.0, 1.0) * (hi - lo), alt);
                     let at = self.at_of(area, pos.x);
                     let end = self.length.saturating_sub(POINT_GAP);
                     let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
@@ -5455,6 +5868,11 @@ impl MixEditor {
                     let to = self.at_of(area, pos.x);
                     self.selection = Some((setting, from.min(to), from.max(to)));
                 }
+                Some(Drag::Marquee { ref mut now, .. }) => *now = pos,
+                Some(Drag::Points { .. }) => {
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    self.drag_points(area, pos, alt);
+                }
                 _ => {}
             }
         }
@@ -5463,6 +5881,12 @@ impl MixEditor {
                 Some(Drag::Point { setting: s, before, .. }) if s == setting => {
                     self.commit(setting, before, "move point")
                 }
+                Some(Drag::Points { before, .. }) => {
+                    let picked = self.picked_points.clone();
+                    self.commit_lanes(before, "move points");
+                    self.picked_points = picked;
+                }
+                Some(Drag::Marquee { .. }) => {}
                 Some(Drag::Select { .. }) => {
                     if self.selection.is_some_and(|(_, from, to)| to <= from) {
                         self.selection = None;
@@ -5474,6 +5898,24 @@ impl MixEditor {
         if response.clicked() {
             self.selection = None;
             self.chosen_fx = None;
+            // Normal tool: a click picks the point (⌘ adds or lets go of
+            // it), or lets go of all.
+            if self.tool == Tool::Normal {
+                let adding = ui.input(|i| i.modifiers.command);
+                match pointer.and_then(near) {
+                    Some(i) if adding => {
+                        match self.picked_points.iter().position(|p| *p == (setting, i)) {
+                            Some(k) => {
+                                self.picked_points.remove(k);
+                            }
+                            None => self.picked_points.push((setting, i)),
+                        }
+                    }
+                    Some(i) => self.picked_points = vec![(setting, i)],
+                    None if !adding => self.picked_points.clear(),
+                    None => {}
+                }
+            }
         }
         // Double-click on a clip edge's BPM handle, or a point: type its
         // value.
@@ -5496,7 +5938,11 @@ impl MixEditor {
             let point = Point {
                 // Not past the end of the set.
                 at: self.at_of(area, pos.x).min(self.length.saturating_sub(POINT_GAP)),
-                value: self.value_of(area, setting, pos.y),
+                value: self.capped(
+                    setting,
+                    self.value_of(area, setting, pos.y),
+                    ui.input(|i| i.modifiers.alt),
+                ),
                 curve: self.shape,
             };
             let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
@@ -5618,17 +6064,29 @@ impl MixEditor {
         self.note = Some("Copying the songs…".into());
     }
 
-    /// Writes the edited session where the user picks.
-    fn save(&mut self) -> Option<String> {
+    /// Writes the edit over its file (⌘S). A recording there is kept
+    /// first, as `<name>.session.orig`.
+    fn save(&mut self) -> String {
+        let path = self.path.clone();
+        self.write_to(path)
+    }
+
+    /// Writes the edit where the user picks (⇧⌘S): the next version of
+    /// its name, unless changed.
+    fn save_as(&mut self) -> Option<String> {
         let dir = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let path = rfd::FileDialog::new()
-            .set_title("Save the edited session")
-            .set_directory(dir)
-            .set_file_name(format!("{} edit.session", self.name))
+            .set_title("Save the edit as")
+            .set_directory(&dir)
+            .set_file_name(format!("{}.session", next_version(&dir, &self.name)))
             .add_filter("Session", &["session"])
             .save_file()?;
+        Some(self.write_to(path))
+    }
+
+    fn write_to(&mut self, path: PathBuf) -> String {
         let written = self.session.lock().map_err(|_| anyhow::anyhow!("the session is broken"));
-        Some(match written.and_then(|s| s.write(&path)) {
+        match written.and_then(|s| s.write(&path)) {
             Ok(()) => {
                 self.edited = false;
                 self.name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
@@ -5636,8 +6094,23 @@ impl MixEditor {
                 format!("Saved {}", self.name)
             }
             Err(err) => format!("Not saved: {err:#}"),
-        })
+        }
     }
+}
+
+/// `name` with the next version number (`Set` → `Set v2`, `Set v2` →
+/// `Set v3`), past any session already in `dir`.
+fn next_version(dir: &Path, name: &str) -> String {
+    let (base, mut n) = match name.rsplit_once(" v") {
+        Some((base, v)) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => {
+            (base, v.parse::<u32>().unwrap_or(1) + 1)
+        }
+        _ => (name, 2),
+    };
+    while dir.join(format!("{base} v{n}.session")).exists() {
+        n += 1;
+    }
+    format!("{base} v{n}")
 }
 
 /// A tool's button: its pointer drawn (an arrow for Normal, an I-beam for
@@ -5789,8 +6262,20 @@ impl DeckhandApp {
             }
             let Some(editor) = self.edit_view.editor.as_mut() else { return };
             let idle = !editor.busy();
-            if ui.add_enabled(idle, egui::Button::new("Save edit…")).tour(crate::tour::Target::EditSave).clicked() {
-                message = editor.save();
+            if ui
+                .add_enabled(idle, egui::Button::new("Save"))
+                .on_hover_text("Saves the edit over this session (⌘S). The recording is kept beside it, as .session.orig")
+                .tour(crate::tour::Target::EditSave)
+                .clicked()
+            {
+                message = Some(editor.save());
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Save as…"))
+                .on_hover_text("Saves the edit as a new session, the next version by default (⇧⌘S)")
+                .clicked()
+            {
+                message = editor.save_as();
             }
             let (label, hint) = match editor.range {
                 Some(_) => (
@@ -5869,6 +6354,17 @@ impl DeckhandApp {
             Some(2) if !editor.busy() => editor.split_selection(),
             _ => {}
         }
+        let (save, save_as) = ui.input_mut(|i| {
+            let as_ = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S);
+            (i.consume_key(egui::Modifiers::COMMAND, egui::Key::S), as_)
+        });
+        if !editor.busy() {
+            if save {
+                self.status = Some(editor.save());
+            } else if save_as && let Some(note) = editor.save_as() {
+                self.status = Some(note);
+            }
+        }
         let (delete, undo, redo, nudge) = ui.input(|i| {
             let step = if i.modifiers.shift { 0.0001 } else { 0.001 };
             let nudge = if i.key_pressed(egui::Key::ArrowRight) {
@@ -5903,9 +6399,15 @@ impl DeckhandApp {
         }
         // Follow playhead is a preference, kept between runs.
         editor.follow_playhead = self.config.prefs.edit_follow_playhead;
+        editor.eq_boost = self.config.prefs.edit_eq_boost;
+        editor.delete_default = self.config.prefs.edit_delete;
         editor.timeline(ui);
         if editor.follow_playhead != self.config.prefs.edit_follow_playhead {
             self.config.prefs.edit_follow_playhead = editor.follow_playhead;
+            self.config.save();
+        }
+        if editor.delete_default != self.config.prefs.edit_delete {
+            self.config.prefs.edit_delete = editor.delete_default;
             self.config.save();
         }
     }
@@ -5953,6 +6455,12 @@ impl DeckhandApp {
                     session.split_color_fx();
                     // And the Beat FX depth one, with curves.
                     session.split_fx_depth();
+                    // Edited as clips and lanes from now on; the recording
+                    // itself is never written.
+                    if let Err(err) = session.make_editable(&path) {
+                        self.status = Some(format!("Could not open the session to edit: {err:#}"));
+                        return;
+                    }
                     let mut editor = MixEditor::new(path, session);
                     editor.cues = library_cues(&self.collection, editor.tracks.iter().map(|t| &t.path));
                     editor.outlines = outlines;
@@ -6460,5 +6968,66 @@ mod tests {
         }
         assert_eq!(editor.span_pieces(&spans[0]), [(spans[0].from, spans[0].to)]);
         assert_eq!(editor.span_pieces(&spans[1]), [(spans[1].from, spans[1].to)]);
+    }
+
+    /// Temporary check on a real recording: made into an edit, it plays as
+    /// recorded.
+    #[test]
+    #[ignore]
+    fn real_session_as_edit() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
+        session.split_color_fx();
+        session.split_fx_depth();
+        let limit = 48_000 * 2 * 180;
+        let take = |s: &Session| {
+            let mut out = Vec::new();
+            let _ = s.render(|b| {
+                out.extend_from_slice(b);
+                if out.len() >= limit { anyhow::bail!("enough") }
+                Ok(())
+            });
+            out
+        };
+        let before = take(&session);
+        let t = std::time::Instant::now();
+        session.make_editable(&path).unwrap();
+        println!("made editable in {:?}", t.elapsed());
+        for span in session.tracks() {
+            println!("deck {} {:>8.2}s-{:>8.2}s {}", span.deck + 1, span.from as f64 / 48_000.0, span.to as f64 / 48_000.0, span.path.file_name().unwrap().to_string_lossy());
+        }
+        let after = take(&session);
+        let n = before.len().min(after.len());
+        let worst = before[..n].iter().zip(&after[..n]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let first = before[..n].iter().zip(&after[..n]).position(|(a, b)| (a - b).abs() > 1e-3);
+        println!("compared {:.1}s: worst {worst}, first off at {:?}s", n as f64 / 96_000.0, first.map(|i| i as f64 / 96_000.0));
+    }
+
+    /// A real recording's WAV against a render of its session, and of the
+    /// edit made from it (24-bit, sample by sample).
+    #[test]
+    #[ignore]
+    fn real_recording_matches_its_renders() {
+        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let wav = path.with_extension("wav");
+        let out = std::env::var("DECKHAND_RENDER_DIR").map(PathBuf::from).unwrap();
+        let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
+        let report = |what: &str, r: deckhand_audio::Rendered| {
+            let c = r.comparison.expect("compared");
+            println!(
+                "{what}: rendered {} frames, recorded {} | differing samples {} | largest {:.6} ({:.1} dB) | first at {:?}s",
+                r.frames,
+                c.recorded_frames,
+                c.differing,
+                c.largest,
+                20.0 * f64::from(c.largest.max(1e-12)).log10(),
+                c.first.map(|f| f as f64 / 48_000.0),
+            );
+        };
+        report("session", session.render_to_wav(&out.join("session.wav"), Some(&wav), |_| {}).unwrap());
+        session.split_color_fx();
+        session.split_fx_depth();
+        session.make_editable(&path).unwrap();
+        report("edit   ", session.render_to_wav(&out.join("edit.wav"), Some(&wav), |_| {}).unwrap());
     }
 }

@@ -23,7 +23,7 @@ pub use fx::{BeatFx, BeatFxKind, BeatFxParams, ColorFx, ColorFxKind, FxTarget};
 pub use preview::SessionPlayer;
 pub use record::{Recording, write_float_wav_file, write_wav_file};
 pub use session::{
-    Clash, Comparison, Curve, Exported, Files, FxSpan, Grid, Nudge, Outline, PlayEdges, Played, Point, Rendered, SYNC_CHECK_SECS,
+    Clash, Clip, Comparison, DeleteOptions, Edit, Move, is_edit, orig_path, Curve, Exported, Files, FxSpan, Grid, Nudge, Outline, PlayEdges, Played, Point, Rendered, SYNC_CHECK_SECS,
     SYNC_DRIFT_BEATS, Session, Setting, Sources, StemLevels, StemSpan, StemsSource, SyncSpan, TrackMove, TrackSpan,
     clashes, fx_spans, lane_value, move_fx, remember_grid, remember_stems, remember_track,
     export_files, remove_fx, restyle_fx, session_path,

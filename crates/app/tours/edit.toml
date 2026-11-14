@@ -73,7 +73,7 @@ click-advances = false
 [[step]]
 target = "edit-save"
 title = "Save your edit"
-text = "Saves the changes as a new .session, to come back to later."
+text = "Save (⌘S) writes the edit over this session; the recording is kept beside it as .session.orig, never changed. Save as… (⇧⌘S) makes a new version."
 wait = ["edit", "session-open"]
 click-advances = false
 

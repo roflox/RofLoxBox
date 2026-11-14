@@ -27,6 +27,9 @@ use crate::engine::{Command, CrossfaderSide, Offline, Snapshot};
 use crate::fx::{BeatFxKind, BeatFxParams, FxTarget};
 use crate::stems::StemLayers;
 
+mod edit;
+pub use edit::{Clip, DeleteOptions, Edit, Move, is_edit, orig_path};
+
 const VERSION: u32 = 1;
 /// Events the audio thread can log before the writer takes them.
 const QUEUE: usize = 1 << 15;
@@ -1265,6 +1268,8 @@ pub struct TrackSpan {
     pub to: u64,
     /// When it was playing (the deck's play button).
     pub playing: Vec<(u64, u64)>,
+    /// Scratched (see [`Clip::scratch`]).
+    pub scratch: bool,
 }
 
 /// A recorded session, read back with its tracks.
@@ -1282,11 +1287,20 @@ pub struct Session {
     grids: HashMap<PathBuf, Grid>,
     /// Lanes as edited, with their curves (the commands follow them).
     curves: std::collections::BTreeMap<Setting, Vec<Point>>,
+    /// Being edited: the clips and lanes (the events are made from them,
+    /// and edits change them, not the events).
+    edit: Option<Box<Edit>>,
 }
 
 impl Session {
     /// Reads a session, opening its tracks and stems with `sources`.
     pub fn read(path: &Path, sources: impl Sources + 'static) -> Result<Self> {
+        if is_edit(path) {
+            let edit = Edit::read(path, sources)?;
+            let mut session = edit.to_session()?;
+            session.edit = Some(Box::new(edit));
+            return Ok(session);
+        }
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let opened = Opened {
             sources: Box::new(sources),
@@ -1331,6 +1345,7 @@ impl Session {
             stems: HashMap::new(),
             grids: HashMap::new(),
             curves: Default::default(),
+            edit: None,
         };
         for (index, line) in lines {
             let line = line?;
@@ -1364,6 +1379,91 @@ impl Session {
             session.events.push((at, event));
         }
         Ok(session)
+    }
+
+    /// Opens the recording for editing (once): its clips and lanes are
+    /// made from it, and edits change those from now on. `recording` is
+    /// its file, kept beside an edit saved over it.
+    pub fn make_editable(&mut self, recording: &Path) -> Result<()> {
+        if self.edit.is_some() {
+            return Ok(());
+        }
+        let mut edit = Edit::from_session(self)?;
+        edit.recording = Some(orig_path(recording));
+        self.edit = Some(Box::new(edit));
+        self.recompile();
+        Ok(())
+    }
+
+    /// Whether it is being edited (see [`Session::make_editable`]).
+    pub fn editable(&self) -> bool {
+        self.edit.is_some()
+    }
+
+    /// Changes the edit, then the events to play it as it is now.
+    fn with_edit<T>(&mut self, change: impl FnOnce(&mut Edit) -> T) -> T {
+        let edit = self.edit.as_mut().expect("being edited");
+        let out = change(edit);
+        self.recompile();
+        out
+    }
+
+    /// The events made again from the edit.
+    fn recompile(&mut self) {
+        let Some(edit) = &self.edit else { return };
+        match edit.to_session() {
+            Ok(fresh) => (self.events, self.end, self.curves) = (fresh.events, fresh.end, fresh.curves),
+            Err(err) => eprintln!("the edit could not be played: {err:#}"),
+        }
+    }
+
+    /// [`Session::delete_range`], taking along what `options` say.
+    pub fn delete_range_with(
+        &mut self,
+        deck: usize,
+        from: u64,
+        to: u64,
+        options: DeleteOptions,
+    ) -> Result<()> {
+        if self.edit.is_none() {
+            return self.delete_range(deck, from, to);
+        }
+        self.with_edit(|e| e.delete(deck, from, to, options))
+    }
+
+    /// [`Session::resync`] for an edit: synced decks' tempo lanes take
+    /// sync's tempos, and its corrections go into the clips.
+    fn resync_edit(&mut self) -> Result<usize> {
+        let mut plain = self.duplicate()?;
+        plain.edit = None;
+        plain.curves.clear();
+        let count = plain.resync()?;
+        let start = self.snapshot.clock;
+        let edit = self.edit.as_mut().expect("being edited");
+        for deck in 0..crate::engine::DECKS {
+            let synced = plain.events.iter().any(|(_, e)| {
+                matches!(e, Logged::Command(Command::SyncTempo { deck: d, .. }) if *d == deck)
+            });
+            if synced {
+                edit.lanes.insert(Setting::Tempo(deck), plain.lane(Setting::Tempo(deck)));
+            }
+        }
+        for clip in &mut edit.clips {
+            clip.moves.retain(|m| !matches!(m.1, Move::SyncShift { .. }));
+        }
+        for (at, event) in &plain.events {
+            if let Logged::Command(Command::SyncShift { deck, seconds }) = event
+                && let Some(i) = edit.clip_at(*deck, at - start)
+            {
+                let clip = &mut edit.clips[i];
+                clip.moves.push((at - start - clip.at, Move::SyncShift { seconds: *seconds }));
+            }
+        }
+        for clip in &mut edit.clips {
+            clip.moves.sort_by_key(|m| m.0);
+        }
+        self.recompile();
+        Ok(count)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -1419,10 +1519,13 @@ impl Session {
 
     /// The tracks on the decks over time.
     pub fn tracks(&self) -> Vec<TrackSpan> {
+        if let Some(edit) = &self.edit {
+            return edit.spans();
+        }
         let start = self.snapshot.clock;
         let length = self.length();
         let path = |audio: &Arc<TrackAudio>| source_of(&TRACKS, audio).unwrap_or_default();
-        let span = |deck, path, from| TrackSpan { deck, path, from, to: from, playing: Vec::new() };
+        let span = |deck, path, from| TrackSpan { deck, path, from, to: from, playing: Vec::new(), scratch: false };
         let jump_split = (JUMP_SPLIT_SECS * f64::from(self.rate)) as u64;
         // Per deck: the track on it, and since when it plays.
         let mut open: Vec<Option<(TrackSpan, Option<u64>)>> = (0..crate::engine::DECKS)
@@ -1496,6 +1599,9 @@ impl Session {
     /// Gives a track a beat grid if the session has none for it (one
     /// recorded before grids were kept).
     pub fn add_grid(&mut self, path: PathBuf, grid: Grid) {
+        if let Some(edit) = &mut self.edit {
+            edit.grids.entry(path.clone()).or_insert_with(|| grid.clone());
+        }
         self.grids.entry(path).or_insert(grid);
     }
 
@@ -1531,6 +1637,9 @@ impl Session {
     /// The Beat FX unit over the recording: how it was at the start, then
     /// every change (frames from the start).
     pub fn beat_fx(&self) -> Vec<(u64, BeatFxParams)> {
+        if let Some(edit) = &self.edit {
+            return edit.beat_fx.clone();
+        }
         let start = self.snapshot.clock;
         let mut changes = vec![(0, self.snapshot.beat_fx())];
         for (at, event) in &self.events {
@@ -1546,6 +1655,9 @@ impl Session {
     /// amount over time ([`Command::SetColorAmount`]), which sounds the
     /// same. Returns whether there was anything to change.
     pub fn split_color_fx(&mut self) -> bool {
+        if self.edit.is_some() {
+            return false;
+        }
         use crate::fx::ColorFxKind;
         let played = |event: &Logged| {
             matches!(
@@ -1598,6 +1710,9 @@ impl Session {
     /// Replaces the Beat FX unit's changes with `changes` (as
     /// [`Session::beat_fx`] gives them), each moved to a buffer start.
     pub fn set_beat_fx(&mut self, changes: &[(u64, BeatFxParams)]) {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.set_beat_fx(changes));
+        }
         let start = self.snapshot.clock;
         self.events.retain(|(_, event)| !matches!(event, Logged::Command(Command::SetBeatFx(_))));
         let end = self.end.map_or(u64::MAX, |end| end.saturating_sub(start));
@@ -1622,6 +1737,9 @@ impl Session {
     /// them when it was loaded), in place of any it had: its parts can then
     /// be turned up and down.
     pub fn add_stems(&mut self, span: &TrackSpan, stems: Arc<StemLayers>) {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.add_stems(span.deck, span.from, stems));
+        }
         let start = self.snapshot.clock;
         let deck = span.deck;
         let (from, to) = (start + span.from, start + span.to);
@@ -1698,6 +1816,9 @@ impl Session {
     /// [`Session::stem_levels`] gives them), each moved to a buffer start;
     /// after a load, the levels there are set again.
     pub fn set_stem_levels(&mut self, deck: usize, changes: &[StemLevels]) {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.set_stem_levels(deck, changes));
+        }
         const ALL: [f32; crate::stems::PARTS] = [1.0; crate::stems::PARTS];
         let start = self.snapshot.clock;
         let mine = |event: &Logged| {
@@ -1762,6 +1883,11 @@ impl Session {
         frames: i64,
         tempo: f64,
     ) -> (u64, u64) {
+        if self.edit.is_some() {
+            let _ = tempo;
+            let (deck, at, to) = (span.deck, from, to);
+            return self.with_edit(|e| e.shift_range(deck, at, to, frames).unwrap_or((at, to)));
+        }
         let frames = frames.clamp(
             span.from as i64 - from as i64,
             (span.to as i64 - to as i64).max(span.from as i64 - from as i64),
@@ -1816,6 +1942,9 @@ impl Session {
     /// The pieces of `span` heard, between the editor's cuts (all of it
     /// when uncut); pieces that touch were split there.
     pub fn pieces(&self, span: &TrackSpan) -> Vec<(u64, u64)> {
+        if self.edit.is_some() {
+            return vec![(span.from, span.to)];
+        }
         let start = self.snapshot.clock;
         let cuts: Vec<(u64, bool)> = self
             .events
@@ -1849,6 +1978,10 @@ impl Session {
     /// Lets only `pieces` of `span` be heard (sorted, not overlapping;
     /// touching ones stay split there).
     pub fn set_pieces(&mut self, span: &TrackSpan, pieces: &[(u64, u64)]) {
+        if self.edit.is_some() {
+            let _ = self.with_edit(|e| e.set_pieces(span.deck, span.from, pieces));
+            return;
+        }
         let start = self.snapshot.clock;
         let mut cuts = Vec::new();
         let mut end = span.from;
@@ -1888,6 +2021,9 @@ impl Session {
     /// the deck stays stopped. Clips the recording began with stay. Returns
     /// how many went.
     pub fn drop_deleted(&mut self) -> usize {
+        if self.edit.is_some() {
+            return 0;
+        }
         let start = self.snapshot.clock;
         let spans = self.tracks();
         let mut dropped = 0;
@@ -1933,6 +2069,9 @@ impl Session {
 
     /// The tracks moved in the editor.
     pub fn moves(&self) -> Vec<TrackMove> {
+        if let Some(edit) = &self.edit {
+            return edit.moves();
+        }
         let start = self.snapshot.clock;
         self.events
             .iter()
@@ -1950,6 +2089,9 @@ impl Session {
     /// deck next jumps; replaces a move there, and 0 takes it away.
     /// Returns where it is.
     pub fn move_track(&mut self, deck: usize, at: u64, later: f64) -> u64 {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.move_track(deck, at, later));
+        }
         let at = self.snap(at);
         let clock = self.snapshot.clock + at;
         self.events.retain(|(t, event)| {
@@ -1990,6 +2132,9 @@ impl Session {
     /// gives them), each moved to the nearest buffer start; a curve becomes
     /// a change at every buffer start along it.
     pub fn set_lane(&mut self, setting: Setting, points: &[Point]) {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.set_lane(setting, points));
+        }
         let start = self.snapshot.clock;
         let is_setting = |event: &Logged| matches!(event, Logged::Command(c) if Setting::of(c).is_some_and(|(s, _)| s == setting));
         self.events.retain(|(_, event)| !is_setting(event));
@@ -2040,6 +2185,9 @@ impl Session {
     /// each depth the Beat FX changes set as played becomes a point of it,
     /// which sounds the same. Returns whether there was anything to do.
     pub fn split_fx_depth(&mut self) -> bool {
+        if self.edit.is_some() {
+            return false;
+        }
         if self.events.iter().any(|(_, e)| matches!(e, Logged::Command(Command::SetBeatFxDepth(_))))
         {
             return false;
@@ -2139,6 +2287,9 @@ impl Session {
 
     /// The events and lanes as they are, to [`Session::restore`] later.
     pub fn backup(&self) -> Result<Vec<u8>> {
+        if let Some(edit) = &self.edit {
+            return edit.backup();
+        }
         let mut out = Vec::new();
         serde_json::to_writer(&mut out, &self.curves.iter().collect::<Vec<_>>())?;
         out.push(b'\n');
@@ -2160,6 +2311,9 @@ impl Session {
 
     /// Back to a [`Session::backup`].
     pub fn restore(&mut self, backup: &[u8]) -> Result<()> {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.restore(backup));
+        }
         let opened = Opened {
             sources: Box::new(Files),
             tracks: self.tracks.clone(),
@@ -2200,6 +2354,9 @@ impl Session {
     /// and what would run into the next clip is cut. Returns where it
     /// starts now.
     pub fn move_clip(&mut self, deck: usize, from: u64, by: i64) -> Result<u64> {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.move_clip_at(deck, from, by));
+        }
         let start = self.snapshot.clock;
         let spans: Vec<TrackSpan> = self.tracks().into_iter().filter(|s| s.deck == deck).collect();
         let index = spans
@@ -2274,6 +2431,10 @@ impl Session {
     /// and cut as they were, so it sounds the same. False if there was
     /// nothing to split.
     pub fn split_plays(&mut self, deck: usize, from: u64) -> Result<bool> {
+        if self.edit.is_some() {
+            let _ = (deck, from);
+            return Ok(false);
+        }
         let start = self.snapshot.clock;
         let Some(span) = self.tracks().into_iter().find(|t| t.deck == deck && t.from == from)
         else {
@@ -2353,6 +2514,9 @@ impl Session {
     /// Takes the markers between `from` and `to` (frames from the start,
     /// both included) out; returns how many went.
     pub fn remove_markers(&mut self, from: u64, to: u64) -> usize {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.remove_markers(from, to));
+        }
         let start = self.snapshot.clock;
         let before = self.events.len();
         self.events.retain(|(at, e)| {
@@ -2418,6 +2582,14 @@ impl Session {
     /// nothing jumps while heard), and after it all is where it was.
     /// Returns how many went.
     pub fn remove_nudges(&mut self, deck: usize, from: u64, to: u64, keep_step: bool) -> usize {
+        if self.edit.is_some() {
+            let gone: Vec<Nudge> = self
+                .nudges()
+                .into_iter()
+                .filter(|n| n.deck == deck && n.from < to.max(from + 1) && from <= n.to)
+                .collect();
+            return self.with_edit(|e| e.remove_nudges(&gone, keep_step));
+        }
         let start = self.snapshot.clock;
         let gone: Vec<Nudge> = self
             .nudges()
@@ -2461,6 +2633,9 @@ impl Session {
     /// cuts through is split there, into clips of their own before and
     /// after, and what is between goes.
     pub fn delete_range(&mut self, deck: usize, from: u64, to: u64) -> Result<()> {
+        if self.edit.is_some() {
+            return self.delete_range_with(deck, from, to, DeleteOptions::default());
+        }
         let (from, to) = (self.snap(from), self.snap(to));
         if from >= to {
             return Ok(());
@@ -2486,6 +2661,9 @@ impl Session {
     /// was, playing if it was, with its stems and cut as they were, so it
     /// sounds the same. Returns where it was split (a buffer start).
     pub fn split_clip(&mut self, deck: usize, at: u64) -> Result<u64> {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.split(deck, at).map(|i| e.clips[i].at));
+        }
         let start = self.snapshot.clock;
         let at = self.snap(at);
         let Some(span) = self.tracks().into_iter().find(|t| t.deck == deck && t.from < at && at < t.to)
@@ -2603,6 +2781,9 @@ impl Session {
     /// tracks loaded and not heard) gives way. With more
     /// plays in its clip: not into the plays around it nor across a jump.
     pub fn play_edges(&self, deck: usize, from: u64, to: u64) -> Option<PlayEdges> {
+        if let Some(edit) = &self.edit {
+            return edit.play_edges(deck, from, to);
+        }
         let spans: Vec<TrackSpan> = self.tracks().into_iter().filter(|t| t.deck == deck).collect();
         let k = spans.iter().position(|t| t.from <= from && to <= t.to)?;
         let span = &spans[k];
@@ -2717,6 +2898,9 @@ impl Session {
         (from, to): (u64, u64),
         (new_from, new_to): (u64, u64),
     ) -> Result<(u64, u64)> {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.resize(deck, (from, to), (new_from, new_to)));
+        }
         let edges = self
             .play_edges(deck, from, to)
             .ok_or_else(|| anyhow!("deck {} didn't play there", deck + 1))?;
@@ -2948,6 +3132,9 @@ impl Session {
     /// of [`TrackSpan::playing`]) can move: not into the plays before and
     /// after it, nor out of its clip. `None` if it is not a play.
     pub fn play_limits(&self, deck: usize, from: u64, to: u64) -> Option<(i64, i64)> {
+        if let Some(edit) = &self.edit {
+            return edit.play_limits(deck, from, to);
+        }
         let span =
             self.tracks().into_iter().find(|t| t.deck == deck && t.from <= from && to <= t.to)?;
         let i = span.playing.iter().position(|&p| p == (from, to))?;
@@ -2964,6 +3151,9 @@ impl Session {
     /// moves along, so it starts where it did in the track and sounds the
     /// same. Returns its new place.
     pub fn move_play(&mut self, deck: usize, from: u64, to: u64, by: i64) -> (u64, u64) {
+        if self.edit.is_some() {
+            return self.with_edit(|e| e.move_play(deck, from, to, by));
+        }
         let Some((low, high)) = self.play_limits(deck, from, to) else { return (from, to) };
         let by = by.clamp(low, high.max(low));
         // On a buffer start, like everything the mixer does.
@@ -3000,6 +3190,9 @@ impl Session {
 
     /// Writes the session, as edited, to `path`.
     pub fn write(&self, path: &Path) -> Result<()> {
+        if let Some(edit) = &self.edit {
+            return edit.save(path);
+        }
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let mut out = BufWriter::with_capacity(1 << 16, file);
         let line = |out: &mut BufWriter<File>, line: Line| -> Result<()> {
@@ -3038,19 +3231,7 @@ impl Session {
     /// A copy of something holding the session's tracks, through serde
     /// (commands are not `Clone`: one of them holds the recorder).
     fn copy<T: Serialize + serde::de::DeserializeOwned>(&self, item: &T) -> Result<T> {
-        let value = serde_json::to_value(item)?;
-        let opened = Opened {
-            sources: Box::new(Files),
-            tracks: self.tracks.clone(),
-            stems: self.stems.clone(),
-            warnings: Vec::new(),
-            // The stems are open already (by the names the session has).
-            folder: None,
-        };
-        let previous = OPENED.replace(Some(opened));
-        let copy = serde_json::from_value(value);
-        OPENED.set(previous);
-        Ok(copy?)
+        copy_with(&self.tracks, &self.stems, item)
     }
 
     /// Plays the session through the mixer, handing `out` each buffer of
@@ -3193,6 +3374,7 @@ impl Session {
             stems: self.stems.clone(),
             grids: self.grids.clone(),
             curves: self.curves.clone(),
+            edit: self.edit.clone(),
         })
     }
 
@@ -3202,6 +3384,9 @@ impl Session {
     /// What sync did while recording is replaced; returns the commands sync
     /// makes now.
     pub fn resync(&mut self) -> Result<usize> {
+        if self.edit.is_some() {
+            return self.resync_edit();
+        }
         let made_by_sync = |event: &Logged| {
             matches!(event, Logged::Command(Command::SyncTempo { .. } | Command::SyncShift { .. }))
         };
@@ -3460,6 +3645,36 @@ impl Run for Playing<'_> {
         }
         Ok(())
     }
+}
+
+/// A copy of something holding tracks, through serde, opening them from
+/// `tracks` and `stems` (commands are not `Clone`: one holds the recorder).
+fn copy_with<T: Serialize + serde::de::DeserializeOwned>(
+    tracks: &HashMap<PathBuf, Arc<TrackAudio>>,
+    stems: &HashMap<StemsSource, Arc<StemLayers>>,
+    item: &T,
+) -> Result<T> {
+    copy_value(tracks, stems, serde_json::to_value(item)?)
+}
+
+/// [`copy_with`] from its serde value.
+fn copy_value<T: serde::de::DeserializeOwned>(
+    tracks: &HashMap<PathBuf, Arc<TrackAudio>>,
+    stems: &HashMap<StemsSource, Arc<StemLayers>>,
+    value: serde_json::Value,
+) -> Result<T> {
+    let opened = Opened {
+        sources: Box::new(Files),
+        tracks: tracks.clone(),
+        stems: stems.clone(),
+        warnings: Vec::new(),
+        // The stems are open already (by the names they have).
+        folder: None,
+    };
+    let previous = OPENED.replace(Some(opened));
+    let copy = serde_json::from_value(value);
+    OPENED.set(previous);
+    Ok(copy?)
 }
 
 /// What a set stretched by an edit keeps after the last thing in it
@@ -3788,7 +4003,7 @@ mod tests {
     use crate::fx::{BeatFxKind, BeatFxParams, FxTarget};
 
     /// The tests' tracks, by name.
-    struct Tracks(HashMap<PathBuf, Arc<TrackAudio>>);
+    pub(super) struct Tracks(pub(super) HashMap<PathBuf, Arc<TrackAudio>>);
 
     impl Sources for Tracks {
         fn track(&mut self, path: &Path) -> Result<Arc<TrackAudio>> {
@@ -3801,7 +4016,7 @@ mod tests {
     }
 
     /// Two tones and a little noise, different for each `seed`.
-    fn track(rate: u32, secs: f64, seed: u32) -> Arc<TrackAudio> {
+    pub(super) fn track(rate: u32, secs: f64, seed: u32) -> Arc<TrackAudio> {
         let mut noise = seed.wrapping_mul(2_654_435_761) | 1;
         let frames = (secs * f64::from(rate)) as usize;
         let samples = (0..frames)
@@ -4313,13 +4528,13 @@ mod tests {
 
     /// Records `commands` on fresh decks for `secs` seconds; returns the
     /// session's file and its tracks.
-    fn record(name: &str, commands: Vec<Command>, secs: f64) -> PathBuf {
+    pub(super) fn record(name: &str, commands: Vec<Command>, secs: f64) -> PathBuf {
         record_after(name, Vec::new(), commands, secs)
     }
 
     /// [`record`], with `before` done before recording starts (in the
     /// session's snapshot).
-    fn record_after(name: &str, before: Vec<Command>, commands: Vec<Command>, secs: f64) -> PathBuf {
+    pub(super) fn record_after(name: &str, before: Vec<Command>, commands: Vec<Command>, secs: f64) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("deckhand-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -5175,7 +5390,7 @@ mod tests {
 
     /// A session with `events` (frames from the start) on deck 0, which
     /// has an 8 s track loaded, and one as played `reference`.
-    fn deck_session(name: &str, events: Vec<(u64, Command)>) -> (Session, PathBuf) {
+    pub(super) fn deck_session(name: &str, events: Vec<(u64, Command)>) -> (Session, PathBuf) {
         let a = track(48_000, 8.0, 3);
         let path = PathBuf::from(format!("/music/{name}.wav"));
         remember_track(&a, &path);
@@ -5260,13 +5475,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
-    fn rendered(s: &Session) -> Vec<f32> {
+    pub(super) fn rendered(s: &Session) -> Vec<f32> {
         let mut out = Vec::new();
         s.render(|b| Ok(out.extend_from_slice(b))).unwrap();
         out
     }
 
-    fn worst(a: &[f32], b: &[f32]) -> f32 {
+    pub(super) fn worst(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max)
     }
 
