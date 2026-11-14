@@ -43,6 +43,40 @@ pub const BEAT_JUMPS: [f64; 8] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0];
 /// master's beat: past the engine's coast after a release, and a buffer.
 const SNAP_AFTER: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// The BPM a tempo can be typed in as (half-time ambient to double-time
+/// drum & bass); beyond is surely a typo.
+pub const BPM_LIMITS: std::ops::RangeInclusive<f64> = 20.0..=400.0;
+
+/// The tempo range and fader position that play a track of `track_bpm` at
+/// `bpm` (see [`Deck::set_bpm`]).
+pub fn plan_bpm(
+    track_bpm: f64,
+    bpm: f64,
+    current: TempoRange,
+    ranges: &[TempoRange],
+) -> Result<(TempoRange, f32), String> {
+    if !BPM_LIMITS.contains(&bpm) {
+        return Err(format!(
+            "{bpm:.2} BPM is out of reach: {:.0}–{:.0} BPM",
+            BPM_LIMITS.start(),
+            BPM_LIMITS.end()
+        ));
+    }
+    let offset = bpm / track_bpm - 1.0;
+    if offset.abs() > TempoRange::WIDE.fraction() + 1e-9 {
+        return Err(format!("{bpm:.2} BPM is more than ±100 % from the track's {track_bpm:.2}"));
+    }
+    let range = if offset.abs() <= current.fraction() + 1e-9 {
+        current
+    } else {
+        let mut fitting: Vec<TempoRange> =
+            ranges.iter().copied().filter(|r| r.fraction() + 1e-9 >= offset.abs()).collect();
+        fitting.sort();
+        fitting.first().copied().unwrap_or(TempoRange::WIDE)
+    };
+    Ok((range, (offset / range.fraction()) as f32))
+}
+
 /// Beat-loop pad lengths in beats.
 pub const BEAT_LOOPS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 
@@ -1370,6 +1404,26 @@ impl Deck {
         engine.send(Command::SetKeyLock { deck: self.index, on: self.key_lock });
     }
 
+    /// Plays the track at `bpm` (typed in): within [`BPM_LIMITS`] and what
+    /// the tempo can reach (±100 %). A range too narrow for it gives way to
+    /// the narrowest of `ranges` that reaches it (else WIDE). A synced
+    /// deck following the master can't.
+    pub fn set_bpm(&mut self, bpm: f64, ranges: &[TempoRange], engine: &mut Engine) -> Result<(), String> {
+        let Some(track) = &self.track else { return Err("No track on the deck".into()) };
+        if track.bpm <= 0.0 {
+            return Err("The track has no BPM yet".into());
+        }
+        if self.sync && !self.is_master {
+            return Err("It follows the master's tempo (BEAT SYNC)".into());
+        }
+        let (range, fader) = plan_bpm(track.bpm, bpm, self.tempo_range, ranges)?;
+        if range != self.tempo_range {
+            self.set_tempo_range(range, engine);
+        }
+        self.set_tempo_fader(fader, engine);
+        Ok(())
+    }
+
     pub fn set_tempo_range(&mut self, range: TempoRange, engine: &mut Engine) {
         self.tempo_range = range;
         if self.tempo_fader_active() && self.sync_ratio.is_none() {
@@ -2014,6 +2068,25 @@ mod tests {
         eprintln!("{:.0} s of audio", audio.duration_secs());
     }
     use super::*;
+
+    /// A typed BPM: in the current range if it reaches, else the narrowest
+    /// of the user's ranges that does, else WIDE; out of reach refused.
+    #[test]
+    fn typed_bpm_picks_a_range() {
+        let ranges = [TempoRange::percent(6), TempoRange::percent(10), TempoRange::percent(16)];
+        let six = TempoRange::percent(6);
+        let (range, fader) = plan_bpm(174.0, 175.0, six, &ranges).unwrap();
+        assert_eq!(range, six);
+        assert!((1.0 + f64::from(fader) * 0.06 - 175.0 / 174.0).abs() < 1e-6);
+        // 174 → 190 is +9.2 %: ±10 %.
+        assert_eq!(plan_bpm(174.0, 190.0, six, &ranges).unwrap().0, TempoRange::percent(10));
+        // 174 → 87 is −50 %: WIDE.
+        let (range, fader) = plan_bpm(174.0, 87.0, six, &ranges).unwrap();
+        assert_eq!((range, fader), (TempoRange::WIDE, -0.5));
+        assert!(plan_bpm(174.0, 360.0, six, &ranges).is_err(), "more than ±100 %");
+        assert!(plan_bpm(120.0, 500.0, six, &ranges).is_err(), "out of the limits");
+        assert!(plan_bpm(120.0, 10.0, six, &ranges).is_err(), "out of the limits");
+    }
 
     #[test]
     fn auto_gain_follows_loudness() {

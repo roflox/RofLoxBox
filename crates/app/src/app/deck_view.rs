@@ -60,6 +60,9 @@ struct Parts<'a> {
     live_stems: bool,
     /// The pads are in the layout: GRID edits the grid in their place.
     pads_shown: bool,
+    /// The CUE and Play buttons' size when they fill a column (the side
+    /// column's width); their usual size otherwise.
+    round_size: Option<f32>,
     out: DeckOut,
 }
 
@@ -116,6 +119,7 @@ impl DeckhandApp {
             stem_model,
             live_stems: self.config.prefs.live_stems,
             pads_shown: layout.is_shown(DeckElement::Pads),
+            round_size: None,
             out: DeckOut::default(),
         };
         let area = ui.horizontal_top(|ui| {
@@ -170,6 +174,7 @@ impl DeckhandApp {
                             // The column by the mixer is drawn mirrored on a
                             // right deck: everything in it left for right.
                             set_mirrored(ui, mirror);
+                            set_in_side(ui, true);
                             for &section in layout.side.iter().filter(|s| editing || layout.section_shown(**s)) {
                                 if mirror {
                                     // Snapped to the far side, as the left deck's
@@ -182,6 +187,7 @@ impl DeckhandApp {
                                 }
                             }
                             set_mirrored(ui, false);
+                            set_in_side(ui, false);
                             if editing {
                                 drop_zone(ui, "+", SIDE_WIDTH - 4.0, Some(Place::SideEnd), &mut moved);
                             }
@@ -246,9 +252,26 @@ const TEMPO_NUDGE_STEP: f64 = 0.0002;
 /// rekordbox's jog display: a ring (its mark turns with the music, once
 /// per 1.8 s as a record does) round the BPM in big, the tempo in % and the
 /// range, and − + for tiny tempo steps.
-fn tempo_display(ui: &mut Ui, deck: &mut Deck, engine: &mut Engine, playing: bool, position: f64, index: usize) {
+#[allow(clippy::too_many_arguments)]
+fn tempo_display(
+    ui: &mut Ui,
+    deck: &mut Deck,
+    engine: &mut Engine,
+    playing: bool,
+    position: f64,
+    index: usize,
+    ranges: &[TempoRange],
+    status: &mut Option<String>,
+) {
     let size = ui.available_width().min(140.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
+    // Double-click: type the BPM.
+    let edit_id = egui::Id::new(("tempo edit", index));
+    let mut editing: Option<String> = ui.data(|d| d.get_temp(edit_id));
+    if response.double_clicked() && deck.track.is_some() {
+        editing = Some(deck.current_bpm().map(|b| format!("{b:.2}")).unwrap_or_default());
+    }
+    let response = response.on_hover_text("Double-click to type the BPM");
     let painter = ui.painter_at(rect.expand(2.0));
     let center = rect.center();
     let radius = size / 2.0 - 2.0;
@@ -263,6 +286,7 @@ fn tempo_display(ui: &mut Ui, deck: &mut Deck, engine: &mut Engine, playing: boo
     let strong = ui.visuals().strong_text_color();
     painter.text(center - vec2(0.0, size * 0.25), egui::Align2::CENTER_CENTER, "BPM", egui::FontId::proportional(10.0), weak);
     match deck.current_bpm() {
+        _ if editing.is_some() => {}
         Some(bpm) => {
             let whole = format!("{}", bpm.trunc() as i64);
             let decimals = format!(".{:02}", ((bpm.fract() * 100.0).round() as i64).min(99));
@@ -321,6 +345,37 @@ fn tempo_display(ui: &mut Ui, deck: &mut Deck, engine: &mut Engine, playing: boo
     if ui.put(plus, egui::Button::new("+")).on_hover_text(hover).clicked() {
         deck.set_tempo_fader(deck.tempo_fader + step, engine);
     }
+    // The BPM being typed, where it shows: Enter sets it, Esc (or clicking
+    // away) cancels.
+    if let Some(mut text) = editing {
+        let field = egui::Rect::from_center_size(center - vec2(0.0, size * 0.02), vec2(size * 0.62, size * 0.2));
+        let edit = ui.put(
+            field,
+            egui::TextEdit::singleline(&mut text)
+                .font(egui::FontId::proportional(size * 0.14))
+                .horizontal_align(egui::Align::Center),
+        );
+        if !edit.has_focus() && !edit.lost_focus() {
+            edit.request_focus();
+        }
+        let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        if edit.lost_focus() || escape {
+            if enter && !escape {
+                match text.trim().replace(',', ".").parse::<f64>() {
+                    Ok(bpm) => {
+                        if let Err(why) = deck.set_bpm(bpm, ranges, engine) {
+                            *status = Some(format!("Deck {}: {why}", index + 1));
+                        }
+                    }
+                    Err(_) => *status = Some(format!("Deck {}: \"{}\" is not a BPM", index + 1, text.trim())),
+                }
+            }
+            ui.data_mut(|d| d.remove::<String>(edit_id));
+        } else {
+            ui.data_mut(|d| d.insert_temp(edit_id, text));
+        }
+    }
+    let _ = response;
 }
 
 /// Inside a section's panel, around its controls.
@@ -379,6 +434,15 @@ fn mirrored(ui: &Ui) -> bool {
 
 fn set_mirrored(ui: &Ui, on: bool) {
     ui.data_mut(|d| d.insert_temp(egui::Id::new("deck mirrored"), on));
+}
+
+/// Whether the controls being drawn are in the side column.
+fn in_side(ui: &Ui) -> bool {
+    ui.data(|d| d.get_temp::<bool>(egui::Id::new("deck side"))).unwrap_or(false)
+}
+
+fn set_in_side(ui: &Ui, on: bool) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("deck side"), on));
 }
 
 /// Draws `contents` against the right edge: as much space before it as it
@@ -445,7 +509,18 @@ fn draw_section(ui: &mut Ui, section: Section, layout: &DeckLayout, p: &mut Part
         });
         return;
     }
+    // In the side column, CUE and Play fill it, as wide as its other panels.
+    p.round_size = None;
+    let fill_column = section == Section::Play && in_side(ui);
+    if fill_column {
+        let inner = SIDE_WIDTH - 2.0 * PANEL_MARGIN;
+        let across = if layout.is_stacked(section) { 1.0 } else { 2.0 };
+        p.round_size = Some((inner - GAP * (across - 1.0)) / across);
+    }
     panel(ui, section.title(), |ui| {
+        if fill_column {
+            ui.set_width(SIDE_WIDTH - 2.0 * PANEL_MARGIN);
+        }
         if layout.is_stacked(section) {
             // One on the other: two lines tall.
             ui.vertical(|ui| {
@@ -461,7 +536,8 @@ fn draw_section(ui: &mut Ui, section: Section, layout: &DeckLayout, p: &mut Part
                 }
             });
         } else {
-            let flip = mirrored(ui);
+            // CUE then Play on every deck, mirrored or not.
+            let flip = mirrored(ui) && section != Section::Play;
             for line in &lines {
                 ui.horizontal(|ui| {
                     let mut line = line.clone();
@@ -614,13 +690,25 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                     .on_hover_text("Drag to a playlist, deck or channel");
                 p.out.drag_track |= response.drag_started();
             }
-            None => {
+            // As tall as a loaded one's, so every deck is the same size.
+            None if compact => {
                 ui.label(RichText::new("Empty — double-click a track in the library").weak());
+            }
+            None => {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Empty").size(18.0).weak());
+                    ui.label(RichText::new("Double-click a track in the library").weak());
+                });
             }
         },
         E::Info => {
-            let Some(track) = &deck.track else { return };
             let size = if compact { 20.0 } else { 26.0 };
+            let Some(track) = &deck.track else {
+                // Placeholders, as tall as the values.
+                ui.label(RichText::new("---.--").size(size).monospace().weak());
+                ui.label(RichText::new("BPM").weak());
+                return;
+            };
             ui.label(
                 RichText::new(format!("{:.2}", deck.current_bpm().unwrap_or(0.0)))
                     .size(size)
@@ -710,15 +798,22 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             }
         }
         E::Overview => {
-            let Some(track) = &deck.track else { return };
             let height = if compact { 28.0 } else { 44.0 };
             let width = ui.available_width().max(160.0);
-            // Below it, with stems, which parts of the track have them.
+            // Below it, with stems, which parts of the track have them (room
+            // kept without, so every deck is the same size).
+            let strip_height = if compact { 3.0 } else { 4.0 };
+            let below = strip_height + 2.0;
+            let Some(track) = &deck.track else {
+                let (whole, _) = ui.allocate_exact_size(vec2(width, height + below), Sense::hover());
+                let rect = egui::Rect::from_min_size(whole.min, vec2(width, height));
+                ui.painter().rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+                return;
+            };
             let strip = match &deck.stems {
-                crate::deck::Stems::Ready(layers) => Some((layers.clone(), if compact { 3.0 } else { 4.0 })),
+                crate::deck::Stems::Ready(layers) => Some((layers.clone(), strip_height)),
                 _ => None,
             };
-            let below = strip.as_ref().map_or(0.0, |(_, h)| h + 2.0);
             let (whole, response) = ui.allocate_exact_size(vec2(width, height + below), Sense::click_and_drag());
             let rect = egui::Rect::from_min_size(whole.min, vec2(width, height));
             let hot_cues = hot_cue_marks(track);
@@ -755,7 +850,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::Cue => {
             // Lit while held, or paused at the cue point (like a CDJ).
             let at_cue = deck.track.is_some() && !playing && (position - deck.cue_point).abs() < crate::deck::AT_CUE;
-            let size = big.y;
+            let size = p.round_size.unwrap_or(big.y);
             let cue = round_button(ui, RoundIcon::Text("CUE"), CUE_COLOR, at_cue || *p.cue_held, size);
             let held = cue.is_pointer_button_down_on();
             if held && !*p.cue_held {
@@ -767,7 +862,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Play => {
             let icon = if playing { RoundIcon::Pause } else { RoundIcon::Play };
-            let size = big.y;
+            let size = p.round_size.unwrap_or(big.y);
             if round_button(ui, icon, PLAY_COLOR, playing, size).clicked() {
                 p.out.play = true;
             }
@@ -1087,7 +1182,8 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             slider.on_disabled_hover_text("Follows the master (SYNC)");
         }
         E::TempoDisplay => {
-            tempo_display(ui, deck, engine, playing, position, index);
+            let ranges = p.tempo_ranges.clone();
+            tempo_display(ui, deck, engine, playing, position, index, &ranges, &mut p.out.status);
         }
         E::TempoReset => {
             if ui.button("RESET").on_hover_text("Tempo back to ±0").clicked() {

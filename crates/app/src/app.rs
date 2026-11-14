@@ -487,7 +487,12 @@ impl DeckhandApp {
             buffer_frames: self.config.buffer_frames,
             quality: self.config.audio_quality.engine(),
         };
-        let mut result = Engine::start(&options);
+        // Test aid: no audio output, as on a computer without one.
+        let mut result = if std::env::var_os("DECKHAND_NO_AUDIO").is_some() {
+            Err(anyhow::anyhow!("no audio output (DECKHAND_NO_AUDIO)"))
+        } else {
+            Engine::start(&options)
+        };
         if result.is_err() && (options.sample_rate.is_some() || options.buffer_frames.is_some()) {
             // The device may not take the chosen rate or buffer size.
             (options.sample_rate, options.buffer_frames) = (None, None);
@@ -1736,6 +1741,7 @@ impl eframe::App for DeckhandApp {
             self.moved_window = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
         }
+        self.start_tours_when_due();
         self.run_tour(ctx);
         if std::env::var_os("DECKHAND_TARGETS").is_some() {
             crate::tour::show_targets(ctx);
@@ -1769,6 +1775,24 @@ impl DeckhandApp {
         }
     }
 
+    /// Starts a tour whose moment has come (`start-when`), once: not while
+    /// another runs, nor one finished or skipped before.
+    fn start_tours_when_due(&mut self) {
+        // Not in screenshots (test aid DECKHAND_TRIGGER_TOURS lets them).
+        let shooting = self.screenshot.is_some() && std::env::var_os("DECKHAND_TRIGGER_TOURS").is_none();
+        if self.tour.is_some() || shooting {
+            return;
+        }
+        let due = self.tours.iter().find(|t| {
+            !t.start_when.is_empty()
+                && !self.config.tours_done.contains(&t.id)
+                && t.start_when.iter().all(|c| self.tour_holds(*c))
+        });
+        if let Some(id) = due.map(|t| t.id.clone()) {
+            self.start_tour(&id);
+        }
+    }
+
     fn start_tour(&mut self, id: &str) {
         self.tour = self
             .tours
@@ -1792,6 +1816,8 @@ impl DeckhandApp {
             Condition::FourDecks => self.config.four_decks,
             Condition::RekordboxWriteOn => self.config.prefs.rekordbox_write,
             Condition::RekordboxWriteOff => !self.config.prefs.rekordbox_write,
+            Condition::ControllerConnected => self.controller.port().is_some(),
+            Condition::NoAudioOutput => self.engine.is_none(),
             Condition::MacOs => cfg!(target_os = "macos"),
             Condition::Windows => cfg!(windows),
             Condition::Linux => cfg!(target_os = "linux"),

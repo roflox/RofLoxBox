@@ -1,0 +1,11 @@
+# Shown once, the first time a MIDI controller is connected.
+id = "controller"
+name = "Your controller"
+start-when = ["controller-connected", "performance"]
+
+[[step]]
+target = "controller"
+title = "Controller connected"
+text = """
+RofLoxBox found your controller and plays with it. Here you can see what \
+each knob, fader and button does, and change it (its MIDI mapping)."""

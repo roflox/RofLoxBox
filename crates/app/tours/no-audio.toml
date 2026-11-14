@@ -1,0 +1,18 @@
+# Shown once, the first time no audio output can be opened.
+id = "no-audio"
+name = "No sound output"
+start-when = ["no-audio-output"]
+
+[[step]]
+target = "audio-device"
+title = "No sound output"
+text = """
+No audio output could be opened, so tracks don't load or play. Pick one \
+here: the built-in speakers, headphones or an audio interface."""
+warn = "An interface plugged in after start shows up here too; pick it once it's connected."
+
+[[step]]
+target = "prefs-audio"
+title = "Audio settings"
+text = "Sample rate and buffer size are here, if the output still won't open."
+action = { label = "Open Audio settings", open-prefs = "audio" }

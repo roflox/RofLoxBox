@@ -13,6 +13,8 @@ pub enum Section {
     /// CUE and Play: side by side, or one on the other ([`DeckLayout::stacked`]).
     Play,
     Transport,
+    /// SHIFT, GATE and GRID (next to the transport by default).
+    Functions,
     Loop,
     Jump,
     Memory,
@@ -22,10 +24,11 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Self::Track,
         Self::Play,
         Self::Transport,
+        Self::Functions,
         Self::Loop,
         Self::Jump,
         Self::Memory,
@@ -37,7 +40,7 @@ impl Section {
     /// The name on its panel ("" for none).
     pub fn title(self) -> &'static str {
         match self {
-            Self::Track | Self::Play | Self::Transport | Self::Pads => "",
+            Self::Track | Self::Play | Self::Transport | Self::Functions | Self::Pads => "",
             Self::Loop => "LOOP",
             Self::Jump => "BEAT JUMP",
             Self::Memory => "MEMORY",
@@ -52,6 +55,7 @@ impl Section {
             Self::Track => "Track info",
             Self::Play => "CUE / Play",
             Self::Transport => "Transport",
+            Self::Functions => "SHIFT / GATE / GRID",
             Self::Loop => "Loop",
             Self::Jump => "Beat jump",
             Self::Memory => "Memory",
@@ -71,7 +75,8 @@ impl Section {
             Self::Loop => &[&[E::LoopInOut, E::LoopResize, E::BeatLoops]],
             Self::Jump => &[&[E::BeatJump]],
             Self::Memory => &[&[E::MemoryCall, E::MemorySet]],
-            Self::Pads => &[&[E::PadModes], &[E::Pads], &[E::PadShift, E::Gate, E::GridEdit]],
+            Self::Functions => &[&[E::PadShift, E::Gate, E::GridEdit]],
+            Self::Pads => &[&[E::PadModes], &[E::Pads]],
             Self::Tempo => &[
                 &[E::TempoDisplay],
                 &[E::TempoRange],
@@ -172,14 +177,15 @@ impl DeckElement {
     ];
 
     /// Groups for the View menu, as the decks' sections: (name, elements).
-    pub const GROUPS: [(&'static str, &'static [DeckElement]); 9] = [
+    pub const GROUPS: [(&'static str, &'static [DeckElement]); 10] = [
         ("Track info", &[Self::Header, Self::Title, Self::Info, Self::Overview]),
         ("CUE / Play", &[Self::Cue, Self::Play]),
         ("Transport", &[Self::Sync, Self::Master, Self::Quantize, Self::Vinyl, Self::Slip]),
         ("Loop", &[Self::LoopInOut, Self::LoopResize, Self::BeatLoops]),
         ("Beat jump", &[Self::BeatJump]),
         ("Memory", &[Self::MemoryCall, Self::MemorySet]),
-        ("Pads", &[Self::PadModes, Self::Pads, Self::PadShift, Self::Gate, Self::GridEdit]),
+        ("SHIFT / GATE / GRID", &[Self::PadShift, Self::Gate, Self::GridEdit]),
+        ("Pads", &[Self::PadModes, Self::Pads]),
         (
             "Tempo",
             &[
@@ -380,7 +386,7 @@ impl DeckLayout {
         Self {
             main: vec![
                 vec![S::Track],
-                vec![S::Play, S::Transport],
+                vec![S::Play, S::Transport, S::Functions],
                 vec![S::Loop],
                 vec![S::Jump, S::Memory],
                 vec![S::Pads],
@@ -589,6 +595,6 @@ mod tests {
         let mut layout = DeckLayout::everything();
         layout.remove(S::Play);
         layout.repair();
-        assert_eq!(layout.main[1], vec![S::Play, S::Transport]);
+        assert_eq!(layout.main[1], vec![S::Play, S::Transport, S::Functions]);
     }
 }

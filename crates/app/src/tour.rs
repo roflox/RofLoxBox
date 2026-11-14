@@ -31,6 +31,8 @@ const BUILT_IN: &[(&str, &str)] = &[
     ("first-start.toml", include_str!("../tours/first-start.toml")),
     ("stems.toml", include_str!("../tours/stems.toml")),
     ("edit.toml", include_str!("../tours/edit.toml")),
+    ("controller.toml", include_str!("../tours/controller.toml")),
+    ("no-audio.toml", include_str!("../tours/no-audio.toml")),
 ];
 
 /// A UI element a tour step can point at.
@@ -116,6 +118,10 @@ pub enum Condition {
     /// That Preferences page is showing (or not).
     PrefsTab(PrefsTab),
     NotPrefsTab(PrefsTab),
+    /// A MIDI controller is connected.
+    ControllerConnected,
+    /// No audio output could be opened (tracks don't load or play).
+    NoAudioOutput,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +132,10 @@ pub struct Tour {
     /// Runs by itself once (until finished or skipped).
     #[serde(default)]
     pub auto: bool,
+    /// Runs by itself once, the first time all of these hold (a controller
+    /// plugged in, no audio output…).
+    #[serde(default, rename = "start-when")]
+    pub start_when: Vec<Condition>,
     #[serde(rename = "step")]
     pub steps: Vec<Step>,
 }
@@ -451,6 +461,18 @@ mod tests {
             let tour = parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(!tour.id.is_empty(), "{name}");
         }
+    }
+
+    /// Tours that start by themselves when something happens, once.
+    #[test]
+    fn tours_start_when_due() {
+        let start = |name: &str| {
+            let (_, text) = BUILT_IN.iter().find(|(n, _)| *n == name).unwrap();
+            parse(text).unwrap().start_when
+        };
+        assert_eq!(start("controller.toml"), [Condition::ControllerConnected, Condition::Performance]);
+        assert_eq!(start("no-audio.toml"), [Condition::NoAudioOutput]);
+        assert!(start("first-start.toml").is_empty());
     }
 
     #[test]
