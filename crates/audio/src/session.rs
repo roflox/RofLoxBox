@@ -600,6 +600,7 @@ fn deck_of(event: &Logged) -> Option<usize> {
             | C::SetNudge { deck, .. }
             | C::SetKeyLock { deck, .. }
             | C::Hold { deck, .. }
+            | C::Settle { deck }
             | C::JogMove { deck, .. }
             | C::SetSlip { deck, .. }
             | C::SlipHold { deck, .. }

@@ -125,6 +125,11 @@ pub enum Command {
         deck: usize,
         held: bool,
     },
+    /// The held record goes exactly where it is held at once (a waveform
+    /// dragged with the mouse and let go), rather than catching up.
+    Settle {
+        deck: usize,
+    },
     /// Moves the record by this much while it is held, or while the deck is
     /// paused. Playback glides there, so single jog steps do not click.
     JogMove {
@@ -974,6 +979,12 @@ impl Mixer {
                     // the track keeps following it (apply_jog ends this).
                     d.coasting = true;
                     d.last_jog = self.clock;
+                }
+            }
+            Command::Settle { deck } => {
+                let d = &mut self.decks[deck];
+                if let Some(target) = d.target {
+                    (d.position, d.velocity) = (target, 0.0);
                 }
             }
             Command::JogMove { deck, seconds } => {
@@ -1963,6 +1974,30 @@ mod tests {
         let mut out = vec![0f32; 800 * 2];
         mixer.render(&mut out, 2);
         assert!((position(&shared, 2) - 1.0).abs() < 1e-3, "{}", position(&shared, 2));
+    }
+
+    /// A waveform dragged far and let go plays on from where it was
+    /// dragged to, not from where the record had caught up to.
+    #[test]
+    fn a_waveform_let_go_plays_on_from_where_it_was_dragged() {
+        let rate = 48_000;
+        let (mut mixer, mut tx, shared) = mixer(rate);
+        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        tx.push(Command::Hold { deck: 0, held: true }).unwrap();
+        tx.push(Command::JogMove { deck: 0, seconds: 3.0 }).unwrap();
+        let mut out = vec![0f32; 48 * 2];
+        mixer.render(&mut out, 2);
+        assert!(position(&shared, 0) < 3.95, "still catching up: {}", position(&shared, 0));
+        tx.push(Command::Settle { deck: 0 }).unwrap();
+        tx.push(Command::Hold { deck: 0, held: false }).unwrap();
+        let mut out = vec![0f32; 4_800 * 2];
+        mixer.render(&mut out, 2);
+        // Where it was dragged to (4 s), a coast and a little playing on.
+        let at = position(&shared, 0);
+        assert!((4.0..4.2).contains(&at), "{at}");
     }
 
     #[test]

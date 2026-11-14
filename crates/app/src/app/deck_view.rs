@@ -4,7 +4,7 @@
 
 use deckhand_audio::Engine;
 use deckhand_control::{DeckAction, PadMode, Value};
-use eframe::egui::{self, Color32, Rect, RichText, Sense, Slider, Stroke, Ui, UiBuilder, pos2, vec2};
+use eframe::egui::{self, Color32, RichText, Sense, Slider, Stroke, Ui, UiBuilder, vec2};
 
 use super::{
     ACTIVE, CUE_COLOR, DECK_COLORS, DeckhandApp, PLAY_COLOR, WARN, beats_label, hot_cue_marks,
@@ -16,7 +16,7 @@ use crate::widgets::{RoundIcon, round_button};
 const RED: Color32 = Color32::from_rgb(230, 60, 50);
 use crate::deck::{Deck, TempoRange, display_key, format_key};
 use crate::effects::{Effects, FX_BEATS, PadFxSlot, beat_label};
-use crate::layout::{COLUMNS, DeckElement, Place, SIDE_COLUMNS};
+use crate::layout::{DeckElement, DeckLayout, Place, Section};
 use crate::library::format_time;
 use crate::waveform::{Markers, draw_overview};
 
@@ -64,36 +64,26 @@ struct Parts<'a> {
 }
 
 /// A layout change from a drop: the element and where it goes (`None` hides it).
-type Move = Option<(DeckElement, Option<Place>)>;
-
-/// The decks' grid: a cell's width, the space between cells, a row's
-/// height.
-#[derive(Clone, Copy)]
-struct Grid {
-    cell: f32,
-    gap: f32,
-    unit: f32,
-}
-
-impl Grid {
-    /// The width of `n` cells side by side.
-    fn across(self, n: u8) -> f32 {
-        f32::from(n) * self.cell + f32::from(n.saturating_sub(1)) * self.gap
-    }
-
-    /// The height of `n` rows.
-    fn down(self, n: u8) -> f32 {
-        f32::from(n) * self.unit + f32::from(n.saturating_sub(1)) * self.gap
-    }
-}
+type Move = Option<(Section, Option<Place>)>;
 
 /// The space between the main area and the side column.
-const SIDE_SPACE: f32 = 8.0;
-/// The space between cells and between the parts of a control.
-const GAP: f32 = 3.0;
+const SIDE_SPACE: f32 = 10.0;
+/// The side column's width (tempo, key).
+const SIDE_WIDTH: f32 = 128.0;
+/// The space between controls in a section.
+const GAP: f32 = 4.0;
+/// The space between sections.
+const SECTION_GAP: f32 = 8.0;
+/// A control's height (a button row).
+const ROW_HEIGHT: f32 = 28.0;
+/// The width of a small button ("16", "◀", "×2"); wider ones are a
+/// multiple of it, so the same control is the same size everywhere.
+const UNIT: f32 = 34.0;
 
 impl DeckhandApp {
-    pub(super) fn deck_ui(&mut self, ui: &mut Ui, index: usize, compact: bool) {
+    /// One deck's controls; `mirror` (a deck in the right column) puts the
+    /// side column on its left.
+    pub(super) fn deck_ui(&mut self, ui: &mut Ui, index: usize, compact: bool, mirror: bool) {
         if self.engine.is_none() {
             ui.label("No audio output");
             return;
@@ -101,19 +91,11 @@ impl DeckhandApp {
         let four = self.config.four_decks;
         let layout = self.config.deck_layout(four).clone();
         let editing = self.editing_layout;
-        let shown = |e: &&DeckElement| layout.is_shown(**e);
-        let has_side = editing || layout.side.iter().any(|e| layout.is_shown(*e));
-        // One grid across the deck: the main area's columns, then (after a
-        // space) the side column's.
-        let side_columns = if has_side { SIDE_COLUMNS } else { 0 };
-        let columns = COLUMNS + side_columns;
-        let free = ui.available_width()
-            - if has_side { SIDE_SPACE } else { 0.0 }
-            - f32::from(columns - 1) * GAP;
-        let grid = Grid {
-            cell: (free / f32::from(columns)).max(16.0),
-            gap: GAP,
-            unit: if compact { 24.0 } else { 28.0 },
+        let has_side = editing || layout.side.iter().any(|s| layout.section_shown(*s));
+        let main_width = if has_side {
+            (ui.available_width() - SIDE_WIDTH - SIDE_SPACE).max(220.0)
+        } else {
+            ui.available_width()
         };
         let mut moved: Move = None;
         let stem_model = self.stem_model().is_some();
@@ -136,82 +118,82 @@ impl DeckhandApp {
             pads_shown: layout.is_shown(DeckElement::Pads),
             out: DeckOut::default(),
         };
-        let top = ui.cursor().min;
-        let left = top.x;
-        let main_width = grid.across(COLUMNS);
-        // The main area, row by row: each control in its cells; one that no
-        // longer fits on the line starts the next.
-        let mut y = top.y;
-        for (r, row) in layout.main.iter().enumerate() {
-            let row: Vec<DeckElement> = row.iter().filter(shown).copied().collect();
-            if row.is_empty() && !editing {
-                continue;
-            }
-            let mut lines: Vec<Vec<(DeckElement, u8)>> = vec![Vec::new()];
-            let mut column = 0;
-            for element in row {
-                let across = element.cells().0.min(COLUMNS);
-                if column + across > COLUMNS && column > 0 {
-                    lines.push(Vec::new());
-                    column = 0;
+        let area = ui.horizontal_top(|ui| {
+            // The side column outside: on the right of a left deck, on the
+            // left of a right one, so the two decks mirror each other.
+            for main in if mirror { [false, true] } else { [true, false] } {
+                if main {
+                    ui.allocate_ui_with_layout(
+                        vec2(main_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(main_width);
+                            ui.spacing_mut().item_spacing.y = SECTION_GAP;
+                            for (r, row) in layout.main.iter().enumerate() {
+                                let row: Vec<Section> =
+                                    row.iter().copied().filter(|s| editing || layout.section_shown(*s)).collect();
+                                if row.is_empty() {
+                                    continue;
+                                }
+                                // Sections side by side; one that no longer fits
+                                // goes to the next line whole.
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = vec2(SECTION_GAP, SECTION_GAP);
+                                    for &section in &row {
+                                        keep_together(ui, (index, section), |ui| {
+                                            place_section(ui, section, &layout, &mut parts, editing, &mut moved);
+                                        });
+                                    }
+                                    if editing {
+                                        drop_zone(ui, "+", 22.0, Some(Place::RowEnd(r)), &mut moved);
+                                    }
+                                });
+                            }
+                            if editing {
+                                ui.horizontal(|ui| {
+                                    drop_zone(ui, "New row", 120.0, Some(Place::NewRow), &mut moved);
+                                    drop_zone(ui, "Hide", 80.0, None, &mut moved);
+                                });
+                            }
+                        },
+                    );
+                } else if has_side {
+                    if !mirror {
+                        ui.add_space(SIDE_SPACE);
+                    }
+                    ui.allocate_ui_with_layout(
+                        vec2(SIDE_WIDTH, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(SIDE_WIDTH);
+                            ui.spacing_mut().item_spacing.y = SECTION_GAP;
+                            // The column by the mixer is drawn mirrored on a
+                            // right deck: everything in it left for right.
+                            set_mirrored(ui, mirror);
+                            for &section in layout.side.iter().filter(|s| editing || layout.section_shown(**s)) {
+                                if mirror {
+                                    // Snapped to the far side, as the left deck's
+                                    // are to theirs (mirrored).
+                                    against_far_side(ui, (index, "side", section), |ui| {
+                                        place_section(ui, section, &layout, &mut parts, editing, &mut moved);
+                                    });
+                                } else {
+                                    place_section(ui, section, &layout, &mut parts, editing, &mut moved);
+                                }
+                            }
+                            set_mirrored(ui, false);
+                            if editing {
+                                drop_zone(ui, "+", SIDE_WIDTH - 4.0, Some(Place::SideEnd), &mut moved);
+                            }
+                        },
+                    );
+                    if mirror {
+                        ui.add_space(SIDE_SPACE);
+                    }
                 }
-                lines.last_mut().expect("a line").push((element, column));
-                column += across;
             }
-            for line in &lines {
-                let rows = line.iter().map(|(e, _)| e.cells().1).max().unwrap_or(0);
-                let mut height = if rows > 0 { grid.down(rows) } else { 0.0 };
-                for &(element, column) in line {
-                    let (across, down) = element.cells();
-                    let x = left + f32::from(column) * (grid.cell + grid.gap);
-                    let width = grid.across(across.min(COLUMNS));
-                    let used = if down > 0 {
-                        // Shorter ones in the middle of the line's height.
-                        let own = grid.down(down);
-                        let rect = Rect::from_min_size(pos2(x, y + (height - own) / 2.0), vec2(width, own));
-                        place_in(ui, rect, false, element, &mut parts, editing, &mut moved)
-                    } else {
-                        let rect = Rect::from_min_size(pos2(x, y), vec2(width, f32::INFINITY));
-                        place_in(ui, rect, true, element, &mut parts, editing, &mut moved)
-                    };
-                    height = height.max(used);
-                }
-                y += height + grid.gap;
-            }
-            if editing {
-                let rect = Rect::from_min_size(pos2(left, y), vec2(main_width, 22.0));
-                let mut zone = ui.new_child(UiBuilder::new().max_rect(rect));
-                drop_zone(&mut zone, "+ this row", main_width, Some(Place::RowEnd(r)), &mut moved);
-                y += 22.0 + grid.gap;
-            }
-        }
-        if editing {
-            let rect = Rect::from_min_size(pos2(left, y), vec2(main_width, 22.0));
-            let mut zone = ui.new_child(UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Min)));
-            drop_zone(&mut zone, "New row", 120.0, Some(Place::NewRow), &mut moved);
-            drop_zone(&mut zone, "Hide", 80.0, None, &mut moved);
-            y += 22.0 + grid.gap;
-        }
-        // The side column: one under another.
-        let mut side_y = top.y;
-        if has_side {
-            let x = left + main_width + SIDE_SPACE;
-            let width = grid.across(SIDE_COLUMNS);
-            for &element in layout.side.iter().filter(shown) {
-                let rect = Rect::from_min_size(pos2(x, side_y), vec2(width, grid.down(element.cells().1.max(1))));
-                place_in(ui, rect, false, element, &mut parts, editing, &mut moved);
-                side_y = rect.bottom() + grid.gap;
-            }
-            if editing {
-                let rect = Rect::from_min_size(pos2(x, side_y), vec2(width, 22.0));
-                let mut zone = ui.new_child(UiBuilder::new().max_rect(rect));
-                drop_zone(&mut zone, "+", width, Some(Place::SideEnd), &mut moved);
-                side_y += 22.0 + grid.gap;
-            }
-        }
-        let width = main_width + if has_side { SIDE_SPACE + grid.across(SIDE_COLUMNS) } else { 0.0 };
-        let area = Rect::from_min_max(top, pos2(left + width, y.max(side_y) - grid.gap));
-        ui.advance_cursor_after_rect(area);
+        });
+        let area = area.response.rect;
 
         let out = parts.out;
         let ctx = ui.ctx().clone();
@@ -247,116 +229,299 @@ impl DeckhandApp {
         if out.separate {
             self.separate_deck(index);
         }
-        if let Some((element, place)) = moved {
+        if let Some((section, place)) = moved {
             let layout = self.config.deck_layout_mut(four);
             match place {
-                Some(place) => layout.move_to(element, place),
-                None => layout.set_shown(element, false),
+                Some(place) => layout.move_to(section, place),
+                None => layout.set_section_shown(section, false),
             }
             self.config.save();
         }
     }
 }
 
-/// Draws `element` in its cells (`natural`: as tall as it draws, from the
-/// top of `rect`); returns the height it took.
-fn place_in(
-    ui: &mut Ui,
-    rect: Rect,
-    natural: bool,
-    element: DeckElement,
-    p: &mut Parts<'_>,
-    editing: bool,
-    moved: &mut Move,
-) -> f32 {
-    let layout = if natural {
-        egui::Layout::top_down(egui::Align::Min)
+/// A tempo step of − and + by the BPM: 0.02 % of the original tempo.
+const TEMPO_NUDGE_STEP: f64 = 0.0002;
+
+/// rekordbox's jog display: a ring (its mark turns with the music, once
+/// per 1.8 s as a record does) round the BPM in big, the tempo in % and the
+/// range, and − + for tiny tempo steps.
+fn tempo_display(ui: &mut Ui, deck: &mut Deck, engine: &mut Engine, playing: bool, position: f64, index: usize) {
+    let size = ui.available_width().min(140.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    let painter = ui.painter_at(rect.expand(2.0));
+    let center = rect.center();
+    let radius = size / 2.0 - 2.0;
+    let color = DECK_COLORS[index % DECK_COLORS.len()];
+    painter.circle_stroke(center, radius, Stroke::new(3.0_f32, Color32::from_gray(70)));
+    painter.circle_stroke(center, radius - 5.0, Stroke::new(2.0_f32, color));
+    // The mark, turning as a record at 33⅓ does (one turn in 1.8 s).
+    let turn = (position / 1.8).fract() as f32 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+    let mark = center + vec2(turn.cos(), turn.sin()) * (radius - 1.0);
+    painter.circle_filled(mark, 4.0, if playing { Color32::WHITE } else { Color32::from_gray(150) });
+    let weak = ui.visuals().weak_text_color();
+    let strong = ui.visuals().strong_text_color();
+    painter.text(center - vec2(0.0, size * 0.25), egui::Align2::CENTER_CENTER, "BPM", egui::FontId::proportional(10.0), weak);
+    match deck.current_bpm() {
+        Some(bpm) => {
+            let whole = format!("{}", bpm.trunc() as i64);
+            let decimals = format!(".{:02}", ((bpm.fract() * 100.0).round() as i64).min(99));
+            let big = ui.painter().layout_no_wrap(whole, egui::FontId::proportional(size * 0.2), strong);
+            let small = ui.painter().layout_no_wrap(decimals, egui::FontId::proportional(size * 0.11), strong);
+            let width = big.size().x + small.size().x;
+            let left = center.x - width / 2.0;
+            let baseline = center.y - size * 0.02;
+            painter.galley(egui::pos2(left, baseline - big.size().y / 2.0), big.clone(), strong);
+            painter.galley(
+                egui::pos2(left + big.size().x, baseline + big.size().y / 2.0 - small.size().y - 2.0),
+                small,
+                strong,
+            );
+        }
+        None => {
+            painter.text(center, egui::Align2::CENTER_CENTER, "—", egui::FontId::proportional(size * 0.18), weak);
+        }
+    }
+    let percent = (deck.tempo_ratio() - 1.0) * 100.0;
+    let line = center.y + size * 0.15;
+    // The tempo left of the range (right of it when mirrored).
+    let (first, second) = if mirrored(ui) {
+        (egui::Align2::LEFT_CENTER, egui::Align2::RIGHT_CENTER)
     } else {
-        egui::Layout::centered_and_justified(egui::Direction::LeftToRight)
+        (egui::Align2::RIGHT_CENTER, egui::Align2::LEFT_CENTER)
     };
-    let builder = UiBuilder::new().id_salt(("deck element", p.index, element)).max_rect(rect).layout(layout);
-    let mut child = ui.new_child(builder);
-    child.spacing_mut().item_spacing = vec2(GAP, GAP);
-    if natural {
-        // As the rows used to be: across, wrapping, a line tall.
-        child.horizontal_wrapped(|ui| place_element(ui, element, p, editing, moved));
-    } else {
-        place_element(&mut child, element, p, editing, moved);
+    let away = if mirrored(ui) { 4.0 } else { -4.0 };
+    painter.text(
+        egui::pos2(center.x + away, line),
+        first,
+        format!("{percent:+.2}%"),
+        egui::FontId::proportional(11.0),
+        ui.visuals().text_color(),
+    );
+    painter.text(
+        egui::pos2(center.x - away, line),
+        second,
+        deck.tempo_range.label(),
+        egui::FontId::proportional(11.0),
+        Color32::from_rgb(110, 200, 110),
+    );
+    // − + under them, inside the ring.
+    let button = vec2(size * 0.18, size * 0.14);
+    let y = center.y + size * 0.31;
+    let step = (TEMPO_NUDGE_STEP / deck.tempo_range.fraction()) as f32;
+    let hover = if deck.tempo_fader_active() { "Tempo −0.02 %" } else { "Follows the master (SYNC)" };
+    // + on the left when mirrored.
+    let side = if mirrored(ui) { -1.0 } else { 1.0 };
+    let minus = egui::Rect::from_center_size(egui::pos2(center.x - side * button.x * 0.65, y), button);
+    if ui.put(minus, egui::Button::new("−")).on_hover_text(hover).clicked() {
+        deck.set_tempo_fader(deck.tempo_fader - step, engine);
     }
-    if natural { child.min_rect().height() } else { rect.height() }
+    let hover = if deck.tempo_fader_active() { "Tempo +0.02 %" } else { "Follows the master (SYNC)" };
+    let plus = egui::Rect::from_center_size(egui::pos2(center.x + side * button.x * 0.65, y), button);
+    if ui.put(plus, egui::Button::new("+")).on_hover_text(hover).clicked() {
+        deck.set_tempo_fader(deck.tempo_fader + step, engine);
+    }
 }
 
-/// Splits the control's cells across into parts (by `weights`), each
-/// filled by `part` (buttons fill their part).
+/// Inside a section's panel, around its controls.
+const PANEL_MARGIN: f32 = 8.0;
+
+/// A section of a deck's controls: a panel with its name, controls a row
+/// tall and spaced alike.
+fn panel(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(Stroke::new(1.0_f32, Color32::from_gray(48)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(PANEL_MARGIN as i8, 6))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+            ui.spacing_mut().interact_size.y = ROW_HEIGHT;
+            // Its name above its controls, whatever the row around it.
+            ui.vertical(|ui| {
+                if !title.is_empty() {
+                    ui.label(RichText::new(title).small().weak());
+                }
+                contents(ui);
+            });
+        });
+}
+
+/// Draws `contents` (a section) whole: when it no longer fits on the line
+/// (as wide as it was last frame, or measured unseen the first time), it
+/// starts the next one, never half on each.
+fn keep_together(ui: &mut Ui, key: impl std::hash::Hash, mut contents: impl FnMut(&mut Ui)) {
+    let id = egui::Id::new(("keep together", key));
+    let width = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or_else(|| {
+        let builder = UiBuilder::new()
+            .id_salt(("measure", id))
+            .max_rect(ui.max_rect())
+            .layout(egui::Layout::left_to_right(egui::Align::Min))
+            .sizing_pass()
+            .invisible();
+        let mut measure = ui.new_child(builder);
+        contents(&mut measure);
+        measure.min_rect().width()
+    });
+    let at_line_start = ui.cursor().min.x <= ui.max_rect().left() + 1.0;
+    if !at_line_start && ui.max_rect().right() - ui.cursor().min.x < width {
+        ui.end_row();
+    }
+    let rect = ui.scope(|ui| contents(ui)).response.rect;
+    ui.data_mut(|d| d.insert_temp(id, rect.width()));
+}
+
+/// Whether the controls being drawn are in a right deck's column by the
+/// mixer, drawn mirrored (left for right).
+fn mirrored(ui: &Ui) -> bool {
+    ui.data(|d| d.get_temp::<bool>(egui::Id::new("deck mirrored"))).unwrap_or(false)
+}
+
+fn set_mirrored(ui: &Ui, on: bool) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("deck mirrored"), on));
+}
+
+/// Draws `contents` against the right edge: as much space before it as it
+/// leaves (its width as last frame).
+fn against_far_side(ui: &mut Ui, key: impl std::hash::Hash, contents: impl FnOnce(&mut Ui)) {
+    let id = egui::Id::new(("far side", key));
+    let width: Option<f32> = ui.data(|d| d.get_temp(id));
+    ui.horizontal(|ui| {
+        if let Some(width) = width {
+            ui.add_space((ui.available_width() - width).max(0.0));
+        }
+        let rect = ui.scope(contents).response.rect;
+        ui.data_mut(|d| d.insert_temp(id, rect.width()));
+    });
+}
+
+/// Parts of a control side by side, each `weight` units wide and a row
+/// tall, filled by `part` (buttons fill their part).
 fn split(ui: &mut Ui, weights: &[f32], mut part: impl FnMut(&mut Ui, usize)) {
-    let rect = ui.max_rect();
-    let total: f32 = weights.iter().sum();
-    let free = rect.width() - GAP * (weights.len() as f32 - 1.0);
-    let mut x = rect.left();
-    for (i, weight) in weights.iter().enumerate() {
-        let width = free * weight / total;
-        let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(width, rect.height()));
-        let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
-        ui.scope_builder(UiBuilder::new().max_rect(cell).layout(layout), |ui| part(ui, i));
-        x += width + GAP;
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    if mirrored(ui) {
+        order.reverse();
     }
+    ui.horizontal(|ui| {
+        for i in order {
+            let weight = &weights[i];
+            let size = vec2(UNIT * weight + GAP * (weight - 1.0).max(0.0), ROW_HEIGHT);
+            let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
+            ui.allocate_ui_with_layout(size, layout, |ui| part(ui, i));
+        }
+    });
 }
 
-/// [`split`] down: `rows` parts one under another.
+/// Parts one under another, each a row tall and as wide as there is room.
 fn stack(ui: &mut Ui, rows: usize, mut part: impl FnMut(&mut Ui, usize)) {
-    let rect = ui.max_rect();
-    let height = (rect.height() - GAP * (rows as f32 - 1.0)) / rows as f32;
-    for i in 0..rows {
-        let top = rect.top() + i as f32 * (height + GAP);
-        let cell = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), height));
-        let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
-        ui.scope_builder(UiBuilder::new().max_rect(cell).layout(layout), |ui| part(ui, i));
-    }
+    ui.vertical(|ui| {
+        for i in 0..rows {
+            let size = vec2(ui.available_width(), ROW_HEIGHT);
+            let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
+            ui.allocate_ui_with_layout(size, layout, |ui| part(ui, i));
+        }
+    });
 }
 
-/// Draws an element; while editing, as a draggable box that elements can be
-/// dropped on (in front of it, or behind it on its right half).
-fn place_element(
+/// Draws a section's shown controls, line by line: the track's as they
+/// are, the others in a panel (narrow ones as a column of wide buttons).
+fn draw_section(ui: &mut Ui, section: Section, layout: &DeckLayout, p: &mut Parts<'_>) {
+    let lines: Vec<Vec<DeckElement>> = section
+        .lines()
+        .iter()
+        .map(|line| line.iter().copied().filter(|e| layout.is_shown(*e)).collect::<Vec<_>>())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if section == Section::Track {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for line in &lines {
+                ui.horizontal_wrapped(|ui| {
+                    for &element in line {
+                        draw_element(ui, element, p);
+                    }
+                });
+            }
+        });
+        return;
+    }
+    panel(ui, section.title(), |ui| {
+        if layout.is_stacked(section) {
+            // One on the other: two lines tall.
+            ui.vertical(|ui| {
+                for &element in lines.iter().flatten() {
+                    draw_element(ui, element, p);
+                }
+            });
+        } else if section.narrow() {
+            ui.set_width(SIDE_WIDTH - 2.0 * PANEL_MARGIN);
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+                for &element in lines.iter().flatten() {
+                    draw_element(ui, element, p);
+                }
+            });
+        } else {
+            let flip = mirrored(ui);
+            for line in &lines {
+                ui.horizontal(|ui| {
+                    let mut line = line.clone();
+                    if flip {
+                        line.reverse();
+                    }
+                    for element in line {
+                        draw_element(ui, element, p);
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// Draws a section; while editing, as a box to drag (whole) onto another
+/// section (in front of it, or behind it on its right half) or a drop zone.
+fn place_section(
     ui: &mut Ui,
-    element: DeckElement,
+    section: Section,
+    layout: &DeckLayout,
     p: &mut Parts<'_>,
     editing: bool,
     moved: &mut Move,
 ) {
     if !editing {
-        draw_element(ui, element, p);
+        draw_section(ui, section, layout, p);
         return;
     }
-    let id = egui::Id::new(("deck element", p.index, element));
+    let id = egui::Id::new(("deck section", p.index, section));
     let response = ui
-        .dnd_drag_source(id, element, |ui| {
+        .dnd_drag_source(id, section, |ui| {
             egui::Frame::new()
-                .stroke(Stroke::new(1.0_f32, Color32::from_gray(90)))
+                .stroke(Stroke::new(1.0_f32, Color32::from_gray(110)))
+                .corner_radius(6)
                 .inner_margin(2.0)
                 .show(ui, |ui| {
-                    ui.add_enabled_ui(false, |ui| draw_element(ui, element, p));
+                    ui.add_enabled_ui(false, |ui| draw_section(ui, section, layout, p));
                 });
         })
         .response
-        .on_hover_text(format!("{} — drag to move", element.label()));
+        .on_hover_text(format!("{} — drag to move", section.label()));
     // While dragging, nothing counts as hovered; use the pointer itself.
     let pointer = ui.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
     let after = pointer.is_some_and(|pos| pos.x > response.rect.center().x);
-    if response.dnd_hover_payload::<DeckElement>().is_some() {
+    if response.dnd_hover_payload::<Section>().is_some() {
         // Show where it would land.
         let x = if after { response.rect.right() } else { response.rect.left() };
         ui.painter().vline(x, response.rect.y_range(), Stroke::new(3.0_f32, ACTIVE));
     }
-    if let Some(dragged) = response.dnd_release_payload::<DeckElement>() {
-        *moved = Some((*dragged, Some(Place::Next { to: element, after })));
+    if let Some(dragged) = response.dnd_release_payload::<Section>() {
+        *moved = Some((*dragged, Some(Place::Next { to: section, after })));
     }
 }
 
-/// A target for dropping elements: the end of a row, a new row, the side
+/// A target for dropping sections: the end of a row, a new row, the side
 /// column, or `None` to hide them.
 fn drop_zone(ui: &mut Ui, text: &str, width: f32, place: Option<Place>, moved: &mut Move) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, 22.0), Sense::hover());
-    let hovered = response.dnd_hover_payload::<DeckElement>().is_some();
+    let hovered = response.dnd_hover_payload::<Section>().is_some();
     let color = if hovered { ACTIVE } else { Color32::from_gray(70) };
     ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0_f32, color), egui::StrokeKind::Inside);
     ui.painter().text(
@@ -366,7 +531,7 @@ fn drop_zone(ui: &mut Ui, text: &str, width: f32, place: Option<Place>, moved: &
         egui::FontId::proportional(11.0),
         color,
     );
-    if let Some(dragged) = response.dnd_release_payload::<DeckElement>() {
+    if let Some(dragged) = response.dnd_release_payload::<Section>() {
         *moved = Some((*dragged, place));
     }
 }
@@ -590,7 +755,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::Cue => {
             // Lit while held, or paused at the cue point (like a CDJ).
             let at_cue = deck.track.is_some() && !playing && (position - deck.cue_point).abs() < crate::deck::AT_CUE;
-            let size = ui.max_rect().size().min_elem().min(big.y * 1.4);
+            let size = big.y;
             let cue = round_button(ui, RoundIcon::Text("CUE"), CUE_COLOR, at_cue || *p.cue_held, size);
             let held = cue.is_pointer_button_down_on();
             if held && !*p.cue_held {
@@ -602,7 +767,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Play => {
             let icon = if playing { RoundIcon::Pause } else { RoundIcon::Play };
-            let size = ui.max_rect().size().min_elem().min(big.y * 1.4);
+            let size = big.y;
             if round_button(ui, icon, PLAY_COLOR, playing, size).clicked() {
                 p.out.play = true;
             }
@@ -635,7 +800,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::LoopInOut => {
             let looping = deck.loop_active;
-            split(ui, &[1.0, 1.0, 1.6], |ui, i| match i {
+            split(ui, &[1.2, 1.2, 1.8], |ui, i| match i {
                 0 => {
                     if toggle_in(ui, deck.loop_in.is_some() && !looping, "IN", CUE_COLOR).clicked() {
                         deck.loop_in(engine);
@@ -665,10 +830,9 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::BeatLoops => {
             const BEATS: [f64; 4] = [1.0, 4.0, 8.0, 16.0];
-            split(ui, &[1.0; 5], |ui, i| match i {
-                0 => caption(ui, "LOOP"),
-                _ => {
-                    let beats = BEATS[i - 1];
+            split(ui, &[1.0; 4], |ui, i| {
+                {
+                    let beats = BEATS[i];
                     if ui.button(format!("{beats}")).on_hover_text(format!("{beats}-beat loop")).clicked() {
                         deck.beat_loop(beats, engine);
                     }
@@ -678,8 +842,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::BeatJump => {
             // JUMP ◀ − 4 beats + ▶: the arrows jump, − and + set how far.
             let size = deck.jump_size;
-            split(ui, &[1.0, 1.0, 1.0, 2.0, 1.0, 1.0], |ui, i| match i {
-                0 => caption(ui, "JUMP"),
+            split(ui, &[1.0, 1.0, 2.2, 1.0, 1.0], |ui, i| match i + 1 {
                 1 => {
                     if ui.button("◀").on_hover_text("Jump back").clicked() {
                         deck.beat_jump(-deck.jump_size, engine);
@@ -719,13 +882,12 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::MemoryCall => {
             // ◀ MEMORY ▶, as on a CDJ.
-            split(ui, &[0.8, 1.4, 0.8], |ui, i| match i {
+            split(ui, &[1.0, 1.0], |ui, i| match i {
                 0 => {
                     if ui.button("◀").on_hover_text("Previous memory cue").clicked() {
                         deck.memory_call(false, engine);
                     }
                 }
-                1 => caption(ui, "MEMORY"),
                 _ => {
                     if ui.button("▶").on_hover_text("Next memory cue").clicked() {
                         deck.memory_call(true, engine);
@@ -734,14 +896,14 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             });
         }
         E::MemorySet => {
-            split(ui, &[1.0, 1.3], |ui, i| {
+            split(ui, &[1.2, 1.8], |ui, i| {
                 if i == 0 {
-                    let set = ui.button(RichText::new("SET").small());
+                    let set = ui.button("SET");
                     if set.on_hover_text("Save the cue or loop as a memory cue").clicked() {
                         deck.memory_set(engine);
                     }
                 } else {
-                    let delete = ui.button(RichText::new("DELETE").small());
+                    let delete = ui.button("DELETE");
                     if delete.on_hover_text("Delete the memory cue here").clicked() {
                         deck.memory_delete();
                     }
@@ -750,7 +912,8 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::PadModes => {
             // Pad modes like rekordbox; the controller's mode buttons switch them too.
-            split(ui, &[1.0; 8], |ui, i| {
+            let weight = if compact { 1.0 } else { 1.3 };
+            split(ui, &[weight; 8], |ui, i| {
                 let mode = PadMode::ALL[i];
                 let label = RichText::new(pad_mode_short(mode)).small();
                 let lit = deck.pad_mode == mode && !deck.grid_edit;
@@ -840,11 +1003,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             });
         }
         E::TempoRange => {
-            stack(ui, 2, |ui, i| {
-                if i == 0 {
-                    caption(ui, "TEMPO");
-                    return;
-                }
+            {
                 let mut range = deck.tempo_range;
                 egui::ComboBox::from_id_salt(("range", index))
                     .selected_text(range.label())
@@ -857,7 +1016,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 if range != deck.tempo_range {
                     deck.set_tempo_range(range, engine);
                 }
-            });
+            }
         }
         E::MasterTempo => {
             if toggle_in(ui, deck.key_lock, "MT", RED)
@@ -868,11 +1027,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             }
         }
         E::KeyShift => {
-            stack(ui, 2, |ui, row| {
-                if row == 0 {
-                    caption(ui, "KEY");
-                    return;
-                }
+            {
                 split(ui, &[1.0, 1.0, 1.0], |ui, i| match i {
                     0 => {
                         if ui.button("−").on_hover_text("Key down a semitone").clicked() {
@@ -891,7 +1046,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                         }
                     }
                 });
-            });
+            }
         }
         E::KeySyncTap => {
             stack(ui, 2, |ui, row| {
@@ -921,7 +1076,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::TempoFader => {
             // Like on a CDJ, pulling the fader down makes the track faster.
             let mut fader = -deck.tempo_fader;
-            ui.spacing_mut().slider_width = ui.max_rect().height() - 8.0;
+            ui.spacing_mut().slider_width = if compact { 110.0 } else { 170.0 };
             let slider = ui.add_enabled(
                 deck.tempo_fader_active(),
                 Slider::new(&mut fader, -1.0..=1.0).vertical().show_value(false),
@@ -930,6 +1085,9 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 deck.set_tempo_fader(-fader, engine);
             }
             slider.on_disabled_hover_text("Follows the master (SYNC)");
+        }
+        E::TempoDisplay => {
+            tempo_display(ui, deck, engine, playing, position, index);
         }
         E::TempoReset => {
             if ui.button("RESET").on_hover_text("Tempo back to ±0").clicked() {

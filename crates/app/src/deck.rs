@@ -39,6 +39,10 @@ const SEARCH_SECONDS_PER_STEP: f64 = 0.1;
 pub const AT_CUE: f64 = 0.02;
 /// Beat-jump pads: back/forward pairs.
 pub const BEAT_JUMPS: [f64; 8] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0];
+/// How long after letting go of a synced deck's waveform it snaps onto the
+/// master's beat: past the engine's coast after a release, and a buffer.
+const SNAP_AFTER: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// Beat-loop pad lengths in beats.
 pub const BEAT_LOOPS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 
@@ -331,6 +335,10 @@ pub struct Deck {
     pub phase_offset: f64,
     /// A nudge or scratch just ended: take the current phase as the offset.
     pub rephase: bool,
+    /// Let go of after dragging its waveform while synced: onto the
+    /// master's nearest beat once the record has settled, not before this
+    /// (the engine takes the release with its next buffers).
+    pub snap_at: Option<std::time::Instant>,
     /// The waveform is held by the mouse, stopping the deck.
     grabbed: bool,
     pub volume: f32,
@@ -424,6 +432,7 @@ impl Deck {
             last_poll: Instant::now(),
             phase_offset: 0.0,
             rephase: false,
+            snap_at: None,
             grabbed: false,
             volume: 1.0,
             trim: 0.5,
@@ -1112,20 +1121,22 @@ impl Deck {
         });
     }
 
-    /// Lets go of a grabbed waveform; returns whether it was held. A synced
-    /// deck snaps back into beat with the master (its offset goes) instead
-    /// of keeping where it was let go, as a nudge does.
-    pub fn release_waveform(&mut self, engine: &mut Engine) -> bool {
+    /// Lets go of a grabbed waveform: the deck plays on from exactly where
+    /// it was dragged to. A synced deck then snaps onto the master's
+    /// nearest beat (its offset goes, see [`Deck::snap_at`]) instead of
+    /// keeping where it was let go, as a nudge does.
+    pub fn release_waveform(&mut self, engine: &mut Engine) {
         if !std::mem::take(&mut self.grabbed) {
-            return false;
+            return;
         }
         if self.sync {
             (self.phase_offset, self.rephase) = (0.0, false);
+            self.snap_at = Some(std::time::Instant::now() + SNAP_AFTER);
         } else {
             self.rephase = true;
         }
+        engine.send(Command::Settle { deck: self.index });
         engine.send(Command::Hold { deck: self.index, held: false });
-        true
     }
 
     pub fn jog_touch(&mut self, touched: bool, engine: &mut Engine) {

@@ -4,10 +4,100 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Columns of a deck's main area; every control takes whole ones.
-pub const COLUMNS: u8 = 12;
-/// Columns of the side column (tempo, key), the same width as the main ones.
-pub const SIDE_COLUMNS: u8 = 2;
+/// A section of a deck's controls: drawn as one panel, moved as one in
+/// the layout editor; its controls can be hidden one by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Section {
+    /// Name, title, info, overview: not in a panel.
+    Track,
+    /// CUE and Play: side by side, or one on the other ([`DeckLayout::stacked`]).
+    Play,
+    Transport,
+    Loop,
+    Jump,
+    Memory,
+    Pads,
+    Tempo,
+    Key,
+}
+
+impl Section {
+    pub const ALL: [Section; 9] = [
+        Self::Track,
+        Self::Play,
+        Self::Transport,
+        Self::Loop,
+        Self::Jump,
+        Self::Memory,
+        Self::Pads,
+        Self::Tempo,
+        Self::Key,
+    ];
+
+    /// The name on its panel ("" for none).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Track | Self::Play | Self::Transport | Self::Pads => "",
+            Self::Loop => "LOOP",
+            Self::Jump => "BEAT JUMP",
+            Self::Memory => "MEMORY",
+            Self::Tempo => "TEMPO",
+            Self::Key => "KEY",
+        }
+    }
+
+    /// Its name in menus.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Track => "Track info",
+            Self::Play => "CUE / Play",
+            Self::Transport => "Transport",
+            Self::Loop => "Loop",
+            Self::Jump => "Beat jump",
+            Self::Memory => "Memory",
+            Self::Pads => "Pads",
+            Self::Tempo => "Tempo",
+            Self::Key => "Key",
+        }
+    }
+
+    /// Its controls, line by line, as they are arranged in it.
+    pub fn lines(self) -> &'static [&'static [DeckElement]] {
+        use DeckElement as E;
+        match self {
+            Self::Track => &[&[E::Header], &[E::Title], &[E::Info], &[E::Overview]],
+            Self::Play => &[&[E::Cue, E::Play]],
+            Self::Transport => &[&[E::Sync, E::Master, E::Quantize, E::Vinyl, E::Slip]],
+            Self::Loop => &[&[E::LoopInOut, E::LoopResize, E::BeatLoops]],
+            Self::Jump => &[&[E::BeatJump]],
+            Self::Memory => &[&[E::MemoryCall, E::MemorySet]],
+            Self::Pads => &[&[E::PadModes], &[E::Pads], &[E::PadShift, E::Gate, E::GridEdit]],
+            Self::Tempo => &[
+                &[E::TempoDisplay],
+                &[E::TempoRange],
+                &[E::MasterTempo],
+                &[E::TempoFader],
+                &[E::TempoReset],
+                &[E::Nudge],
+            ],
+            Self::Key => &[&[E::KeyShift], &[E::KeySyncTap]],
+        }
+    }
+
+    /// A column of buttons as wide as the side column, wherever it is.
+    pub fn narrow(self) -> bool {
+        matches!(self, Self::Tempo | Self::Key)
+    }
+
+    /// Whether it can be drawn one on the other instead of side by side.
+    pub fn can_stack(self) -> bool {
+        self == Self::Play
+    }
+
+    pub fn elements(self) -> impl Iterator<Item = DeckElement> {
+        self.lines().iter().flat_map(|line| line.iter().copied())
+    }
+}
 
 /// One piece of a deck's controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,13 +128,17 @@ pub enum DeckElement {
     KeyShift,
     KeySyncTap,
     TempoFader,
+    /// The BPM in big in a ring (like rekordbox's jog), with − + for tiny
+    /// tempo steps.
+    TempoDisplay,
     TempoReset,
     Nudge,
     GridEdit,
 }
 
 impl DeckElement {
-    pub const ALL: [DeckElement; 29] = [
+    #[cfg(test)]
+    pub const ALL: [DeckElement; 30] = [
         Self::Header,
         Self::Title,
         Self::Info,
@@ -71,65 +165,34 @@ impl DeckElement {
         Self::KeyShift,
         Self::KeySyncTap,
         Self::TempoFader,
+        Self::TempoDisplay,
         Self::TempoReset,
         Self::Nudge,
         Self::GridEdit,
     ];
 
-    /// Groups for the View menu: (name, elements).
-    pub const GROUPS: [(&'static str, &'static [DeckElement]); 7] = [
+    /// Groups for the View menu, as the decks' sections: (name, elements).
+    pub const GROUPS: [(&'static str, &'static [DeckElement]); 9] = [
         ("Track info", &[Self::Header, Self::Title, Self::Info, Self::Overview]),
-        (
-            "Transport",
-            &[
-                Self::Cue,
-                Self::Play,
-                Self::Sync,
-                Self::Master,
-                Self::Quantize,
-                Self::Vinyl,
-                Self::Slip,
-            ],
-        ),
-        ("Loops", &[Self::LoopInOut, Self::LoopResize, Self::BeatLoops, Self::BeatJump]),
-        ("Cues", &[Self::Gate, Self::MemoryCall, Self::MemorySet]),
-        ("Pads", &[Self::PadModes, Self::PadShift, Self::Pads]),
+        ("CUE / Play", &[Self::Cue, Self::Play]),
+        ("Transport", &[Self::Sync, Self::Master, Self::Quantize, Self::Vinyl, Self::Slip]),
+        ("Loop", &[Self::LoopInOut, Self::LoopResize, Self::BeatLoops]),
+        ("Beat jump", &[Self::BeatJump]),
+        ("Memory", &[Self::MemoryCall, Self::MemorySet]),
+        ("Pads", &[Self::PadModes, Self::Pads, Self::PadShift, Self::Gate, Self::GridEdit]),
         (
             "Tempo",
             &[
+                Self::TempoDisplay,
                 Self::TempoRange,
                 Self::MasterTempo,
                 Self::TempoFader,
                 Self::TempoReset,
                 Self::Nudge,
-                Self::GridEdit,
             ],
         ),
         ("Key", &[Self::KeyShift, Self::KeySyncTap]),
     ];
-
-    /// Its size on the deck's grid: columns across (of [`COLUMNS`] in the
-    /// main area, [`SIDE_COLUMNS`] beside it) and rows down; 0 rows is as
-    /// tall as it draws (track info, overview, pads).
-    pub fn cells(self) -> (u8, u8) {
-        match self {
-            Self::Header | Self::Title | Self::Info | Self::Overview | Self::Pads => (COLUMNS, 0),
-            Self::Cue | Self::Play => (2, 2),
-            Self::Sync | Self::Master | Self::Vinyl => (2, 1),
-            Self::Quantize | Self::Slip => (1, 1),
-            Self::LoopInOut => (5, 1),
-            Self::LoopResize => (2, 1),
-            Self::BeatLoops => (5, 1),
-            Self::BeatJump => (7, 1),
-            Self::MemoryCall => (3, 1),
-            Self::MemorySet => (2, 1),
-            Self::Gate | Self::GridEdit | Self::PadShift => (1, 1),
-            Self::PadModes => (9, 1),
-            Self::MasterTempo | Self::TempoReset => (SIDE_COLUMNS, 1),
-            Self::TempoRange | Self::KeyShift | Self::KeySyncTap | Self::Nudge => (SIDE_COLUMNS, 2),
-            Self::TempoFader => (SIDE_COLUMNS, 6),
-        }
-    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -159,6 +222,7 @@ impl DeckElement {
             Self::KeyShift => "Key shift − +",
             Self::KeySyncTap => "KEY sync and TAP",
             Self::TempoFader => "Tempo fader",
+            Self::TempoDisplay => "BPM with − +",
             Self::TempoReset => "Tempo reset",
             Self::Nudge => "Nudge − +",
             Self::GridEdit => "Beat grid edit",
@@ -166,11 +230,11 @@ impl DeckElement {
     }
 }
 
-/// Where a moved element goes.
+/// Where a moved section goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
-    /// In front of (or, with `after`, behind) another element.
-    Next { to: DeckElement, after: bool },
+    /// In front of (or, with `after`, behind) another section.
+    Next { to: Section, after: bool },
     /// At the end of a main-area row.
     RowEnd(usize),
     /// On a new row at the bottom of the main area.
@@ -179,15 +243,20 @@ pub enum Place {
     SideEnd,
 }
 
+/// Where a deck's sections are, and the controls not shown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeckLayout {
-    /// Rows of the main area, top to bottom.
-    pub main: Vec<Vec<DeckElement>>,
-    /// The column beside it (the tempo column by default).
-    pub side: Vec<DeckElement>,
-    /// Elements not shown; they keep their place for when shown again.
+    /// Rows of the main area, top to bottom: sections side by side.
+    pub main: Vec<Vec<Section>>,
+    /// The column beside it (tempo and key by default).
+    pub side: Vec<Section>,
+    /// Controls not shown; a section with none shown is not drawn.
     pub hidden: Vec<DeckElement>,
+    /// Sections drawn one on the other (CUE over Play) rather than side by
+    /// side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stacked: Vec<Section>,
 }
 
 /// The "Default" preset: the controller does the transport, loops, memory
@@ -305,41 +374,31 @@ impl LayoutPreset {
 }
 
 impl DeckLayout {
-    /// Every element shown.
+    /// Every control shown.
     pub fn everything() -> Self {
-        use DeckElement as E;
+        use Section as S;
         Self {
             main: vec![
-                vec![E::Header],
-                vec![E::Title],
-                vec![E::Info],
-                vec![E::Overview],
-                vec![E::Cue, E::Play, E::Sync, E::Master, E::Quantize, E::Vinyl, E::Slip],
-                vec![E::LoopInOut, E::LoopResize, E::BeatLoops],
-                vec![E::BeatJump, E::MemoryCall, E::MemorySet],
-                vec![E::Gate, E::GridEdit, E::PadShift, E::PadModes],
-                vec![E::Pads],
+                vec![S::Track],
+                vec![S::Play, S::Transport],
+                vec![S::Loop],
+                vec![S::Jump, S::Memory],
+                vec![S::Pads],
             ],
-            side: vec![
-                E::TempoRange,
-                E::MasterTempo,
-                E::KeyShift,
-                E::KeySyncTap,
-                E::TempoFader,
-                E::TempoReset,
-                E::Nudge,
-            ],
+            side: vec![S::Tempo, S::Key],
             hidden: Vec::new(),
+            stacked: Vec::new(),
         }
     }
-}
 
-impl DeckLayout {
     /// The four-deck default: every control on screen (loops, beat jump,
     /// the pads' ◀ ▶, key, tempo fader…), since four decks are more than a
     /// two-deck controller has buttons for.
     pub fn four_decks() -> Self {
-        Self::everything()
+        let mut layout = Self::everything();
+        // − + by the BPM instead, as rekordbox has.
+        layout.set_shown(DeckElement::TempoFader, false);
+        layout
     }
 
     pub fn is_shown(&self, element: DeckElement) -> bool {
@@ -353,97 +412,117 @@ impl DeckLayout {
         }
     }
 
-    /// Adds elements a saved layout does not know yet (from a newer
-    /// version) and drops duplicates and empty rows.
+    /// Whether any of a section's controls is shown.
+    pub fn section_shown(&self, section: Section) -> bool {
+        section.elements().any(|e| self.is_shown(e))
+    }
+
+    /// Drops duplicates and empty rows, and puts back sections a saved
+    /// layout lacks (where the full layout has them).
     pub fn repair(&mut self) {
         let mut seen = Vec::new();
         for row in &mut self.main {
-            row.retain(|e| {
-                let new = !seen.contains(e);
-                seen.push(*e);
+            row.retain(|s| {
+                let new = !seen.contains(s);
+                seen.push(*s);
                 new
             });
         }
-        self.side.retain(|e| {
-            let new = !seen.contains(e);
-            seen.push(*e);
+        self.side.retain(|s| {
+            let new = !seen.contains(s);
+            seen.push(*s);
             new
         });
         self.main.retain(|row| !row.is_empty());
-        let missing: Vec<DeckElement> =
-            DeckElement::ALL.into_iter().filter(|e| !seen.contains(e)).collect();
-        // Next to what they sit by in the full layout, else at the bottom.
         let everything = Self::everything();
-        let mut left = Vec::new();
-        for element in missing {
-            let neighbours = everything.main.iter().find(|row| row.contains(&element));
-            let placed = neighbours.and_then(|row| {
-                let at = row.iter().position(|e| *e == element)?;
-                // The nearest neighbour before it, else after it.
-                row[..at].iter().rev().chain(&row[at + 1..]).find_map(|n| {
-                    let (r, i) = self.find(*n)?;
-                    Some((r, if row[..at].contains(n) { i + 1 } else { i }))
+        for section in Section::ALL.into_iter().filter(|s| !seen.contains(s)) {
+            if everything.side.contains(&section) {
+                self.side.push(section);
+                continue;
+            }
+            // Next to a neighbour it has in the full layout, else on a row
+            // of its own.
+            let row = everything.main.iter().find(|row| row.contains(&section));
+            let placed = row.and_then(|row| {
+                let at = row.iter().position(|s| *s == section)?;
+                row.iter().enumerate().filter(|(i, _)| *i != at).find_map(|(i, neighbour)| {
+                    let r = self.main.iter().position(|r| r.contains(neighbour))?;
+                    let k = self.main[r].iter().position(|s| s == neighbour)?;
+                    Some((r, if i < at { k + 1 } else { k }))
                 })
             });
             match placed {
-                Some((r, i)) => self.main[r].insert(i, element),
-                None => left.push(element),
+                Some((r, k)) => self.main[r].insert(k, section),
+                None => self.main.push(vec![section]),
             }
         }
-        if !left.is_empty() {
-            self.main.push(left);
-        }
     }
 
-    /// The row and place of an element in the main column.
-    fn find(&self, element: DeckElement) -> Option<(usize, usize)> {
-        self.main
-            .iter()
-            .enumerate()
-            .find_map(|(r, row)| row.iter().position(|e| *e == element).map(|i| (r, i)))
-    }
-
-    fn remove(&mut self, element: DeckElement) {
+    fn remove(&mut self, section: Section) {
         for row in &mut self.main {
-            row.retain(|e| *e != element);
+            row.retain(|s| *s != section);
         }
-        self.side.retain(|e| *e != element);
+        self.side.retain(|s| *s != section);
     }
 
-    /// Moves an element; it is shown afterwards.
-    pub fn move_to(&mut self, element: DeckElement, place: Place) {
-        if place == (Place::Next { to: element, after: false })
-            || place == (Place::Next { to: element, after: true })
-        {
+    /// Moves a section.
+    pub fn move_to(&mut self, section: Section, place: Place) {
+        if matches!(place, Place::Next { to, .. } if to == section) {
             return;
         }
         // Emptied rows are dropped only at the end, so row numbers hold.
-        self.remove(element);
+        self.remove(section);
         match place {
             Place::Next { to, after } => {
                 let offset = usize::from(after);
                 if let Some(row) = self.main.iter_mut().find(|r| r.contains(&to)) {
-                    let at = row.iter().position(|e| *e == to).unwrap_or(0) + offset;
-                    row.insert(at, element);
-                } else if let Some(at) = self.side.iter().position(|e| *e == to) {
-                    self.side.insert(at + offset, element);
+                    let at = row.iter().position(|s| *s == to).unwrap_or(0) + offset;
+                    row.insert(at, section);
+                } else if let Some(at) = self.side.iter().position(|s| *s == to) {
+                    self.side.insert(at + offset, section);
                 } else {
-                    self.main.push(vec![element]);
+                    self.main.push(vec![section]);
                 }
             }
-            Place::RowEnd(row) if row < self.main.len() => self.main[row].push(element),
-            Place::RowEnd(_) | Place::NewRow => self.main.push(vec![element]),
-            Place::SideEnd => self.side.push(element),
+            Place::RowEnd(row) if row < self.main.len() => self.main[row].push(section),
+            Place::RowEnd(_) | Place::NewRow => self.main.push(vec![section]),
+            Place::SideEnd => self.side.push(section),
         }
         self.main.retain(|row| !row.is_empty());
-        self.set_shown(element, true);
+    }
+
+    pub fn is_stacked(&self, section: Section) -> bool {
+        self.stacked.contains(&section)
+    }
+
+    pub fn set_stacked(&mut self, section: Section, stacked: bool) {
+        self.stacked.retain(|s| *s != section);
+        if stacked {
+            self.stacked.push(section);
+        }
+    }
+
+    /// Hides (or shows again) all of a section's controls.
+    pub fn set_section_shown(&mut self, section: Section, shown: bool) {
+        for element in section.elements() {
+            self.set_shown(element, shown);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use DeckElement as E;
+
+    /// The View menu's groups are the decks' sections.
+    #[test]
+    fn groups_are_sections() {
+        for (_, elements) in DeckElement::GROUPS {
+            let section = Section::ALL.into_iter().find(|s| s.elements().any(|e| e == elements[0]));
+            let own: Vec<DeckElement> = section.unwrap().elements().collect();
+            assert!(elements.iter().all(|e| own.contains(e)) && own.len() == elements.len(), "{elements:?}");
+        }
+    }
 
     #[test]
     fn groups_hold_every_element_once() {
@@ -456,25 +535,22 @@ mod tests {
     #[test]
     fn four_deck_default_shows_everything() {
         let four = DeckLayout::four_decks();
-        assert_eq!(four, DeckLayout::everything());
+        assert!(DeckElement::ALL.iter().all(|e| *e == DeckElement::TempoFader || four.is_shown(*e)));
         assert!(!DeckLayout::default().is_shown(DeckElement::MemoryCall));
         let default = |four| LayoutPreset::built_in(four).remove(0).layout;
         assert_eq!(default(true), four);
         assert_eq!(default(false), DeckLayout::default());
     }
 
-    /// Each row of the full layout fits the grid across.
     #[test]
-    fn rows_fit_the_grid() {
-        for row in DeckLayout::everything().main {
-            let across: u8 = row.iter().map(|e| e.cells().0).sum();
-            assert!(across <= COLUMNS, "{row:?} is {across} columns");
-        }
-        assert!(DeckLayout::everything().side.iter().all(|e| e.cells().0 <= SIDE_COLUMNS));
+    fn sections_hold_every_element_once() {
+        let all: Vec<DeckElement> = Section::ALL.iter().flat_map(|s| s.elements()).collect();
+        assert_eq!(all.len(), DeckElement::ALL.len());
+        assert!(DeckElement::ALL.iter().all(|e| all.contains(e)));
     }
 
     #[test]
-    fn default_has_every_element_once() {
+    fn default_has_every_section_once() {
         let mut layout = DeckLayout::default();
         let before = layout.clone();
         layout.repair();
@@ -482,41 +558,37 @@ mod tests {
     }
 
     #[test]
-    fn moving_elements() {
-        let mut layout = DeckLayout::default();
-        layout.move_to(E::Play, Place::Next { to: E::Cue, after: false });
-        assert_eq!(&layout.main[4][..2], [E::Play, E::Cue]);
-        layout.move_to(E::TempoFader, Place::NewRow);
-        assert_eq!(layout.main.last().unwrap(), &vec![E::TempoFader]);
-        assert!(!layout.side.contains(&E::TempoFader));
-        // The header row empties and disappears.
-        layout.move_to(E::Header, Place::SideEnd);
-        assert_eq!(layout.main[0], vec![E::Title]);
-        assert_eq!(layout.side.last(), Some(&E::Header));
-        layout.set_shown(E::Slip, false);
-        layout.move_to(E::Slip, Place::Next { to: E::Header, after: true });
-        assert!(layout.is_shown(E::Slip), "moving shows it again");
-    }
-
-    #[test]
-    fn repair_adds_unknown_elements() {
-        let mut layout =
-            DeckLayout { main: vec![vec![E::Play, E::Play]], side: vec![], hidden: vec![] };
-        layout.repair();
-        // The duplicate went; Play's neighbours joined its row.
-        assert_eq!(layout.main[0].iter().filter(|e| **e == E::Play).count(), 1);
-        assert!(layout.main[0].contains(&E::Cue));
-        let all: usize = layout.main.iter().map(Vec::len).sum::<usize>() + layout.side.len();
-        assert_eq!(all, DeckElement::ALL.len());
-    }
-
-    #[test]
-    fn missing_elements_go_next_to_their_neighbours() {
+    fn moving_sections() {
+        use Section as S;
         let mut layout = DeckLayout::everything();
-        layout.remove(E::GridEdit);
-        layout.repair();
-        let (row, at) = layout.find(E::Gate).unwrap();
-        assert_eq!(layout.main[row][at + 1], E::GridEdit);
+        layout.move_to(S::Memory, Place::Next { to: S::Loop, after: true });
+        assert_eq!(layout.main[2], vec![S::Loop, S::Memory]);
+        assert_eq!(layout.main[3], vec![S::Jump]);
+        layout.move_to(S::Tempo, Place::NewRow);
+        assert_eq!(layout.main.last().unwrap(), &vec![S::Tempo]);
+        assert_eq!(layout.side, vec![S::Key]);
+        // A row left empty goes.
+        layout.move_to(S::Jump, Place::SideEnd);
+        assert!(!layout.main.iter().any(|r| r.is_empty()));
+        assert_eq!(layout.side.last(), Some(&S::Jump));
+        layout.set_section_shown(S::Pads, false);
+        assert!(!layout.section_shown(S::Pads));
     }
 
+    #[test]
+    fn repair_puts_back_missing_sections() {
+        use Section as S;
+        let mut layout =
+            DeckLayout { main: vec![vec![S::Loop, S::Loop]], side: vec![], hidden: vec![], stacked: vec![] };
+        layout.repair();
+        assert_eq!(layout.main[0], vec![S::Loop]);
+        let all: usize = layout.main.iter().map(Vec::len).sum::<usize>() + layout.side.len();
+        assert_eq!(all, Section::ALL.len());
+        assert!(layout.side.contains(&S::Tempo));
+        // One the full layout has by another goes back next to it.
+        let mut layout = DeckLayout::everything();
+        layout.remove(S::Play);
+        layout.repair();
+        assert_eq!(layout.main[1], vec![S::Play, S::Transport]);
+    }
 }

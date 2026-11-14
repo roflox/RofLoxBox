@@ -234,7 +234,8 @@ pub fn lit_button_sized(
     let font = FontId::proportional(text_size);
     let width =
         ui.painter().layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
-    let height = text_size + 8.0;
+    // At least a button's height (the decks' sections set it).
+    let height = (text_size + 8.0).max(ui.spacing().interact_size.y);
     // At least its text's size; filling its cell in a justified layout
     // (the decks' grid).
     let (rect, response) =
@@ -443,10 +444,11 @@ pub fn disclosure(ui: &mut Ui, open: bool) -> Response {
     response
 }
 
-/// A small round "?" that shows `text` when hovered.
+/// A small round "?" that shows `text` when hovered, or (clicked) in a
+/// popup that stays until a click elsewhere.
 pub fn help(ui: &mut Ui, text: &str) -> Response {
     let size = ui.text_style_height(&eframe::egui::TextStyle::Body).max(14.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let visuals = ui.style().interact(&response);
     let color = if response.hovered() { visuals.fg_stroke.color } else { ui.visuals().weak_text_color() };
     let painter = ui.painter();
@@ -458,7 +460,14 @@ pub fn help(ui: &mut Ui, text: &str) -> Response {
         eframe::egui::FontId::proportional(size * 0.7),
         color,
     );
-    response.on_hover_ui(|ui| {
+    let popup = eframe::egui::Popup::from_toggle_button_response(&response).show(|ui| {
+        ui.set_max_width(320.0);
+        ui.label(text);
+    });
+    if popup.is_some() {
+        return response;
+    }
+    response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand).on_hover_ui(|ui| {
         ui.set_max_width(320.0);
         ui.label(text);
     })

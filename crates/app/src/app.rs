@@ -1011,6 +1011,15 @@ impl DeckhandApp {
         for deck in 0..DECKS {
             if self.decks[deck].sync {
                 let playing = self.engine.as_ref().is_some_and(|e| e.is_playing(deck));
+                // A waveform let go of: onto the master's nearest beat once
+                // the record has settled (not bending or coasting).
+                let settled = self.engine.as_ref().is_some_and(|e| !e.is_bending(deck));
+                let due = self.decks[deck].snap_at.is_some_and(|at| Instant::now() >= at);
+                if due && settled {
+                    self.decks[deck].snap_at = None;
+                    self.follow_master(deck, playing);
+                    continue;
+                }
                 self.follow_master(deck, check_drift && playing);
             }
         }
@@ -1990,23 +1999,32 @@ impl DeckhandApp {
                         let which = if four { "4-deck" } else { "2-deck" };
                         sticky_menu(ui, format!("Deck elements ({which} layout)"), |ui| {
                             use crate::layout::DeckElement;
-                            let hidden = &mut self.config.deck_layout_mut(four).hidden;
-                            let changed = ScrollArea::vertical()
+                            let layout = self.config.deck_layout_mut(four);
+                            let mut changed = ScrollArea::vertical()
                                 .show(ui, |ui| {
                                     crate::parts::grouped_checkboxes(
                                         ui,
                                         &DeckElement::GROUPS,
                                         DeckElement::label,
-                                        hidden,
+                                        &mut layout.hidden,
                                     )
                                 })
                                 .inner;
+                            ui.separator();
+                            for section in crate::layout::Section::ALL.into_iter().filter(|s| s.can_stack()) {
+                                let mut stacked = layout.is_stacked(section);
+                                let label = format!("{} one on the other", section.label());
+                                if ui.checkbox(&mut stacked, label).changed() {
+                                    layout.set_stacked(section, stacked);
+                                    changed = true;
+                                }
+                            }
                             if changed {
                                 self.config.save();
                             }
                         });
                         if ui
-                            .checkbox(&mut self.editing_layout, "Edit deck layout (drag elements)")
+                            .checkbox(&mut self.editing_layout, "Edit deck layout (drag sections)")
                             .changed()
                         {
                             ui.close();
@@ -2156,13 +2174,11 @@ impl DeckhandApp {
         if let Some(seconds) = drag {
             deck.drag_waveform(seconds, engine);
         }
-        let snap = !response.dragged() && deck.release_waveform(engine) && deck.sync;
+        if !response.dragged() {
+            deck.release_waveform(engine);
+        }
         if let Some(seconds) = jump {
             self.decks[index].seek(seconds, engine);
-        }
-        if snap {
-            // Onto the master's beat at once (the nearest one).
-            self.follow_master(index, true);
         }
         painter.text(
             rect.left_top() + vec2(6.0, 4.0),
@@ -2360,8 +2376,8 @@ impl DeckhandApp {
                     height -= BAR + ui.spacing().item_spacing.y;
                 }
                 match block {
-                    B::LeftDecks => self.deck_column(ui, &left, size.x, height),
-                    B::RightDecks => self.deck_column(ui, &right, size.x, height),
+                    B::LeftDecks => self.deck_column(ui, &left, size.x, height, false),
+                    B::RightDecks => self.deck_column(ui, &right, size.x, height, true),
                     B::LeftWaves => self.wave_column(ui, &left_waves, size.x, height),
                     B::RightWaves => self.wave_column(ui, &right_waves, size.x, height),
                     B::Mixer => {
@@ -2436,11 +2452,15 @@ impl DeckhandApp {
         (strips + master).max(crossfader).max(order) + 16.0
     }
 
-    fn deck_column(&mut self, ui: &mut Ui, decks: &[usize], width: f32, height: f32) {
+    /// A column of decks; `mirror` for the right one (see [`DeckhandApp::deck_ui`]).
+    fn deck_column(&mut self, ui: &mut Ui, decks: &[usize], width: f32, height: f32, mirror: bool) {
         let compact = decks.len() > 1;
         ui.allocate_ui_with_layout(vec2(width, height), Layout::top_down(Align::Min), |ui| {
             ui.set_width(width);
             ScrollArea::vertical().id_salt(("decks", decks[0])).show(ui, |ui| {
+                // Never wider than the column (a scroll area keeps the
+                // widest its contents ever were).
+                ui.set_max_width(width);
                 for &deck in decks {
                     // With four decks, the one each controller side drives is framed.
                     let active = self.config.four_decks && self.active_decks[deck % 2] == deck;
@@ -2453,7 +2473,7 @@ impl DeckhandApp {
                         .stroke(stroke)
                         .corner_radius(4)
                         .inner_margin(3.0)
-                        .show(ui, |ui| self.deck_ui(ui, deck, compact));
+                        .show(ui, |ui| self.deck_ui(ui, deck, compact, mirror));
                     if compact {
                         ui.separator();
                     }

@@ -62,12 +62,12 @@ pub struct Config {
     /// Deck, mixer and FX settings as they were when deckhand last ran.
     #[serde(default)]
     pub session: Session,
-    /// Deck controls and where they are on the decks' grid, for two and
-    /// for four decks. (Layouts from before the grid were saved under other
-    /// names and are left behind.)
-    #[serde(default, rename = "deck_grid_two")]
+    /// The decks' sections and where they are, and the controls hidden, for
+    /// two and for four decks. (Older layouts were saved under other names
+    /// and are left behind.)
+    #[serde(default, rename = "deck_sections_two")]
     pub layout_two: crate::layout::DeckLayout,
-    #[serde(default = "crate::layout::DeckLayout::four_decks", rename = "deck_grid_four")]
+    #[serde(default = "crate::layout::DeckLayout::four_decks", rename = "deck_sections_four")]
     pub layout_four: crate::layout::DeckLayout,
     /// Where the decks, vertical waveforms and mixer go.
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_fx_parts: Vec<crate::parts::FxPart>,
     /// Deck layouts saved under a name.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "deck_grid_presets")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "deck_section_presets")]
     pub layout_presets: Vec<crate::layout::LayoutPreset>,
     /// Output sample rate; `None` uses the device's current rate.
     #[serde(default)]
