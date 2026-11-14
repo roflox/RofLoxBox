@@ -4,6 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Columns of a deck's main area; every control takes whole ones.
+pub const COLUMNS: u8 = 12;
+/// Columns of the side column (tempo, key), the same width as the main ones.
+pub const SIDE_COLUMNS: u8 = 2;
+
 /// One piece of a deck's controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DeckElement {
@@ -103,6 +108,29 @@ impl DeckElement {
         ("Key", &[Self::KeyShift, Self::KeySyncTap]),
     ];
 
+    /// Its size on the deck's grid: columns across (of [`COLUMNS`] in the
+    /// main area, [`SIDE_COLUMNS`] beside it) and rows down; 0 rows is as
+    /// tall as it draws (track info, overview, pads).
+    pub fn cells(self) -> (u8, u8) {
+        match self {
+            Self::Header | Self::Title | Self::Info | Self::Overview | Self::Pads => (COLUMNS, 0),
+            Self::Cue | Self::Play => (2, 2),
+            Self::Sync | Self::Master | Self::Vinyl => (2, 1),
+            Self::Quantize | Self::Slip => (1, 1),
+            Self::LoopInOut => (5, 1),
+            Self::LoopResize => (2, 1),
+            Self::BeatLoops => (5, 1),
+            Self::BeatJump => (7, 1),
+            Self::MemoryCall => (3, 1),
+            Self::MemorySet => (2, 1),
+            Self::Gate | Self::GridEdit | Self::PadShift => (1, 1),
+            Self::PadModes => (9, 1),
+            Self::MasterTempo | Self::TempoReset => (SIDE_COLUMNS, 1),
+            Self::TempoRange | Self::KeyShift | Self::KeySyncTap | Self::Nudge => (SIDE_COLUMNS, 2),
+            Self::TempoFader => (SIDE_COLUMNS, 6),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Header => "Deck name",
@@ -119,12 +147,12 @@ impl DeckElement {
             Self::LoopInOut => "Loop IN / OUT / RELOOP",
             Self::LoopResize => "Loop ½ / ×2",
             Self::BeatLoops => "Beat loops 1 4 8 16",
-            Self::BeatJump => "Beat jump ◀ ▶",
+            Self::BeatJump => "Beat jump ◀ − + ▶",
             Self::Gate => "GATE",
-            Self::MemoryCall => "Memory call ◀ ▶",
-            Self::MemorySet => "MEMORY / DELETE",
+            Self::MemoryCall => "◀ MEMORY ▶",
+            Self::MemorySet => "Memory SET / DELETE",
             Self::PadModes => "Pad modes",
-            Self::PadShift => "Pad SHIFT and parameters",
+            Self::PadShift => "Pad SHIFT",
             Self::Pads => "Performance pads",
             Self::TempoRange => "Tempo range",
             Self::MasterTempo => "Master Tempo (MT)",
@@ -287,10 +315,9 @@ impl DeckLayout {
                 vec![E::Info],
                 vec![E::Overview],
                 vec![E::Cue, E::Play, E::Sync, E::Master, E::Quantize, E::Vinyl, E::Slip],
-                vec![E::LoopInOut, E::LoopResize, E::BeatLoops, E::BeatJump],
-                vec![E::Gate, E::GridEdit, E::MemoryCall, E::MemorySet],
-                vec![E::PadModes],
-                vec![E::PadShift],
+                vec![E::LoopInOut, E::LoopResize, E::BeatLoops],
+                vec![E::BeatJump, E::MemoryCall, E::MemorySet],
+                vec![E::Gate, E::GridEdit, E::PadShift, E::PadModes],
                 vec![E::Pads],
             ],
             side: vec![
@@ -308,13 +335,11 @@ impl DeckLayout {
 }
 
 impl DeckLayout {
-    /// The four-deck default: as for two decks, plus the memory cue jumps
-    /// and MEMORY / DELETE (on the GATE row).
+    /// The four-deck default: every control on screen (loops, beat jump,
+    /// the pads' ◀ ▶, key, tempo fader…), since four decks are more than a
+    /// two-deck controller has buttons for.
     pub fn four_decks() -> Self {
-        let mut layout = Self::default();
-        layout.set_shown(DeckElement::MemoryCall, true);
-        layout.set_shown(DeckElement::MemorySet, true);
-        layout
+        Self::everything()
     }
 
     pub fn is_shown(&self, element: DeckElement) -> bool {
@@ -378,19 +403,6 @@ impl DeckLayout {
             .find_map(|(r, row)| row.iter().position(|e| *e == element).map(|i| (r, i)))
     }
 
-    /// Puts Beat grid edit right after GATE (where the default has it), for
-    /// layouts saved when it sat elsewhere.
-    pub fn grid_next_to_gate(&mut self) {
-        let Some((row, at)) = self.find(DeckElement::Gate) else { return };
-        if self.find(DeckElement::GridEdit) == Some((row, at + 1)) {
-            return;
-        }
-        self.remove(DeckElement::GridEdit);
-        let (row, at) = self.find(DeckElement::Gate).expect("still there");
-        self.main[row].insert(at + 1, DeckElement::GridEdit);
-        self.main.retain(|row| !row.is_empty());
-    }
-
     fn remove(&mut self, element: DeckElement) {
         for row in &mut self.main {
             row.retain(|e| *e != element);
@@ -442,14 +454,23 @@ mod tests {
     }
 
     #[test]
-    fn four_deck_default_jumps_to_memory_cues() {
+    fn four_deck_default_shows_everything() {
         let four = DeckLayout::four_decks();
-        assert!(four.is_shown(DeckElement::MemoryCall));
-        assert!(four.is_shown(DeckElement::MemorySet));
+        assert_eq!(four, DeckLayout::everything());
         assert!(!DeckLayout::default().is_shown(DeckElement::MemoryCall));
         let default = |four| LayoutPreset::built_in(four).remove(0).layout;
         assert_eq!(default(true), four);
         assert_eq!(default(false), DeckLayout::default());
+    }
+
+    /// Each row of the full layout fits the grid across.
+    #[test]
+    fn rows_fit_the_grid() {
+        for row in DeckLayout::everything().main {
+            let across: u8 = row.iter().map(|e| e.cells().0).sum();
+            assert!(across <= COLUMNS, "{row:?} is {across} columns");
+        }
+        assert!(DeckLayout::everything().side.iter().all(|e| e.cells().0 <= SIDE_COLUMNS));
     }
 
     #[test]
@@ -498,14 +519,4 @@ mod tests {
         assert_eq!(layout.main[row][at + 1], E::GridEdit);
     }
 
-    #[test]
-    fn grid_moves_next_to_gate() {
-        let mut layout = DeckLayout::everything();
-        layout.remove(E::GridEdit);
-        layout.main.push(vec![E::GridEdit]);
-        layout.grid_next_to_gate();
-        let (row, at) = layout.find(E::Gate).unwrap();
-        assert_eq!(layout.main[row][at + 1], E::GridEdit);
-        assert_eq!(layout.main.len(), DeckLayout::everything().main.len());
-    }
 }

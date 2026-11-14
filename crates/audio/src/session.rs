@@ -109,9 +109,11 @@ pub fn remember_stems(stems: &Arc<StemLayers>, source: StemsSource) {
     remember(&STEMS, stems, source);
 }
 
+/// Notes `item`'s source; a newer one for the same item replaces the old
+/// (stems moved from the cache into a recording's folder).
 fn remember<T, S>(list: &Mutex<Vec<(Weak<T>, S)>>, item: &Arc<T>, source: S) {
     let mut list = list.lock().unwrap_or_else(|e| e.into_inner());
-    list.retain(|(weak, _)| weak.strong_count() > 0);
+    list.retain(|(weak, _)| weak.strong_count() > 0 && !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(item)));
     list.push((Arc::downgrade(item), source));
 }
 
@@ -315,7 +317,9 @@ impl Outline {
 /// What [`export_files`] did.
 #[derive(Debug, Default)]
 pub struct Exported {
+    /// Tracks copied, and those there already from an earlier export.
     pub tracks: usize,
+    pub already: usize,
     pub bytes: u64,
     /// Tracks not found to copy.
     pub missing: Vec<PathBuf>,
@@ -324,13 +328,23 @@ pub struct Exported {
 /// Copies `tracks` (the files a session plays) into `dir`'s `tracks/`
 /// folder, and the stems kept with the recording (`stems`, the `stems/`
 /// folder beside it) into `dir/stems`: with the session written into
-/// `dir`, it opens on another computer, finding them there.
+/// `dir`, it opens on another computer, finding them there. Adds to an
+/// earlier export there: tracks it has already are not copied again.
 pub fn export_files(dir: &Path, tracks: &[PathBuf], stems: Option<&Path>) -> Result<Exported> {
     let folder = dir.join(EXPORTED_TRACKS);
     std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
     let mut exported = Exported::default();
-    let mut index: HashMap<PathBuf, String> = HashMap::new();
+    let mut index: HashMap<PathBuf, String> = std::fs::read(folder.join(EXPORTED_INDEX))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    // Copies whose file is gone are copied again.
+    index.retain(|_, name| folder.join(name.as_str()).is_file());
     for track in tracks {
+        if index.contains_key(track) {
+            exported.already += 1;
+            continue;
+        }
         if !track.is_file() {
             exported.missing.push(track.clone());
             continue;
@@ -340,7 +354,7 @@ pub fn export_files(dir: &Path, tracks: &[PathBuf], stems: Option<&Path>) -> Res
         // Tracks with the same name from different folders: numbered.
         let name = (1..)
             .map(|n| if n == 1 { format!("{stem}{extension}") } else { format!("{stem} {n}{extension}") })
-            .find(|name| !index.values().any(|taken| taken == name))
+            .find(|name| !index.values().any(|taken| taken == name) && !folder.join(name).exists())
             .unwrap_or_default();
         let to = folder.join(&name);
         exported.bytes += std::fs::copy(track, &to)
@@ -350,7 +364,8 @@ pub fn export_files(dir: &Path, tracks: &[PathBuf], stems: Option<&Path>) -> Res
     }
     let written = serde_json::to_vec_pretty(&index)?;
     std::fs::write(folder.join(EXPORTED_INDEX), written)?;
-    if let Some(stems) = stems.filter(|s| s.is_dir()) {
+    // (Not onto themselves, when exporting into the recording's folder.)
+    if let Some(stems) = stems.filter(|s| s.is_dir() && *s != dir.join("stems")) {
         exported.bytes += copy_dir(stems, &dir.join("stems"))?;
     }
     Ok(exported)
@@ -1177,6 +1192,21 @@ pub fn remove_fx(changes: &[(u64, BeatFxParams)], span: &FxSpan) -> Vec<(u64, Be
         .collect()
 }
 
+/// A stretch of a deck with stems to turn parts up and down by, in frames
+/// from the start: from where they were handed to the deck to where it
+/// let go of them (a new track, or taken away).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StemSpan {
+    pub deck: usize,
+    pub from: u64,
+    pub to: u64,
+    /// The parts the stems have (vocals, instruments, bass, drums).
+    pub has: [bool; crate::stems::PARTS],
+}
+
+/// A deck's stem levels from a moment on (see [`Session::stem_levels`]).
+pub type StemLevels = (u64, [f32; crate::stems::PARTS]);
+
 /// How far a play's edges can go (frames from the start, inclusive):
 /// see [`Session::play_edges`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1403,9 +1433,14 @@ impl Session {
         let mut spans = Vec::new();
         let close = |open: &mut Option<(TrackSpan, Option<u64>)>, at, spans: &mut Vec<_>| {
             if let Some((mut span, playing)) = open.take() {
-                span.playing.extend(playing.map(|from| (from, at)));
+                span.playing.extend(playing.map(|from| (from, at)).filter(|(a, b)| b > a));
                 span.to = at;
-                spans.push(span);
+                // Not one that was gone at once (the track on the deck when
+                // recording started, loaded over right then): a clip of no
+                // length would be taken for the one loaded there.
+                if span.to > span.from || !span.playing.is_empty() {
+                    spans.push(span);
+                }
             }
         };
         for (at, event) in &self.events {
@@ -1575,6 +1610,142 @@ impl Session {
         }
         self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
         self.fit_fx_depth();
+    }
+
+    /// The audio of a track the session plays, by its file.
+    pub fn track_audio(&self, path: &Path) -> Option<Arc<TrackAudio>> {
+        self.tracks.get(path).cloned()
+    }
+
+    /// Gives the clip `span` `stems` from its start (as if the deck had had
+    /// them when it was loaded), in place of any it had: its parts can then
+    /// be turned up and down.
+    pub fn add_stems(&mut self, span: &TrackSpan, stems: Arc<StemLayers>) {
+        let start = self.snapshot.clock;
+        let deck = span.deck;
+        let (from, to) = (start + span.from, start + span.to);
+        self.events.retain(|(at, e)| {
+            !(from <= *at
+                && *at < to
+                && matches!(e, Logged::Command(Command::SetStems { deck: d, .. }) if *d == deck))
+        });
+        // After the load at the same moment (the sort is stable).
+        self.events.push((from, Logged::Command(Command::SetStems { deck, stems: Some(stems) })));
+        self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+    }
+
+    /// Where `deck` had stems over the recording.
+    pub fn stem_spans(&self, deck: usize) -> Vec<StemSpan> {
+        let start = self.snapshot.clock;
+        let length = self.length();
+        let has = |stems: &StemLayers| std::array::from_fn(|part| stems.has(part));
+        let mut spans = Vec::new();
+        let mut open = self.snapshot.stems(deck).map(|stems| (0, has(stems)));
+        let mut close = |open: &mut Option<(u64, [bool; crate::stems::PARTS])>, to: u64| {
+            if let Some((from, has)) = open.take()
+                && to > from
+            {
+                spans.push(StemSpan { deck, from, to, has });
+            }
+        };
+        for (at, event) in &self.events {
+            let at = at.saturating_sub(start).min(length);
+            match event {
+                Logged::Command(Command::Load { deck: d, .. } | Command::Unload { deck: d })
+                    if *d == deck =>
+                {
+                    close(&mut open, at);
+                }
+                Logged::Command(Command::SetStems { deck: d, stems }) if *d == deck => {
+                    close(&mut open, at);
+                    open = stems.as_deref().map(|stems| (at, has(stems)));
+                }
+                _ => {}
+            }
+        }
+        close(&mut open, length);
+        spans
+    }
+
+    /// `deck`'s stem levels over the recording (vocals, instruments, bass,
+    /// drums; 1 is as recorded, 0 off): how they stood at the start, then
+    /// every change. Loading a track puts them back to 1.
+    pub fn stem_levels(&self, deck: usize) -> Vec<StemLevels> {
+        let start = self.snapshot.clock;
+        let mut changes = vec![(0, self.snapshot.stem_levels(deck))];
+        for (at, event) in &self.events {
+            let levels = match event {
+                Logged::Command(Command::Load { deck: d, .. }) if *d == deck => {
+                    [1.0; crate::stems::PARTS]
+                }
+                Logged::Command(Command::SetStemLevels { deck: d, levels }) if *d == deck => {
+                    *levels
+                }
+                _ => continue,
+            };
+            let at = at.saturating_sub(start);
+            match changes.last_mut() {
+                Some(last) if last.1 == levels => {}
+                Some(last) if last.0 == at => last.1 = levels,
+                _ => changes.push((at, levels)),
+            }
+        }
+        changes
+    }
+
+    /// Replaces `deck`'s stem level changes with `changes` (as
+    /// [`Session::stem_levels`] gives them), each moved to a buffer start;
+    /// after a load, the levels there are set again.
+    pub fn set_stem_levels(&mut self, deck: usize, changes: &[StemLevels]) {
+        const ALL: [f32; crate::stems::PARTS] = [1.0; crate::stems::PARTS];
+        let start = self.snapshot.clock;
+        let mine = |event: &Logged| {
+            matches!(event, Logged::Command(Command::SetStemLevels { deck: d, .. }) if *d == deck)
+        };
+        self.events.retain(|(_, event)| !mine(event));
+        let end = self.end.map_or(u64::MAX, |end| end.saturating_sub(start));
+        let mut wanted: Vec<StemLevels> =
+            changes.iter().map(|&(at, levels)| (self.snap(at), levels)).collect();
+        wanted.sort_by_key(|c| c.0);
+        let wanted_at = |at: u64| {
+            wanted.iter().take_while(|c| c.0 <= at).last().map_or(ALL, |c| c.1)
+        };
+        // The deck's loads (each puts the levels back to 1), in order.
+        let loads: Vec<u64> = self
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Logged::Command(Command::Load { deck: d, .. }) if *d == deck))
+            .map(|(at, _)| at.saturating_sub(start))
+            .collect();
+        enum Step {
+            Load,
+            Change([f32; crate::stems::PARTS]),
+        }
+        let mut steps: Vec<(u64, Step)> = loads.into_iter().map(|at| (at, Step::Load)).collect();
+        steps.extend(wanted.iter().map(|&(at, levels)| (at, Step::Change(levels))));
+        // A load before a change at the same moment.
+        steps.sort_by_key(|(at, step)| (*at, matches!(step, Step::Change(_))));
+        let mut current = self.snapshot.stem_levels(deck);
+        let mut added = Vec::new();
+        for (at, step) in steps {
+            if at >= end {
+                break;
+            }
+            let levels = match step {
+                Step::Load => {
+                    current = ALL;
+                    wanted_at(at)
+                }
+                Step::Change(levels) => levels,
+            };
+            if levels != current {
+                current = levels;
+                added.push((start + at, Logged::Command(Command::SetStemLevels { deck, levels })));
+            }
+        }
+        // Stable: the new ones come after a load at the same moment.
+        self.events.extend(added);
+        self.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
     }
 
     /// Moves `from`–`to` of `span` (frames from the start) by `frames`,
@@ -2460,7 +2631,10 @@ impl Session {
             .map(|(at, _)| at - start)
             .min();
         let latest_start = first_loop.unwrap_or(to).saturating_sub(1).max(from);
-        let (earliest, latest) = if span.playing.len() == 1 {
+        // As a clip of its own: back to the track's start (not into what is
+        // heard before it on the deck), on to the next thing heard after it
+        // or the track's end.
+        let own_clip = || -> Option<(u64, u64)> {
             // Where it is heard to, and where the deck is in the track then.
             let heard_end = self
                 .heard(span)
@@ -2495,20 +2669,35 @@ impl Session {
                 .map(|h| h.0)
                 .min()
                 .unwrap_or(OPEN_END);
-            (track_start.max(heard_before).min(from), heard_after.min(track_end).max(to))
-        } else {
-            let before = i.checked_sub(1).map_or(span.from, |i| span.playing[i].1 + 1);
-            let after = span.playing.get(i + 1).map_or(span.to, |p| p.0.saturating_sub(1));
-            let earliest =
-                jumps.iter().filter(|&&j| before <= j && j < from).max().map_or(before, |&j| j + 1);
-            let latest = jumps
-                .iter()
-                .filter(|&&j| to < j && j <= after)
-                .min()
-                .map_or(after, |&j| j.saturating_sub(1))
-                .max(to);
-            (earliest.min(from), latest)
+            Some((track_start.max(heard_before).min(from), heard_after.min(track_end).max(to)))
         };
+        // Between the plays around it and the jumps in its clip; the clip's
+        // first play starts, and its last ends, as one of its own would (so
+        // a clip opening with cue hits still stretches back whole).
+        let before = i.checked_sub(1).map_or(span.from, |i| span.playing[i].1 + 1);
+        let after = span.playing.get(i + 1).map_or(span.to, |p| p.0.saturating_sub(1));
+        let mut earliest = jumps
+            .iter()
+            .filter(|&&j| before <= j && j < from)
+            .max()
+            .map_or(before, |&j| j + 1)
+            .min(from);
+        let mut latest = jumps
+            .iter()
+            .filter(|&&j| to < j && j <= after)
+            .min()
+            .map_or(after, |&j| j.saturating_sub(1))
+            .max(to);
+        let (first, last) = (i == 0, i + 1 == span.playing.len());
+        if first || last {
+            let (own_earliest, own_latest) = own_clip()?;
+            if first {
+                earliest = own_earliest;
+            }
+            if last {
+                latest = own_latest;
+            }
+        }
         let start_range = if started { (earliest, latest_start) } else { (from, from) };
         Some(PlayEdges { start: start_range, end: (from + 1, latest) })
     }
@@ -4124,6 +4313,12 @@ mod tests {
     /// Records `commands` on fresh decks for `secs` seconds; returns the
     /// session's file and its tracks.
     fn record(name: &str, commands: Vec<Command>, secs: f64) -> PathBuf {
+        record_after(name, Vec::new(), commands, secs)
+    }
+
+    /// [`record`], with `before` done before recording starts (in the
+    /// session's snapshot).
+    fn record_after(name: &str, before: Vec<Command>, commands: Vec<Command>, secs: f64) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("deckhand-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4131,6 +4326,9 @@ mod tests {
         let mut live = Offline::new(rate, &blank_snapshot(rate));
         let wav = dir.join("set.wav");
         let (recording, tap) = crate::record::Recording::start(&wav, rate).unwrap();
+        for command in before {
+            live.command(command).unwrap();
+        }
         live.command(Command::Record(Some(tap))).unwrap();
         for command in commands {
             live.command(command).unwrap();
@@ -4473,6 +4671,111 @@ mod tests {
         let comparison = rendered.unwrap().comparison.unwrap();
         assert_eq!(comparison.differing, 0, "after renaming: {comparison:?}");
         let _ = std::fs::remove_dir_all(&renamed);
+    }
+
+    /// Stem levels read back as changes, and written back: parts turned
+    /// off for a stretch, then all back as recorded.
+    #[test]
+    fn stem_levels_edited() {
+        let rate = 48_000;
+        let a = track(rate, 3.0, 21);
+        let path = PathBuf::from("/music/stem-edit.wav");
+        remember_track(&a, &path);
+        let vocals = track(rate, 3.0, 22);
+        let stems = Arc::new(StemLayers::new(Some(&vocals), None, None, rate, a.frames()));
+        remember_stems(
+            &stems,
+            StemsSource {
+                track: path.clone(),
+                dir: PathBuf::from("/nowhere/stem-cache/stem-edit"),
+                stems: vec!["vocals".into(), "other".into()],
+            },
+        );
+        let file = record(
+            "stem-edit",
+            vec![
+                Command::Load { deck: 0, audio: a.clone() },
+                Command::SetStems { deck: 0, stems: Some(stems.clone()) },
+                Command::SetStemLevels { deck: 0, levels: [0.5, 1.0, 1.0, 1.0] },
+                Command::SetPlaying { deck: 0, playing: true },
+            ],
+            2.0,
+        );
+        drop(stems);
+        let tracks = Tracks([(path, a)].into_iter().collect());
+        let mut session = Session::read(&file, tracks).unwrap();
+        let spans = session.stem_spans(0);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!((spans[0].from, spans[0].to), (0, session.length()));
+        assert_eq!(spans[0].has, [true, true, false, false]);
+        assert!(session.stem_spans(1).is_empty());
+        let recorded = session.stem_levels(0);
+        assert_eq!(recorded, [(0, [0.5, 1.0, 1.0, 1.0])]);
+        let render = |s: &Session| {
+            let mut out = Vec::new();
+            s.render(|b| Ok(out.extend_from_slice(b))).unwrap();
+            out
+        };
+        let before = render(&session);
+
+        let (on, off) = (session.snap(24_000), session.snap(72_000));
+        let edited = [(0, [0.5, 1.0, 1.0, 1.0]), (on, [0.0, 1.0, 1.0, 1.0]), (off, [1.0; 4])];
+        session.set_stem_levels(0, &edited);
+        assert_eq!(session.stem_levels(0), edited);
+        let after = render(&session);
+        let n = on as usize * 2;
+        assert_eq!(after[..n], before[..n], "the same up to the change");
+        assert_ne!(after[n + 4_000..], before[n + 4_000..], "the vocals off from there");
+
+        session.set_stem_levels(0, &recorded);
+        assert_eq!(session.stem_levels(0), recorded);
+        assert_eq!(render(&session), before, "back as recorded");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A clip recorded without stems gets them afterwards (separated in
+    /// EDIT): its parts can then be turned down, and saved with the
+    /// recording it opens again with them.
+    #[test]
+    fn stems_added_to_a_clip_later() {
+        let rate = 48_000;
+        let a = track(rate, 3.0, 23);
+        let path = PathBuf::from("/music/stems-later.wav");
+        remember_track(&a, &path);
+        let file = record(
+            "stems-later",
+            vec![
+                Command::Load { deck: 0, audio: a.clone() },
+                Command::SetPlaying { deck: 0, playing: true },
+            ],
+            2.0,
+        );
+        let tracks = || Tracks([(path.clone(), a.clone())].into_iter().collect());
+        let mut session = Session::read(&file, tracks()).unwrap();
+        assert!(session.stem_spans(0).is_empty());
+        let before = rendered(&session);
+
+        let vocals = track(rate, 3.0, 24);
+        let stems = Arc::new(StemLayers::new(Some(&vocals), None, None, rate, a.frames()));
+        let dir = file.parent().unwrap().join("stems").join("stems-later");
+        stems.save(&dir, rate).unwrap();
+        remember_stems(&stems, StemsSource { track: path.clone(), dir, stems: vec!["vocals".into(), "other".into()] });
+        let span = session.tracks()[0].clone();
+        session.add_stems(&span, stems.clone());
+        assert_eq!(session.stem_spans(0).len(), 1);
+        assert!(worst(&rendered(&session), &before) < 1e-6, "as it was with every part on");
+        session.set_stem_levels(0, &[(0, [0.0, 1.0, 1.0, 1.0])]);
+        let vocals_off = rendered(&session);
+        assert!(worst(&vocals_off, &before) > 0.01, "the vocals off");
+
+        let saved = file.with_file_name("with stems.session");
+        session.write(&saved).unwrap();
+        drop((session, stems));
+        let again = Session::read(&saved, tracks()).unwrap();
+        assert!(again.warnings().is_empty(), "{:?}", again.warnings());
+        assert_eq!(again.stem_spans(0).len(), 1);
+        assert!(worst(&rendered(&again), &vocals_off) < 1e-6, "the same, from the kept stems");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     /// The Beat FX depth gets a lane: sounding the same at first, then
@@ -4885,6 +5188,77 @@ mod tests {
         (session, file)
     }
 
+    /// A track on the deck before recording started, played a while in:
+    /// its start stretched right back to the start of the set, the clip
+    /// then moves (there is no second, empty clip at the start to take
+    /// for it).
+    #[test]
+    fn a_track_from_before_recording_stretched_to_the_start_moves() {
+        let a = track(48_000, 8.0, 31);
+        let path = PathBuf::from("/music/before-rec.wav");
+        remember_track(&a, &path);
+        let file = record_after(
+            "before-rec",
+            vec![Command::Load { deck: 0, audio: a.clone() }],
+            Vec::new(),
+            0.5,
+        );
+        let mut session = Session::read(&file, Tracks([(path, a)].into_iter().collect())).unwrap();
+        // Playing from 1 s in, 2 s into the track.
+        let start = session.snapshot.clock;
+        let at = session.snap(48_000);
+        session.events.push((start + at, Logged::Command(Command::Seek { deck: 0, seconds: 2.0 })));
+        session.events.push((start + at, Logged::Command(Command::SetPlaying { deck: 0, playing: true })));
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        session.stretch_end();
+        let play = session.tracks()[0].playing[0];
+        assert_eq!(play.0, at);
+        assert_eq!(session.resize_play(0, play, (0, play.1)).unwrap().0, 0);
+        let spans = session.tracks();
+        assert_eq!(spans.len(), 1, "no empty clip left at the start: {spans:?}");
+        let by = 24_576;
+        assert_eq!(session.move_clip(0, 0, by).unwrap(), by as u64);
+        let moved = session.tracks().into_iter().find(|t| !t.playing.is_empty()).unwrap();
+        assert_eq!(moved.from, by as u64);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// A clip opening with a cue hit (a short play) then playing on:
+    /// stretching its start back before the load keeps it one clip, its
+    /// later plays where they were.
+    #[test]
+    fn a_clip_opening_with_cue_hits_stretches_back_whole() {
+        let block = 512u64;
+        let (mut session, file) = deck_session("cue-hits-stretch", vec![]);
+        let audio = session.track_audio(Path::new("/music/cue-hits-stretch.wav")).unwrap();
+        let start = session.snapshot.clock;
+        let events = [
+            (60 * block, Command::Load { deck: 0, audio }),
+            (70 * block, Command::Seek { deck: 0, seconds: 2.0 }),
+            (70 * block, Command::SetPlaying { deck: 0, playing: true }),
+            (75 * block, Command::SetPlaying { deck: 0, playing: false }),
+            (90 * block, Command::Seek { deck: 0, seconds: 2.0 }),
+            (90 * block, Command::SetPlaying { deck: 0, playing: true }),
+        ];
+        for (at, command) in events {
+            session.events.push((start + at, Logged::Command(command)));
+        }
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        let clip = |s: &Session| s.tracks().into_iter().find(|t| t.playing.len() > 1).unwrap();
+        let before = clip(&session);
+        assert_eq!(before.from, 60 * block);
+        let first = before.playing[0];
+        assert_eq!(first, (70 * block, 75 * block));
+        let edges = session.play_edges(0, first.0, first.1).unwrap();
+        assert!(edges.start.0 < before.from, "back before the load: {edges:?}");
+        session.resize_play(0, first, (30 * block, first.1)).unwrap();
+        let after = clip(&session);
+        assert_eq!(after.from, 30 * block, "loaded earlier: {:?}", session.tracks());
+        assert_eq!(after.playing[0], (30 * block, 75 * block));
+        assert_eq!(&after.playing[1..], &before.playing[1..], "the rest as it was");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
     fn rendered(s: &Session) -> Vec<f32> {
         let mut out = Vec::new();
         s.render(|b| Ok(out.extend_from_slice(b))).unwrap();
@@ -5126,6 +5500,9 @@ mod tests {
         let tracks: Vec<PathBuf> = session.track_files().into_iter().map(|t| t.0).collect();
         let done = export_files(&out, &tracks, None).unwrap();
         assert_eq!((done.tracks, done.missing.len()), (1, 0));
+        // Again into the same folder: nothing copied twice.
+        let again = export_files(&out, &tracks, None).unwrap();
+        assert_eq!((again.tracks, again.already, again.bytes), (0, 1, 0));
         drop(session);
         std::fs::remove_dir_all(&song_dir).unwrap();
 

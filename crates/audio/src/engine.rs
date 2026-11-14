@@ -1713,6 +1713,11 @@ impl Snapshot {
         self.decks[deck].stems.as_ref()
     }
 
+    /// The levels a deck's stems were set to (see [`Command::SetStemLevels`]).
+    pub(crate) fn stem_levels(&self, deck: usize) -> [f32; crate::stems::PARTS] {
+        self.decks[deck].stem_target
+    }
+
     /// A deck's track and whether it was playing.
     pub(crate) fn deck(&self, deck: usize) -> (Option<&Arc<TrackAudio>>, bool) {
         let d = &self.decks[deck];

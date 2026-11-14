@@ -112,6 +112,12 @@ enum KeyAction {
     Marker,
     /// EDIT mode: 0 Normal tool, 1 Select tool, 2 split at the selection.
     Edit(u8),
+    /// Jumps by this many eighths of a beat (back when negative).
+    Jump(i32),
+    /// Halves (false) or doubles (true) the beat jump size.
+    JumpSize(bool),
+    /// A loop of this many eighths of a beat.
+    BeatLoop(i32),
 }
 
 impl KeyAction {
@@ -128,6 +134,8 @@ struct Binding {
     side: Option<usize>,
     action: KeyAction,
     label: String,
+    /// The heading it is listed under.
+    section: &'static str,
 }
 
 impl Binding {
@@ -214,61 +222,154 @@ const RIGHT: Hand = Hand {
     sampler: [Key::M, Key::Comma, Key::Period, Key::Slash],
 };
 
+/// The beat jump lengths with keys of their own (none by default), in
+/// eighths of a beat: 1/8 … 64, as far as the jump size goes.
+const JUMP_EIGHTHS: [i32; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+/// The beat loops with keys, in eighths of a beat: ¼ … 32.
+const LOOP_EIGHTHS: [i32; 8] = [2, 4, 8, 16, 32, 64, 128, 256];
+
+/// Beats from eighths of a beat, as shown ("1/8", "½", "4").
+fn eighths_label(eighths: i32) -> String {
+    match eighths {
+        4 => "½".to_owned(),
+        _ => crate::effects::beat_label(f64::from(eighths) / 8.0),
+    }
+}
+
 fn hand_bindings(side: usize, hand: &Hand, out: &mut Vec<Binding>) {
     use DeckAction as D;
     use KeyAction::{Bend, Deck, SamplerStop, Tempo};
     const PLAIN: Mods = Mods::PLAIN;
     const SHIFT: Mods = Mods::SHIFT;
     const COMMAND: Mods = Mods::COMMAND;
-    let mut add = |mods, key, action, label: String| {
-        out.push(Binding { combo: Some(Combo { key, mods }), side: Some(side), action, label });
+    let key = |mods, key| Some(Combo { key, mods });
+    let mut section: &str;
+    let mut add = |section: &'static str, combo: Option<Combo>, action, label: String| {
+        out.push(Binding { combo, side: Some(side), action, label, section });
     };
-    let named = [
-        (PLAIN, hand.play, Deck(D::PlayPause), "Play/Pause"),
-        (PLAIN, hand.cue, Deck(D::Cue), "Cue"),
-        (SHIFT, hand.cue, Deck(D::JumpToStart), "Back to the start"),
-        (PLAIN, hand.sync, Deck(D::Sync), "Beat Sync"),
-        (SHIFT, hand.sync, Deck(D::SyncMaster), "Beat Sync Master"),
-        (SHIFT, hand.master_tempo, Deck(D::KeyLock), "Master Tempo"),
-        (PLAIN, hand.bend_down, Bend(-1), "Pitch bend −"),
-        (PLAIN, hand.bend_up, Bend(1), "Pitch bend +"),
-        (SHIFT, hand.bend_down, Tempo(-1), "Tempo − 0.1%"),
-        (SHIFT, hand.bend_up, Tempo(1), "Tempo + 0.1%"),
-        (COMMAND, hand.jump_back, Deck(D::BeatJumpBack), "Beat jump back"),
-        (COMMAND, hand.jump_forward, Deck(D::BeatJumpForward), "Beat jump forward"),
-        (PLAIN, hand.memory_prev, Deck(D::MemoryPrev), "Previous memory cue"),
-        (PLAIN, hand.memory_next, Deck(D::MemoryNext), "Next memory cue"),
-        (SHIFT, hand.memory_next, Deck(D::MemorySet), "Set memory cue"),
-        (SHIFT, hand.memory_prev, Deck(D::MemoryDelete), "Delete memory cue"),
-        (PLAIN, hand.loop_in, Deck(D::LoopIn), "Loop In"),
-        (PLAIN, hand.loop_out, Deck(D::LoopOut), "Loop Out"),
-        (PLAIN, hand.reloop, Deck(D::ReloopExit), "Reloop/Exit"),
-        (SHIFT, hand.loop_in, Deck(D::LoopResizeHalf), "Loop ½"),
-        (SHIFT, hand.reloop, Deck(D::LoopResizeDouble), "Loop ×2"),
-        (SHIFT, hand.loop_out, Deck(D::AutoLoop), "4-beat loop on/off"),
-        (SHIFT, hand.load, Deck(D::Load), "Load selected track"),
-        (hand.vinyl.0, hand.vinyl.1, Deck(D::Vinyl), "Vinyl mode"),
-    ];
-    for (mods, key, action, label) in named {
-        add(mods, key, action, label.to_owned());
+    // Playback.
+    for (combo, action, label) in [
+        (key(PLAIN, hand.play), Deck(D::PlayPause), "Play/Pause"),
+        (key(PLAIN, hand.cue), Deck(D::Cue), "Cue"),
+        (key(SHIFT, hand.cue), Deck(D::JumpToStart), "Back to the start"),
+        (key(PLAIN, hand.sync), Deck(D::Sync), "Beat Sync"),
+        (key(SHIFT, hand.sync), Deck(D::SyncMaster), "Beat Sync Master"),
+        (key(SHIFT, hand.master_tempo), Deck(D::KeyLock), "Master Tempo"),
+        (key(PLAIN, hand.bend_down), Bend(-1), "Pitch bend −"),
+        (key(PLAIN, hand.bend_up), Bend(1), "Pitch bend +"),
+        (key(SHIFT, hand.bend_down), Tempo(-1), "Tempo − 0.1%"),
+        (key(SHIFT, hand.bend_up), Tempo(1), "Tempo + 0.1%"),
+        (None, Deck(D::TempoRangeCycle), "Tempo range"),
+        (key(SHIFT, hand.load), Deck(D::Load), "Load selected track"),
+        (key(hand.vinyl.0, hand.vinyl.1), Deck(D::Vinyl), "Vinyl mode"),
+        (None, Deck(D::Slip), "Slip"),
+        (None, Deck(D::Quantize), "Quantize"),
+        (None, Deck(D::TapBpm), "Tap BPM"),
+    ] {
+        add("Playback", combo, action, label.to_owned());
     }
-    for (n, (&key, name)) in hand.hot_cues.iter().zip(["A", "B", "C", "D"]).enumerate() {
-        add(PLAIN, key, Deck(D::HotCue(n as u8)), format!("Hot cue {name}"));
-        add(
-            Mods::SHIFT_COMMAND,
-            key,
-            Deck(D::HotCueDelete(n as u8)),
-            format!("Clear hot cue {name}"),
-        );
+    // Hot cues A–H: the first four on keys.
+    section = "Hot cues";
+    for n in 0..8u8 {
+        let name = char::from(b'A' + n);
+        let hand_key = hand.hot_cues.get(usize::from(n)).copied();
+        add(section, hand_key.and_then(|k| key(PLAIN, k)), Deck(D::HotCue(n)), format!("Hot cue {name}"));
     }
-    // Beat-loop pads 1–5 are the ½ … 8 beat ones.
-    for (n, (&key, name)) in hand.beat_loops.iter().zip(["½", "1", "2", "4", "8"]).enumerate() {
-        add(COMMAND, key, Deck(D::BeatLoop(n as u8 + 1)), format!("{name} beat loop"));
+    for n in 0..8u8 {
+        let name = char::from(b'A' + n);
+        let hand_key = hand.hot_cues.get(usize::from(n)).copied();
+        let combo = hand_key.and_then(|k| key(Mods::SHIFT_COMMAND, k));
+        add(section, combo, Deck(D::HotCueDelete(n)), format!("Clear hot cue {name}"));
     }
-    for (n, &key) in hand.sampler.iter().enumerate() {
-        let pad = n as u8;
-        add(PLAIN, key, Deck(D::SamplerPlay(pad)), format!("Sampler pad {}", n + 1));
-        add(SHIFT, key, SamplerStop(pad), format!("Stop sampler pad {}", n + 1));
+    for n in 0..8u8 {
+        let name = char::from(b'A' + n);
+        add(section, None, Deck(D::HotCueGate(n)), format!("Hot cue {name} (held)"));
+    }
+    add(section, None, Deck(D::HotCueGateMode), "Hot cue gate on/off".to_owned());
+    // Memory cues.
+    for (combo, action, label) in [
+        (key(PLAIN, hand.memory_prev), Deck(D::MemoryPrev), "Previous memory cue"),
+        (key(PLAIN, hand.memory_next), Deck(D::MemoryNext), "Next memory cue"),
+        (key(SHIFT, hand.memory_next), Deck(D::MemorySet), "Set memory cue"),
+        (key(SHIFT, hand.memory_prev), Deck(D::MemoryDelete), "Delete memory cue"),
+    ] {
+        add("Memory cues", combo, action, label.to_owned());
+    }
+    // Loops: each beat loop length, ½ … 8 on keys.
+    section = "Loops";
+    for (combo, action, label) in [
+        (key(PLAIN, hand.loop_in), Deck(D::LoopIn), "Loop In"),
+        (key(PLAIN, hand.loop_out), Deck(D::LoopOut), "Loop Out"),
+        (key(PLAIN, hand.reloop), Deck(D::ReloopExit), "Reloop/Exit"),
+        (key(SHIFT, hand.loop_in), Deck(D::LoopResizeHalf), "Loop ½"),
+        (key(SHIFT, hand.reloop), Deck(D::LoopResizeDouble), "Loop ×2"),
+        (key(SHIFT, hand.loop_out), Deck(D::AutoLoop), "4-beat loop on/off"),
+        (None, Deck(D::ActiveLoop), "Active loop on/off"),
+        (None, Deck(D::LoopMoveBack), "Move loop back"),
+        (None, Deck(D::LoopMoveForward), "Move loop forward"),
+    ] {
+        add(section, combo, action, label.to_owned());
+    }
+    for (i, eighths) in LOOP_EIGHTHS.into_iter().enumerate() {
+        // ½ … 8 (the 2nd to 6th) are on the beat-loop keys.
+        let combo = i.checked_sub(1).and_then(|k| hand.beat_loops.get(k)).and_then(|&k| key(COMMAND, k));
+        add(section, combo, KeyAction::BeatLoop(eighths), format!("{} beat loop", eighths_label(eighths)));
+    }
+    // Beat jump: by the jump size, the size itself, and every length.
+    section = "Beat jump";
+    for (combo, action, label) in [
+        (key(COMMAND, hand.jump_back), Deck(D::BeatJumpBack), "Beat jump back"),
+        (key(COMMAND, hand.jump_forward), Deck(D::BeatJumpForward), "Beat jump forward"),
+        (None, KeyAction::JumpSize(false), "Jump size ½"),
+        (None, KeyAction::JumpSize(true), "Jump size ×2"),
+    ] {
+        add(section, combo, action, label.to_owned());
+    }
+    for eighths in JUMP_EIGHTHS {
+        let beats = eighths_label(eighths);
+        let unit = if eighths == 8 { "beat" } else { "beats" };
+        add(section, None, KeyAction::Jump(-eighths), format!("Jump back {beats} {unit}"));
+        add(section, None, KeyAction::Jump(eighths), format!("Jump forward {beats} {unit}"));
+    }
+    // Stems.
+    section = "Stems";
+    for (part, name) in deckhand_control::STEM_PARTS.iter().enumerate() {
+        add(section, None, Deck(D::StemPart(part as u8)), format!("{name} on/off"));
+    }
+    add(section, None, Deck(D::PartIsolator), "Part Isolator".to_owned());
+    // Pad FX, held.
+    section = "Pad FX";
+    for n in 0..16u8 {
+        let name = char::from(b'A' + n);
+        add(section, None, Deck(D::PadFx(n)), format!("Pad FX {name} (held)"));
+    }
+    // Sampler: pads 1–4 on keys.
+    section = "Sampler";
+    for n in 0..8u8 {
+        let combo = hand.sampler.get(usize::from(n)).and_then(|&k| key(PLAIN, k));
+        add(section, combo, Deck(D::SamplerPlay(n)), format!("Sampler pad {}", n + 1));
+    }
+    for n in 0..8u8 {
+        let combo = hand.sampler.get(usize::from(n)).and_then(|&k| key(SHIFT, k));
+        add(section, combo, SamplerStop(n), format!("Stop sampler pad {}", n + 1));
+    }
+    // Key.
+    for (action, label) in [
+        (D::KeySync, "Key Sync"),
+        (D::KeyUp, "Key +1"),
+        (D::KeyDown, "Key −1"),
+        (D::KeyReset, "Key reset"),
+    ] {
+        add("Key", None, Deck(action), label.to_owned());
+    }
+    // The deck's channel.
+    for (action, label) in [
+        (D::HeadphoneCue, "Headphone cue"),
+        (D::CrossfaderAssignA, "Crossfader A"),
+        (D::CrossfaderAssignThru, "Crossfader THRU"),
+        (D::CrossfaderAssignB, "Crossfader B"),
+    ] {
+        add("Channel", None, Deck(action), label.to_owned());
     }
 }
 
@@ -285,7 +386,8 @@ fn bindings() -> Vec<Binding> {
     ];
     for (mods, key, action, label) in global {
         let combo = Some(Combo { key, mods });
-        all.push(Binding { combo, side: None, action, label: label.to_owned() });
+        let section = "View and recording";
+        all.push(Binding { combo, side: None, action, label: label.to_owned(), section });
     }
     all
 }
@@ -308,6 +410,7 @@ fn edit_bindings() -> Vec<Binding> {
         side: None,
         action: KeyAction::Edit(edit),
         label: format!("{EDIT}{label}"),
+        section: "EDIT mode",
     })
     .collect()
 }
@@ -443,7 +546,7 @@ impl KeyboardMixer {
             changed = true;
         }
         ui.add_space(6.0);
-        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+        ui.scope(|ui| {
             egui::Grid::new("keyboard keys")
                 .num_columns(3)
                 .striped(true)
@@ -453,7 +556,14 @@ impl KeyboardMixer {
                     ui.label(RichText::new("Left deck").strong());
                     ui.label(RichText::new("Right deck").strong());
                     ui.end_row();
+                    let mut section = "";
                     for (binding, right) in rows(&self.bindings) {
+                        if binding.section != section {
+                            section = binding.section;
+                            ui.end_row();
+                            ui.label(RichText::new(section).strong().size(14.0));
+                            ui.end_row();
+                        }
                         ui.label(&binding.label);
                         key_button(ui, binding, &mut self.capturing);
                         if let Some(right) = right {
@@ -608,6 +718,15 @@ impl DeckhandApp {
             KeyAction::Marker => self.add_marker(),
             // EDIT mode reads its own keys.
             KeyAction::Edit(_) => {}
+            KeyAction::Jump(eighths) => {
+                let Some(engine) = self.engine.as_mut() else { return };
+                self.decks[d].beat_jump(f64::from(eighths) / 8.0, engine);
+            }
+            KeyAction::JumpSize(up) => self.decks[d].change_jump_size(if up { 2.0 } else { 0.5 }),
+            KeyAction::BeatLoop(eighths) => {
+                let Some(engine) = self.engine.as_mut() else { return };
+                self.decks[d].beat_loop(f64::from(eighths) / 8.0, engine);
+            }
         }
     }
 }
@@ -654,8 +773,22 @@ mod tests {
     fn no_two_bindings_share_a_key() {
         let all = bindings();
         for (i, a) in all.iter().enumerate() {
-            let same = all[..i].iter().find(|b| b.combo == a.combo);
+            let same = all[..i].iter().find(|b| a.combo.is_some() && b.combo == a.combo);
             assert!(same.is_none(), "{} and {:?}", a.label, same.map(|b| &b.label));
+        }
+    }
+
+    /// Every beat jump length and the other pad functions are listed, off
+    /// their keys at first; the old keys keep their names in the config.
+    #[test]
+    fn everything_is_listed() {
+        let all = bindings();
+        let left = |label: &str| all.iter().find(|b| b.side == Some(0) && b.label == label);
+        for label in ["Jump back 1/8 beats", "Jump forward 1 beat", "Jump forward 64 beats", "Jump size ×2", "VOCAL on/off", "Pad FX P (held)", "Hot cue H", "32 beat loop"] {
+            assert_eq!(left(label).map(|b| b.combo), Some(None), "{label}");
+        }
+        for label in ["½ beat loop", "8 beat loop", "Hot cue D", "Beat jump back"] {
+            assert!(left(label).is_some_and(|b| b.combo.is_some()), "{label}");
         }
     }
 
@@ -742,7 +875,7 @@ mod tests {
     #[test]
     fn combos_survive_the_config() {
         for binding in bindings() {
-            let combo = binding.combo.unwrap();
+            let Some(combo) = binding.combo else { continue };
             assert_eq!(Combo::parse(&combo.stored()), Some(combo), "{}", binding.label);
         }
         let all = Combo { key: Key::K, mods: Mods { alt: true, control: true, ..Mods::SHIFT } };

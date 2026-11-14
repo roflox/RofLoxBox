@@ -1112,11 +1112,20 @@ impl Deck {
         });
     }
 
-    pub fn release_waveform(&mut self, engine: &mut Engine) {
-        if std::mem::take(&mut self.grabbed) {
-            self.rephase = true;
-            engine.send(Command::Hold { deck: self.index, held: false });
+    /// Lets go of a grabbed waveform; returns whether it was held. A synced
+    /// deck snaps back into beat with the master (its offset goes) instead
+    /// of keeping where it was let go, as a nudge does.
+    pub fn release_waveform(&mut self, engine: &mut Engine) -> bool {
+        if !std::mem::take(&mut self.grabbed) {
+            return false;
         }
+        if self.sync {
+            (self.phase_offset, self.rephase) = (0.0, false);
+        } else {
+            self.rephase = true;
+        }
+        engine.send(Command::Hold { deck: self.index, held: false });
+        true
     }
 
     pub fn jog_touch(&mut self, touched: bool, engine: &mut Engine) {

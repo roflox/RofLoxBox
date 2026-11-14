@@ -554,6 +554,17 @@ impl DeckhandApp {
         if let Some(err) = &self.library_error {
             ui.colored_label(super::WARN, err);
         }
+        // The library in a window of its own, or back in the main one.
+        let detached = self.config.library_detached;
+        let (label, hover) = if detached {
+            ("Back to the main window", "Put the library back under the decks")
+        } else {
+            ("Open in its own window", "The library in a window of its own (for another screen)")
+        };
+        if ui.small_button(label).on_hover_text(hover).clicked() {
+            self.config.library_detached = !detached;
+            self.config.save();
+        }
         ScrollArea::vertical().id_salt("library tree").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(230.0);
             self.collection_section(ui);

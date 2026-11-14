@@ -7,7 +7,7 @@ use crate::deck::TempoRange;
 use crate::widgets::help;
 
 /// Pages of the Preferences window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrefsTab {
     #[default]
@@ -90,7 +90,7 @@ pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
 /// Deck settings; returns whether anything changed.
 pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
     let before = p.clone();
-    egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+    {
         section(ui, "Eject/Load Lock", "Locked: no loading onto a playing deck.", |ui| {
             lock(ui, &mut p.load_lock);
         });
@@ -208,7 +208,7 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.scratch_sensitivity = defaults.scratch_sensitivity;
             p.bend_sensitivity = defaults.bend_sensitivity;
         }
-    });
+    }
     *p != before
 }
 
@@ -252,6 +252,13 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             "Wheel, scroll or pinch",
         );
     });
+    section(ui, "Knobs", "Scroll over a knob to turn it; hold Shift for fine steps.", |ui| {
+        ui.add(
+            egui::Slider::new(&mut p.knob_scroll, 0.0..=4.0)
+                .text("Scroll sensitivity")
+                .custom_formatter(|v, _| if v == 0.0 { "Off".into() } else { format!("{v:.2}×") }),
+        );
+    });
     section(ui, "Master Limiter", "", |ui| {
         ui.checkbox(&mut p.limiter, "Soften peaks before they clip");
     });
@@ -269,6 +276,7 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
         p.limiter = defaults.limiter;
         p.eq_waveforms = defaults.eq_waveforms;
         p.scroll_zoom = defaults.scroll_zoom;
+        p.knob_scroll = defaults.knob_scroll;
     }
     *p != before
 }

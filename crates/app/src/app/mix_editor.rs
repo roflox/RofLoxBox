@@ -18,6 +18,9 @@ use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui
 
 use super::{DECK_COLORS, DeckhandApp, WARN};
 
+mod stem_row;
+use stem_row::{STEM_ROW, Separating, StemDrag, StemMenu, StemOpen};
+
 /// Bass clashes.
 const CLASH: Color32 = Color32::from_rgb(235, 60, 60);
 /// The Beat FX beats, as the mixer offers them.
@@ -85,6 +88,10 @@ pub(super) struct EditView {
     opening: Option<Opening>,
     /// `DECKHAND_EDIT_SESSION` was opened (a test aid).
     opened_at_start: bool,
+    /// Separating stems for clips without them (started when first asked
+    /// for), and the number of the next job.
+    separator: Option<crate::stems::LiveSeparator>,
+    next_job: usize,
 }
 
 impl EditView {
@@ -245,6 +252,22 @@ struct MixEditor {
     play_edge: Option<PlayEdgeDrag>,
     /// A message for the status line.
     note: Option<String>,
+    /// Each deck's stem levels (as the session has them), where it had
+    /// stems, the stem clip chosen (deck, a moment in it), one being
+    /// dragged, what the row's right-click menu is for, and what a new
+    /// clip turns off.
+    stems: Vec<Vec<deckhand_audio::StemLevels>>,
+    stem_spans: Vec<Vec<deckhand_audio::StemSpan>>,
+    chosen_stem: Option<(usize, u64)>,
+    stem_drag: Option<StemDrag>,
+    stem_menu: Option<StemMenu>,
+    /// A stem clip's dialog (double-click).
+    stem_open: Option<StemOpen>,
+    /// Decks whose clips without stems are to be separated, and the
+    /// separations running.
+    stems_wanted: Vec<usize>,
+    separating: Vec<Separating>,
+    last_stems: [f32; deckhand_audio::PARTS],
 }
 
 /// The Master group in [`MixEditor::collapsed`].
@@ -424,6 +447,8 @@ enum Edit {
     Lane(Setting, Vec<Point>),
     Move { deck: usize, at: u64, later: f64 },
     Fx(Vec<(u64, BeatFxParams)>),
+    /// A deck's stem levels.
+    Stems(usize, Vec<deckhand_audio::StemLevels>),
     Events(Vec<u8>),
 }
 
@@ -787,6 +812,8 @@ impl MixEditor {
         let markers = session.markers();
         let pieces = tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
         let key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
+        let stems = (0..deckhand_audio::DECKS).map(|d| session.stem_levels(d)).collect();
+        let stem_spans = (0..deckhand_audio::DECKS).map(|d| session.stem_spans(d)).collect();
         let decks = tracks.iter().map(|t| t.deck + 1).max().unwrap_or(0);
         let lanes: BTreeMap<_, _> = Setting::all(deckhand_audio::DECKS)
             .into_iter()
@@ -901,6 +928,15 @@ impl MixEditor {
             edge_drag: None,
             play_edge: None,
             note: None,
+            stems,
+            stem_spans,
+            chosen_stem: None,
+            stem_drag: None,
+            stem_menu: None,
+            stem_open: None,
+            stems_wanted: Vec::new(),
+            separating: Vec::new(),
+            last_stems: stem_row::FIRST_STEMS,
         }
     }
 
@@ -1055,6 +1091,11 @@ impl MixEditor {
                 self.fx = session.beat_fx();
                 Edit::Fx(before)
             }
+            Edit::Stems(deck, changes) => {
+                session.set_stem_levels(deck, &changes);
+                let before = std::mem::replace(&mut self.stems[deck], session.stem_levels(deck));
+                Edit::Stems(deck, before)
+            }
             Edit::Events(packed) => {
                 let now = pack(&session)?;
                 session.restore(&unpack(&packed)?).ok()?;
@@ -1078,6 +1119,8 @@ impl MixEditor {
         self.sync = session.sync_spans();
         self.moves = session.moves();
         self.fx = session.beat_fx();
+        self.stems = (0..deckhand_audio::DECKS).map(|d| session.stem_levels(d)).collect();
+        self.stem_spans = (0..deckhand_audio::DECKS).map(|d| session.stem_spans(d)).collect();
         for (setting, lane) in &mut self.lanes {
             *lane = session.lane(*setting);
         }
@@ -1137,7 +1180,7 @@ impl MixEditor {
     fn mix_only(edit: &Edit) -> bool {
         match edit {
             Edit::Lane(setting, _) => !matches!(setting, Setting::Tempo(_)),
-            Edit::Fx(_) => true,
+            Edit::Fx(_) | Edit::Stems(..) => true,
             Edit::Move { .. } | Edit::Events(_) => false,
         }
     }
@@ -1669,9 +1712,9 @@ impl MixEditor {
             super::collection_view::reveal(&self.path);
         }
         if ui
-            .add_enabled(self.export.is_none(), egui::Button::new("Export with songs…"))
+            .add_enabled(self.export.is_none(), egui::Button::new("Export with songs"))
             .on_hover_text(
-                "Copy the session with its songs",
+                "Copy its songs into the recording's folder (tracks/), so it opens anywhere",
             )
             .clicked()
         {
@@ -1946,13 +1989,24 @@ impl MixEditor {
                     ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
                 let folded = self.fold(ui, row, &response, deck);
                 match deck {
-                    Some(deck) => self.deck_row(ui, row, &response, deck),
+                    Some(deck) => {
+                        self.deck_row(ui, row, &response, deck);
+                        self.stems_button(ui, row, deck);
+                    }
                     None => {
                         self.group_name(ui, row, "Mixer", ui.visuals().strong_text_color(), folded)
                     }
                 }
                 if folded {
                     continue;
+                }
+                // The deck's stems, as clips under its track.
+                if let Some(deck) = deck
+                    && self.stem_spans.get(deck).is_some_and(|s| !s.is_empty())
+                {
+                    let (row, response) =
+                        ui.allocate_exact_size(vec2(width, STEM_ROW), Sense::click_and_drag());
+                    self.stems_row(ui, row, &response, deck);
                 }
                 self.add_button(ui, |editor, ui| editor.lane_menu(ui, deck));
                 for setting in lanes {
@@ -1993,6 +2047,7 @@ impl MixEditor {
         });
         self.snap_guide(ui, Rect::from_x_y_ranges(area.x_range(), rows.inner_rect.y_range()));
         self.add_fx_dialog(ui.ctx());
+        self.stem_dialog(ui.ctx());
         self.point_edit_dialog(ui.ctx());
     }
 
@@ -2527,8 +2582,14 @@ impl MixEditor {
                     self.edge_drag = Some(EdgeDrag { span, index, right, pieces });
                 }
                 EdgeHit::Play(play, right) => {
-                    // One of several plays: it changes alone.
-                    self.separate(deck, play.0);
+                    // One of several plays: it changes alone, unless it is
+                    // the clip's start or end (the clip stretches whole).
+                    let outer = self.tracks.iter().find(|t| t.deck == deck && t.playing.contains(&play)).is_some_and(|t| {
+                        if right { t.playing.last() == Some(&play) } else { t.playing.first() == Some(&play) }
+                    });
+                    if !outer {
+                        self.separate(deck, play.0);
+                    }
                     let edges = self.session.lock().ok().and_then(|s| s.play_edges(deck, play.0, play.1));
                     let heard_end = self
                         .tracks
@@ -4529,6 +4590,7 @@ impl MixEditor {
     /// Lets go of every selection.
     fn clear_selections(&mut self) {
         self.chosen_fx = None;
+        self.chosen_stem = None;
         self.picked.clear();
         self.selection = None;
         self.clip_selection = None;
@@ -4562,6 +4624,7 @@ impl MixEditor {
             self.picked.push(item);
         }
         (self.selection, self.fx_selection, self.chosen_fx) = (None, None, None);
+        self.chosen_stem = None;
     }
 
     /// How far everything selected can move: a stretch stays inside its
@@ -4660,6 +4723,7 @@ impl MixEditor {
     /// Clears the selections but one kind.
     fn select_only(&mut self, keep: Selected) {
         self.chosen_fx = None;
+        self.chosen_stem = None;
         self.picked.clear();
         if !matches!(keep, Selected::Lane) {
             self.selection = None;
@@ -4711,6 +4775,9 @@ impl MixEditor {
                 let changes = remove_fx(&self.fx, span);
                 self.set_fx(changes, "remove");
             }
+        } else {
+            // A stem clip clicked on: gone.
+            self.remove_chosen_stems();
         }
     }
 
@@ -5364,12 +5431,16 @@ impl MixEditor {
                     let share = f64::from((area.bottom() - 3.0 - pos.y) / (area.height() - 6.0));
                     let value = lo + share.clamp(0.0, 1.0) * (hi - lo);
                     let at = self.at_of(area, pos.x);
+                    let end = self.length.saturating_sub(POINT_GAP);
                     let lane = self.lanes.get_mut(&setting).expect("every setting has a lane");
                     // Between its neighbours, apart enough not to land on the
-                    // same buffer as one; the first stays at the start.
+                    // same buffer as one, and before the set ends (a point
+                    // after it would do nothing); the first stays at the start.
                     let low = if index == 0 { 0 } else { lane[index - 1].at + POINT_GAP };
-                    let high =
-                        lane.get(index + 1).map_or(u64::MAX, |p| p.at.saturating_sub(POINT_GAP));
+                    let high = lane
+                        .get(index + 1)
+                        .map_or(u64::MAX, |p| p.at.saturating_sub(POINT_GAP))
+                        .min(end);
                     lane[index] = Point {
                         curve: lane[index].curve,
                         at: if index == 0 || pinned {
@@ -5423,7 +5494,8 @@ impl MixEditor {
         {
             let before = self.lanes[&setting].clone();
             let point = Point {
-                at: self.at_of(area, pos.x),
+                // Not past the end of the set.
+                at: self.at_of(area, pos.x).min(self.length.saturating_sub(POINT_GAP)),
                 value: self.value_of(area, setting, pos.y),
                 curve: self.shape,
             };
@@ -5513,51 +5585,37 @@ impl MixEditor {
     /// Copies the session as edited, with its songs and the stems kept
     /// with it, into a new folder where the user picks, in the background.
     fn start_export(&mut self) {
-        let here = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let Some(parent) = rfd::FileDialog::new()
-            .set_title("Export the session with its songs into")
-            .set_directory(&here)
-            .pick_folder()
-        else {
-            return;
-        };
-        let dir = (1..)
-            .map(|n| match n {
-                1 => parent.join(format!("{} export", self.name)),
-                n => parent.join(format!("{} export {n}", self.name)),
-            })
-            .find(|d| !d.exists())
-            .unwrap_or_else(|| parent.join(format!("{} export", self.name)));
+        // Into the recording's own folder: `tracks/` beside the session, so
+        // every session there opens with its songs, wherever the folder goes.
+        let dir = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let session = self.session.clone();
-        let file = dir.join(format!("{}.session", self.name));
-        let stems = here.join("stems");
         let (tx, rx) = std::sync::mpsc::channel();
         let out = dir.clone();
         std::thread::spawn(move || {
             let result = (|| -> anyhow::Result<String> {
-                std::fs::create_dir_all(&out)?;
                 let tracks: Vec<PathBuf> = {
                     let session =
                         session.lock().map_err(|_| anyhow::anyhow!("the session is broken"))?;
-                    session.write(&file)?;
                     session.track_files().into_iter().map(|(path, _)| path).collect()
                 };
-                let done = deckhand_audio::export_files(&out, &tracks, Some(&stems))?;
+                let done = deckhand_audio::export_files(&out, &tracks, None)?;
                 let mut note = format!(
-                    "Exported with {} songs ({:.0} MB) into {}",
+                    "Copied {} songs ({:.0} MB) into the recording's tracks folder",
                     done.tracks,
                     done.bytes as f64 / 1e6,
-                    out.file_name().unwrap_or_default().to_string_lossy()
                 );
+                if done.already > 0 {
+                    note.push_str(&format!("; {} were there already", done.already));
+                }
                 if !done.missing.is_empty() {
                     note.push_str(&format!("; {} not found to copy", done.missing.len()));
                 }
                 Ok(note)
             })();
-            let _ = tx.send((result, out));
+            let _ = tx.send((result, out.join("tracks")));
         });
         self.export = Some(rx);
-        self.note = Some("Exporting with songs…".into());
+        self.note = Some("Copying the songs…".into());
     }
 
     /// Writes the edited session where the user picks.
@@ -5898,11 +5956,20 @@ impl DeckhandApp {
                     let mut editor = MixEditor::new(path, session);
                     editor.cues = library_cues(&self.collection, editor.tracks.iter().map(|t| &t.path));
                     editor.outlines = outlines;
+                    // Test aid: "Separate stems" pressed for this deck (1–4).
+                    if let Some(deck) = std::env::var("DECKHAND_EDIT_SEPARATE")
+                        .ok()
+                        .and_then(|d| d.trim().parse::<usize>().ok())
+                        .filter(|d| (1..=deckhand_audio::DECKS).contains(d))
+                    {
+                        editor.stems_wanted.push(deck - 1);
+                    }
                     self.edit_view.editor = Some(editor);
                 }
                 Err(err) => self.status = Some(format!("Could not open the session: {err:#}")),
             }
         }
+        self.poll_stem_jobs(ctx);
         let Some(editor) = self.edit_view.editor.as_mut() else { return };
         if let Some(rx) = &editor.resync {
             match rx.try_recv() {

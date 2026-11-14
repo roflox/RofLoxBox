@@ -4,7 +4,7 @@
 
 use deckhand_audio::Engine;
 use deckhand_control::{DeckAction, PadMode, Value};
-use eframe::egui::{self, Color32, RichText, Sense, Slider, Stroke, Ui, vec2};
+use eframe::egui::{self, Color32, Rect, RichText, Sense, Slider, Stroke, Ui, UiBuilder, pos2, vec2};
 
 use super::{
     ACTIVE, CUE_COLOR, DECK_COLORS, DeckhandApp, PLAY_COLOR, WARN, beats_label, hot_cue_marks,
@@ -16,7 +16,7 @@ use crate::widgets::{RoundIcon, round_button};
 const RED: Color32 = Color32::from_rgb(230, 60, 50);
 use crate::deck::{Deck, TempoRange, display_key, format_key};
 use crate::effects::{Effects, FX_BEATS, PadFxSlot, beat_label};
-use crate::layout::{DeckElement, Place};
+use crate::layout::{COLUMNS, DeckElement, Place, SIDE_COLUMNS};
 use crate::library::format_time;
 use crate::waveform::{Markers, draw_overview};
 
@@ -66,7 +66,31 @@ struct Parts<'a> {
 /// A layout change from a drop: the element and where it goes (`None` hides it).
 type Move = Option<(DeckElement, Option<Place>)>;
 
-const SIDE_WIDTH: f32 = 84.0;
+/// The decks' grid: a cell's width, the space between cells, a row's
+/// height.
+#[derive(Clone, Copy)]
+struct Grid {
+    cell: f32,
+    gap: f32,
+    unit: f32,
+}
+
+impl Grid {
+    /// The width of `n` cells side by side.
+    fn across(self, n: u8) -> f32 {
+        f32::from(n) * self.cell + f32::from(n.saturating_sub(1)) * self.gap
+    }
+
+    /// The height of `n` rows.
+    fn down(self, n: u8) -> f32 {
+        f32::from(n) * self.unit + f32::from(n.saturating_sub(1)) * self.gap
+    }
+}
+
+/// The space between the main area and the side column.
+const SIDE_SPACE: f32 = 8.0;
+/// The space between cells and between the parts of a control.
+const GAP: f32 = 3.0;
 
 impl DeckhandApp {
     pub(super) fn deck_ui(&mut self, ui: &mut Ui, index: usize, compact: bool) {
@@ -79,13 +103,17 @@ impl DeckhandApp {
         let editing = self.editing_layout;
         let shown = |e: &&DeckElement| layout.is_shown(**e);
         let has_side = editing || layout.side.iter().any(|e| layout.is_shown(*e));
-        // The row holds the main area, an 8-point space and the side column,
-        // with the inherited item spacing between them.
-        let gap = ui.spacing().item_spacing.x;
-        let main_width = if has_side {
-            (ui.available_width() - SIDE_WIDTH - 8.0 - 2.0 * gap - 2.0).max(220.0)
-        } else {
-            ui.available_width()
+        // One grid across the deck: the main area's columns, then (after a
+        // space) the side column's.
+        let side_columns = if has_side { SIDE_COLUMNS } else { 0 };
+        let columns = COLUMNS + side_columns;
+        let free = ui.available_width()
+            - if has_side { SIDE_SPACE } else { 0.0 }
+            - f32::from(columns - 1) * GAP;
+        let grid = Grid {
+            cell: (free / f32::from(columns)).max(16.0),
+            gap: GAP,
+            unit: if compact { 24.0 } else { 28.0 },
         };
         let mut moved: Move = None;
         let stem_model = self.stem_model().is_some();
@@ -108,57 +136,87 @@ impl DeckhandApp {
             pads_shown: layout.is_shown(DeckElement::Pads),
             out: DeckOut::default(),
         };
-        let area = ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                vec2(main_width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_width(main_width);
-                    for (r, row) in layout.main.iter().enumerate() {
-                        let row: Vec<DeckElement> = row.iter().filter(shown).copied().collect();
-                        if row.is_empty() && !editing {
-                            continue;
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            for element in row {
-                                place_element(ui, element, &mut parts, editing, &mut moved);
-                            }
-                            if editing {
-                                drop_zone(ui, "+", 22.0, Some(Place::RowEnd(r)), &mut moved);
-                            }
-                        });
-                    }
-                    if editing {
-                        ui.horizontal(|ui| {
-                            drop_zone(ui, "New row", 120.0, Some(Place::NewRow), &mut moved);
-                            drop_zone(ui, "Hide", 80.0, None, &mut moved);
-                        });
-                    }
-                },
-            );
-            if has_side {
-                // A separator here would stretch to the full column height.
-                ui.add_space(8.0);
-                ui.allocate_ui_with_layout(
-                    vec2(SIDE_WIDTH, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.set_width(SIDE_WIDTH);
-                        for &element in layout.side.iter().filter(shown) {
-                            place_element(ui, element, &mut parts, editing, &mut moved);
-                        }
-                        if editing {
-                            drop_zone(ui, "+", SIDE_WIDTH - 4.0, Some(Place::SideEnd), &mut moved);
-                        }
-                    },
-                );
+        let top = ui.cursor().min;
+        let left = top.x;
+        let main_width = grid.across(COLUMNS);
+        // The main area, row by row: each control in its cells; one that no
+        // longer fits on the line starts the next.
+        let mut y = top.y;
+        for (r, row) in layout.main.iter().enumerate() {
+            let row: Vec<DeckElement> = row.iter().filter(shown).copied().collect();
+            if row.is_empty() && !editing {
+                continue;
             }
-        });
+            let mut lines: Vec<Vec<(DeckElement, u8)>> = vec![Vec::new()];
+            let mut column = 0;
+            for element in row {
+                let across = element.cells().0.min(COLUMNS);
+                if column + across > COLUMNS && column > 0 {
+                    lines.push(Vec::new());
+                    column = 0;
+                }
+                lines.last_mut().expect("a line").push((element, column));
+                column += across;
+            }
+            for line in &lines {
+                let rows = line.iter().map(|(e, _)| e.cells().1).max().unwrap_or(0);
+                let mut height = if rows > 0 { grid.down(rows) } else { 0.0 };
+                for &(element, column) in line {
+                    let (across, down) = element.cells();
+                    let x = left + f32::from(column) * (grid.cell + grid.gap);
+                    let width = grid.across(across.min(COLUMNS));
+                    let used = if down > 0 {
+                        // Shorter ones in the middle of the line's height.
+                        let own = grid.down(down);
+                        let rect = Rect::from_min_size(pos2(x, y + (height - own) / 2.0), vec2(width, own));
+                        place_in(ui, rect, false, element, &mut parts, editing, &mut moved)
+                    } else {
+                        let rect = Rect::from_min_size(pos2(x, y), vec2(width, f32::INFINITY));
+                        place_in(ui, rect, true, element, &mut parts, editing, &mut moved)
+                    };
+                    height = height.max(used);
+                }
+                y += height + grid.gap;
+            }
+            if editing {
+                let rect = Rect::from_min_size(pos2(left, y), vec2(main_width, 22.0));
+                let mut zone = ui.new_child(UiBuilder::new().max_rect(rect));
+                drop_zone(&mut zone, "+ this row", main_width, Some(Place::RowEnd(r)), &mut moved);
+                y += 22.0 + grid.gap;
+            }
+        }
+        if editing {
+            let rect = Rect::from_min_size(pos2(left, y), vec2(main_width, 22.0));
+            let mut zone = ui.new_child(UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Min)));
+            drop_zone(&mut zone, "New row", 120.0, Some(Place::NewRow), &mut moved);
+            drop_zone(&mut zone, "Hide", 80.0, None, &mut moved);
+            y += 22.0 + grid.gap;
+        }
+        // The side column: one under another.
+        let mut side_y = top.y;
+        if has_side {
+            let x = left + main_width + SIDE_SPACE;
+            let width = grid.across(SIDE_COLUMNS);
+            for &element in layout.side.iter().filter(shown) {
+                let rect = Rect::from_min_size(pos2(x, side_y), vec2(width, grid.down(element.cells().1.max(1))));
+                place_in(ui, rect, false, element, &mut parts, editing, &mut moved);
+                side_y = rect.bottom() + grid.gap;
+            }
+            if editing {
+                let rect = Rect::from_min_size(pos2(x, side_y), vec2(width, 22.0));
+                let mut zone = ui.new_child(UiBuilder::new().max_rect(rect));
+                drop_zone(&mut zone, "+", width, Some(Place::SideEnd), &mut moved);
+                side_y += 22.0 + grid.gap;
+            }
+        }
+        let width = main_width + if has_side { SIDE_SPACE + grid.across(SIDE_COLUMNS) } else { 0.0 };
+        let area = Rect::from_min_max(top, pos2(left + width, y.max(side_y) - grid.gap));
+        ui.advance_cursor_after_rect(area);
 
         let out = parts.out;
         let ctx = ui.ctx().clone();
         // Tracks dragged from a list or another deck load onto the deck they are dropped on.
-        self.deck_drop_target(ui, area.response.rect, ui.id().with(("track drop", index)), index);
+        self.deck_drop_target(ui, area, ui.id().with(("track drop", index)), index);
         if out.drag_track {
             self.start_deck_drag(&ctx, index);
         }
@@ -197,6 +255,62 @@ impl DeckhandApp {
             }
             self.config.save();
         }
+    }
+}
+
+/// Draws `element` in its cells (`natural`: as tall as it draws, from the
+/// top of `rect`); returns the height it took.
+fn place_in(
+    ui: &mut Ui,
+    rect: Rect,
+    natural: bool,
+    element: DeckElement,
+    p: &mut Parts<'_>,
+    editing: bool,
+    moved: &mut Move,
+) -> f32 {
+    let layout = if natural {
+        egui::Layout::top_down(egui::Align::Min)
+    } else {
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight)
+    };
+    let builder = UiBuilder::new().id_salt(("deck element", p.index, element)).max_rect(rect).layout(layout);
+    let mut child = ui.new_child(builder);
+    child.spacing_mut().item_spacing = vec2(GAP, GAP);
+    if natural {
+        // As the rows used to be: across, wrapping, a line tall.
+        child.horizontal_wrapped(|ui| place_element(ui, element, p, editing, moved));
+    } else {
+        place_element(&mut child, element, p, editing, moved);
+    }
+    if natural { child.min_rect().height() } else { rect.height() }
+}
+
+/// Splits the control's cells across into parts (by `weights`), each
+/// filled by `part` (buttons fill their part).
+fn split(ui: &mut Ui, weights: &[f32], mut part: impl FnMut(&mut Ui, usize)) {
+    let rect = ui.max_rect();
+    let total: f32 = weights.iter().sum();
+    let free = rect.width() - GAP * (weights.len() as f32 - 1.0);
+    let mut x = rect.left();
+    for (i, weight) in weights.iter().enumerate() {
+        let width = free * weight / total;
+        let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(width, rect.height()));
+        let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
+        ui.scope_builder(UiBuilder::new().max_rect(cell).layout(layout), |ui| part(ui, i));
+        x += width + GAP;
+    }
+}
+
+/// [`split`] down: `rows` parts one under another.
+fn stack(ui: &mut Ui, rows: usize, mut part: impl FnMut(&mut Ui, usize)) {
+    let rect = ui.max_rect();
+    let height = (rect.height() - GAP * (rows as f32 - 1.0)) / rows as f32;
+    for i in 0..rows {
+        let top = rect.top() + i as f32 * (height + GAP);
+        let cell = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), height));
+        let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
+        ui.scope_builder(UiBuilder::new().max_rect(cell).layout(layout), |ui| part(ui, i));
     }
 }
 
@@ -305,7 +419,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                                 "Take the track off this deck"
                             };
                             let eject = ui
-                                .add_enabled(!locked, egui::Button::new(RichText::new("Eject").small()))
+                                .add_enabled(!locked, egui::Button::new(RichText::new("EJECT").small()))
                                 .on_hover_text(hint)
                                 .on_disabled_hover_text(hint);
                             p.out.eject = eject.clicked();
@@ -476,7 +590,8 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::Cue => {
             // Lit while held, or paused at the cue point (like a CDJ).
             let at_cue = deck.track.is_some() && !playing && (position - deck.cue_point).abs() < crate::deck::AT_CUE;
-            let cue = round_button(ui, RoundIcon::Text("CUE"), CUE_COLOR, at_cue || *p.cue_held, big.y);
+            let size = ui.max_rect().size().min_elem().min(big.y * 1.4);
+            let cue = round_button(ui, RoundIcon::Text("CUE"), CUE_COLOR, at_cue || *p.cue_held, size);
             let held = cue.is_pointer_button_down_on();
             if held && !*p.cue_held {
                 deck.cue_pressed(engine);
@@ -487,7 +602,8 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::Play => {
             let icon = if playing { RoundIcon::Pause } else { RoundIcon::Play };
-            if round_button(ui, icon, PLAY_COLOR, playing, big.y).clicked() {
+            let size = ui.max_rect().size().min_elem().min(big.y * 1.4);
+            if round_button(ui, icon, PLAY_COLOR, playing, size).clicked() {
                 p.out.play = true;
             }
         }
@@ -519,50 +635,79 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::LoopInOut => {
             let looping = deck.loop_active;
-            if toggle_in(ui, deck.loop_in.is_some() && !looping, "IN", CUE_COLOR).clicked() {
-                deck.loop_in(engine);
-            }
-            if toggle_in(ui, looping, "OUT", CUE_COLOR).clicked() {
-                deck.loop_out(engine);
-            }
-            let label = if looping { "EXIT" } else { "RELOOP" };
-            if toggle_in(ui, looping, label, CUE_COLOR).clicked() {
-                deck.reloop_exit(engine);
-            }
+            split(ui, &[1.0, 1.0, 1.6], |ui, i| match i {
+                0 => {
+                    if toggle_in(ui, deck.loop_in.is_some() && !looping, "IN", CUE_COLOR).clicked() {
+                        deck.loop_in(engine);
+                    }
+                }
+                1 => {
+                    if toggle_in(ui, looping, "OUT", CUE_COLOR).clicked() {
+                        deck.loop_out(engine);
+                    }
+                }
+                _ => {
+                    let label = if looping { "EXIT" } else { "RELOOP" };
+                    if toggle_in(ui, looping, label, CUE_COLOR).clicked() {
+                        deck.reloop_exit(engine);
+                    }
+                }
+            });
         }
         E::LoopResize => {
-            if ui.button("½").on_hover_text("Halve the loop").clicked() {
-                deck.resize_loop(0.5, engine);
-            }
-            if ui.button("×2").on_hover_text("Double the loop").clicked() {
-                deck.resize_loop(2.0, engine);
-            }
+            split(ui, &[1.0, 1.0], |ui, i| {
+                let (label, factor, hover) =
+                    if i == 0 { ("½", 0.5, "Halve the loop") } else { ("×2", 2.0, "Double the loop") };
+                if ui.button(label).on_hover_text(hover).clicked() {
+                    deck.resize_loop(factor, engine);
+                }
+            });
         }
         E::BeatLoops => {
-            for beats in [1.0, 4.0, 8.0, 16.0] {
-                if ui.button(format!("{beats}")).on_hover_text(format!("{beats}-beat loop")).clicked() {
-                    deck.beat_loop(beats, engine);
+            const BEATS: [f64; 4] = [1.0, 4.0, 8.0, 16.0];
+            split(ui, &[1.0; 5], |ui, i| match i {
+                0 => caption(ui, "LOOP"),
+                _ => {
+                    let beats = BEATS[i - 1];
+                    if ui.button(format!("{beats}")).on_hover_text(format!("{beats}-beat loop")).clicked() {
+                        deck.beat_loop(beats, engine);
+                    }
                 }
-            }
+            });
         }
         E::BeatJump => {
-            if ui.button("◀").on_hover_text("Beat jump back").clicked() {
-                deck.beat_jump(-deck.jump_size, engine);
-            }
-            let response = ui.add(
-                egui::Button::new(RichText::new(beats_label(deck.jump_size)).monospace())
-                    .min_size(vec2(34.0, 0.0)),
-            );
-            if response.clicked() {
-                deck.change_jump_size(2.0);
-            }
-            if response.secondary_clicked() {
-                deck.change_jump_size(0.5);
-            }
-            response.on_hover_text("Jump size: click ×2, right-click ½");
-            if ui.button("▶").on_hover_text("Beat jump forward").clicked() {
-                deck.beat_jump(deck.jump_size, engine);
-            }
+            // JUMP ◀ − 4 beats + ▶: the arrows jump, − and + set how far.
+            let size = deck.jump_size;
+            split(ui, &[1.0, 1.0, 1.0, 2.0, 1.0, 1.0], |ui, i| match i {
+                0 => caption(ui, "JUMP"),
+                1 => {
+                    if ui.button("◀").on_hover_text("Jump back").clicked() {
+                        deck.beat_jump(-deck.jump_size, engine);
+                    }
+                }
+                2 => {
+                    let shorter = ui.add_enabled(size > 1.0 / 8.0, egui::Button::new("−"));
+                    if shorter.on_hover_text("Shorter jumps (½)").clicked() {
+                        deck.change_jump_size(0.5);
+                    }
+                }
+                3 => {
+                    let unit = if size == 1.0 { "beat" } else { "beats" };
+                    ui.label(RichText::new(format!("{} {unit}", beats_label(size))).monospace())
+                        .on_hover_text("How far ◀ ▶ jump");
+                }
+                4 => {
+                    let longer = ui.add_enabled(size < 64.0, egui::Button::new("+"));
+                    if longer.on_hover_text("Longer jumps (×2)").clicked() {
+                        deck.change_jump_size(2.0);
+                    }
+                }
+                _ => {
+                    if ui.button("▶").on_hover_text("Jump forward").clicked() {
+                        deck.beat_jump(deck.jump_size, engine);
+                    }
+                }
+            });
         }
         E::Gate => {
             if toggle(ui, deck.hot_cue_gate, "GATE")
@@ -573,69 +718,58 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             }
         }
         E::MemoryCall => {
-            if ui.button("◀ MEM").on_hover_text("Call the previous memory cue").clicked() {
-                deck.memory_call(false, engine);
-            }
-            if ui.button("MEM ▶").on_hover_text("Call the next memory cue").clicked() {
-                deck.memory_call(true, engine);
-            }
-        }
-        E::MemorySet => {
-            if ui
-                .button("MEMORY")
-                .on_hover_text("Save cue or loop as memory cue")
-                .clicked()
-            {
-                deck.memory_set(engine);
-            }
-            if ui.button("DELETE").on_hover_text("Delete memory cue here").clicked() {
-                deck.memory_delete();
-            }
-        }
-        E::PadModes => {
-            // Pad modes like rekordbox; the controller's mode buttons switch them too.
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                for mode in PadMode::ALL {
-                    let label = if compact { pad_mode_short(mode) } else { mode.label() };
-                    if ui.selectable_label(deck.pad_mode == mode && !deck.grid_edit, RichText::new(label).small()).clicked() {
-                        deck.grid_edit = false;
-                        deck.set_pad_mode(mode);
+            // ◀ MEMORY ▶, as on a CDJ.
+            split(ui, &[0.8, 1.4, 0.8], |ui, i| match i {
+                0 => {
+                    if ui.button("◀").on_hover_text("Previous memory cue").clicked() {
+                        deck.memory_call(false, engine);
+                    }
+                }
+                1 => caption(ui, "MEMORY"),
+                _ => {
+                    if ui.button("▶").on_hover_text("Next memory cue").clicked() {
+                        deck.memory_call(true, engine);
                     }
                 }
             });
         }
-        // Its ◀ ▶ are for the pads, which the grid editor covers.
+        E::MemorySet => {
+            split(ui, &[1.0, 1.3], |ui, i| {
+                if i == 0 {
+                    let set = ui.button(RichText::new("SET").small());
+                    if set.on_hover_text("Save the cue or loop as a memory cue").clicked() {
+                        deck.memory_set(engine);
+                    }
+                } else {
+                    let delete = ui.button(RichText::new("DELETE").small());
+                    if delete.on_hover_text("Delete the memory cue here").clicked() {
+                        deck.memory_delete();
+                    }
+                }
+            });
+        }
+        E::PadModes => {
+            // Pad modes like rekordbox; the controller's mode buttons switch them too.
+            split(ui, &[1.0; 8], |ui, i| {
+                let mode = PadMode::ALL[i];
+                let label = RichText::new(pad_mode_short(mode)).small();
+                let lit = deck.pad_mode == mode && !deck.grid_edit;
+                if ui.selectable_label(lit, label).on_hover_text(mode.label()).clicked() {
+                    deck.grid_edit = false;
+                    deck.set_pad_mode(mode);
+                }
+            });
+        }
         E::PadShift if deck.grid_edit => {}
         E::PadShift => {
             // SHIFT works like the controller's: latch it on screen or hold
-            // the keyboard's Shift key.
-            let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                if toggle_in(ui, deck.screen_shift, "SHIFT", CUE_COLOR)
-                    .on_hover_text("Shift for pads and ◀ ▶")
-                    .clicked()
-                {
-                    deck.screen_shift = !deck.screen_shift;
-                }
-                let mode = deck.pad_mode;
-                let down = mode.parameter_action(false, shift_held);
-                if ui.add_enabled(down.is_some(), egui::Button::new("◀").small()).clicked()
-                    && let Some(action) = down
-                {
-                    p.out.pad_events.extend([(action, true), (action, false)]);
-                }
-                ui.label(
-                    RichText::new(pad_parameter_caption(deck, p.effects, shift_held)).small().monospace(),
-                );
-                let up = mode.parameter_action(true, shift_held);
-                if ui.add_enabled(up.is_some(), egui::Button::new("▶").small()).clicked()
-                    && let Some(action) = up
-                {
-                    p.out.pad_events.extend([(action, true), (action, false)]);
-                }
-            });
+            // the keyboard's Shift key. (The pads' ◀ ▶ are under them.)
+            if toggle_in(ui, deck.screen_shift, "SHIFT", CUE_COLOR)
+                .on_hover_text("The pads' second functions (or hold Shift)")
+                .clicked()
+            {
+                deck.screen_shift = !deck.screen_shift;
+            }
         }
         E::Pads if deck.grid_edit => {
             let pads = PadBox::new(ui, compact);
@@ -672,15 +806,49 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                         }
                     });
                 }
+                // Under the pads, as the controller's ◀ ▶: what they do
+                // (the jump distances, loop lengths, sampler bank, pages).
+                let mode = deck.pad_mode;
+                let (down, up) =
+                    (mode.parameter_action(false, shift_held), mode.parameter_action(true, shift_held));
+                if (down.is_some() || up.is_some()) && mode != PadMode::HotCue {
+                    let caption = pad_parameter_caption(deck, p.effects, shift_held);
+                    let (less, more) = match mode {
+                        PadMode::BeatJump if shift_held => ("Shorter jumps (÷16)", "Longer jumps (×16)"),
+                        PadMode::BeatJump => ("Shorter jumps (½); Shift: ÷16", "Longer jumps (×2); Shift: ×16"),
+                        PadMode::BeatLoop => ("Shorter loops (½)", "Longer loops (×2)"),
+                        _ => ("Previous", "Next"),
+                    };
+                    ui.horizontal(|ui| {
+                        let side = (pads.size.x - 3.0 * PAD_GAP) / 4.0;
+                        let arrow = |ui: &mut Ui, label: &str, action: Option<DeckAction>, hover: &str| {
+                            let button = egui::Button::new(RichText::new(label).strong()).min_size(vec2(side, 0.0));
+                            ui.add_enabled(action.is_some(), button).on_hover_text(hover).clicked()
+                        };
+                        if arrow(ui, "<", down, less) && let Some(action) = down {
+                            p.out.pad_events.extend([(action, true), (action, false)]);
+                        }
+                        ui.add_sized(
+                            vec2(2.0 * side + PAD_GAP, ui.spacing().interact_size.y),
+                            egui::Label::new(RichText::new(caption).small().monospace()),
+                        );
+                        if arrow(ui, ">", up, more) && let Some(action) = up {
+                            p.out.pad_events.extend([(action, true), (action, false)]);
+                        }
+                    });
+                }
             });
         }
         E::TempoRange => {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("TEMPO").small());
+            stack(ui, 2, |ui, i| {
+                if i == 0 {
+                    caption(ui, "TEMPO");
+                    return;
+                }
                 let mut range = deck.tempo_range;
                 egui::ComboBox::from_id_salt(("range", index))
                     .selected_text(range.label())
-                    .width(64.0)
+                    .width(ui.available_width())
                     .show_ui(ui, |ui| {
                         for &option in &p.tempo_ranges {
                             ui.selectable_value(&mut range, option, option.label());
@@ -700,30 +868,38 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             }
         }
         E::KeyShift => {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if ui.small_button("−").on_hover_text("Key down a semitone").clicked() {
-                    deck.set_key_shift(deck.key_shift - 1, engine);
+            stack(ui, 2, |ui, row| {
+                if row == 0 {
+                    caption(ui, "KEY");
+                    return;
                 }
-                if ui
-                    .small_button(format!("{:+}", deck.key_shift))
-                    .on_hover_text("Semitones; click to reset")
-                    .clicked()
-                {
-                    deck.set_key_shift(0, engine);
-                }
-                if ui.small_button("+").on_hover_text("Key up a semitone").clicked() {
-                    deck.set_key_shift(deck.key_shift + 1, engine);
-                }
+                split(ui, &[1.0, 1.0, 1.0], |ui, i| match i {
+                    0 => {
+                        if ui.button("−").on_hover_text("Key down a semitone").clicked() {
+                            deck.set_key_shift(deck.key_shift - 1, engine);
+                        }
+                    }
+                    1 => {
+                        let shift = ui.button(format!("{:+}", deck.key_shift));
+                        if shift.on_hover_text("Semitones; click to reset").clicked() {
+                            deck.set_key_shift(0, engine);
+                        }
+                    }
+                    _ => {
+                        if ui.button("+").on_hover_text("Key up a semitone").clicked() {
+                            deck.set_key_shift(deck.key_shift + 1, engine);
+                        }
+                    }
+                });
             });
         }
         E::KeySyncTap => {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                p.out.key_sync = toggle(ui, deck.key_synced, "KEY")
-                    .on_hover_text("Match the master's key")
-                    .clicked();
-                if ui.button("TAP").on_hover_text("Tap the BPM").clicked()
+            stack(ui, 2, |ui, row| {
+                if row == 0 {
+                    p.out.key_sync = toggle(ui, deck.key_synced, "KEY SYNC")
+                        .on_hover_text("Match the master's key")
+                        .clicked();
+                } else if ui.button("TAP").on_hover_text("Tap the BPM").clicked()
                     && let Some(bpm) = deck.tap_bpm()
                 {
                     p.out.status = Some(format!("Deck {}: BPM set to {bpm:.2} by tapping", index + 1));
@@ -745,7 +921,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::TempoFader => {
             // Like on a CDJ, pulling the fader down makes the track faster.
             let mut fader = -deck.tempo_fader;
-            ui.spacing_mut().slider_width = if compact { 110.0 } else { 220.0 };
+            ui.spacing_mut().slider_width = ui.max_rect().height() - 8.0;
             let slider = ui.add_enabled(
                 deck.tempo_fader_active(),
                 Slider::new(&mut fader, -1.0..=1.0).vertical().show_value(false),
@@ -756,18 +932,24 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
             slider.on_disabled_hover_text("Follows the master (SYNC)");
         }
         E::TempoReset => {
-            if ui.button("Reset").on_hover_text("Tempo back to ±0").clicked() {
+            if ui.button("RESET").on_hover_text("Tempo back to ±0").clicked() {
                 deck.reset_tempo(engine);
             }
         }
         E::Nudge => {
-            ui.horizontal(|ui| {
-                if ui.add(egui::Button::new("−").sense(Sense::click_and_drag())).on_hover_text("Nudge slower (hold)").is_pointer_button_down_on() {
-                    deck.jog(-3, engine);
+            stack(ui, 2, |ui, row| {
+                if row == 0 {
+                    caption(ui, "NUDGE");
+                    return;
                 }
-                if ui.add(egui::Button::new("+").sense(Sense::click_and_drag())).on_hover_text("Nudge faster (hold)").is_pointer_button_down_on() {
-                    deck.jog(3, engine);
-                }
+                split(ui, &[1.0, 1.0], |ui, i| {
+                    let (label, steps, hover) =
+                        if i == 0 { ("−", -3, "Nudge slower (hold)") } else { ("+", 3, "Nudge faster (hold)") };
+                    let button = ui.add(egui::Button::new(label).sense(Sense::click_and_drag()));
+                    if button.on_hover_text(hover).is_pointer_button_down_on() {
+                        deck.jog(steps, engine);
+                    }
+                });
             });
         }
     }
@@ -932,7 +1114,7 @@ fn stems_strip(ui: &Ui, rect: egui::Rect, layers: &deckhand_audio::StemLayers) {
 }
 
 /// The stem parts' colours on the STEMS pads.
-const STEM_COLORS: [Color32; 4] = [
+pub(super) const STEM_COLORS: [Color32; 4] = [
     Color32::from_rgb(235, 200, 60),
     Color32::from_rgb(90, 200, 120),
     Color32::from_rgb(70, 150, 235),
@@ -1033,6 +1215,11 @@ fn pad_fx_color(kind: deckhand_audio::BeatFxKind) -> Color32 {
         K::Flanger | K::Phaser | K::Filter | K::Helix => Color32::from_rgb(70, 175, 145),
         K::Trans | K::Pitch | K::MobiusSaw | K::MobiusTri => Color32::from_rgb(185, 125, 235),
     }
+}
+
+/// A small name in front of (or above) a group of buttons.
+fn caption(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).small().weak());
 }
 
 /// The pads' box, the same in every pad mode: as tall as the Pad FX

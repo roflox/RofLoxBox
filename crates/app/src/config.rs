@@ -29,6 +29,9 @@ pub struct Config {
     pub show_mixer: bool,
     #[serde(default = "yes")]
     pub show_library: bool,
+    /// The library in a window of its own (to put on another screen).
+    #[serde(default)]
+    pub library_detached: bool,
     #[serde(default = "yes")]
     pub show_fx: bool,
     /// The browser showed deckhand's collection (rather than a USB export).
@@ -45,9 +48,6 @@ pub struct Config {
     /// The Preview column was added to saved column sets once.
     #[serde(default)]
     pub preview_column_added: bool,
-    /// Beat grid edit was moved next to GATE in saved layouts once.
-    #[serde(default)]
-    pub grid_moved: bool,
     /// Tours (by id) finished or skipped; auto tours don't run again.
     #[serde(default)]
     pub tours_done: Vec<String>,
@@ -62,10 +62,12 @@ pub struct Config {
     /// Deck, mixer and FX settings as they were when deckhand last ran.
     #[serde(default)]
     pub session: Session,
-    /// Deck controls and where they are, for two and for four decks.
-    #[serde(default)]
+    /// Deck controls and where they are on the decks' grid, for two and
+    /// for four decks. (Layouts from before the grid were saved under other
+    /// names and are left behind.)
+    #[serde(default, rename = "deck_grid_two")]
     pub layout_two: crate::layout::DeckLayout,
-    #[serde(default = "crate::layout::DeckLayout::four_decks")]
+    #[serde(default = "crate::layout::DeckLayout::four_decks", rename = "deck_grid_four")]
     pub layout_four: crate::layout::DeckLayout,
     /// Where the decks, vertical waveforms and mixer go.
     #[serde(default)]
@@ -76,7 +78,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_fx_parts: Vec<crate::parts::FxPart>,
     /// Deck layouts saved under a name.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "deck_grid_presets")]
     pub layout_presets: Vec<crate::layout::LayoutPreset>,
     /// Output sample rate; `None` uses the device's current rate.
     #[serde(default)]
@@ -189,7 +191,10 @@ pub enum Theme {
 pub struct Preferences {
     /// How keys are written on the decks and in the lists.
     pub key_notation: crate::deck::KeyNotation,
-    /// The track lists light up keys that mix with the master deck's.
+    /// The track lists light up keys that mix with the master deck's. Its
+    /// own key: the old `highlight_compatible_keys` was off by default, so
+    /// renaming it turns it on once for everyone.
+    #[serde(rename = "highlight_compatible_key")]
     pub highlight_compatible_keys: bool,
     /// EDIT: the view moves along with the playhead while playing.
     pub edit_follow_playhead: bool,
@@ -283,6 +288,9 @@ pub struct Preferences {
     pub eq_waveforms: bool,
     /// Scrolling (or pinching) over a scrolling waveform zooms it.
     pub scroll_zoom: bool,
+    /// How far scrolling over a knob turns it: 1.0 turns it fully in about
+    /// 4 wheel notches' worth (200 points); 0 doesn't turn knobs.
+    pub knob_scroll: f32,
     /// EQ mode: low shelf, mid peak and high shelf in Hz.
     pub eq_low_hz: f32,
     pub eq_mid_hz: f32,
@@ -316,7 +324,7 @@ impl Default for Preferences {
             needle_lock: false,
             memory_call_lock: true,
             key_notation: Default::default(),
-            highlight_compatible_keys: false,
+            highlight_compatible_keys: true,
             edit_follow_playhead: false,
             theme: Theme::Dark,
             text_scale: 100,
@@ -353,6 +361,7 @@ impl Default for Preferences {
             isolator: true,
             eq_waveforms: true,
             scroll_zoom: true,
+            knob_scroll: 1.0,
             eq_low_hz: 70.0,
             eq_mid_hz: 1_000.0,
             eq_high_hz: 13_000.0,
@@ -464,13 +473,13 @@ impl Default for Config {
             show_waveforms: true,
             show_mixer: true,
             show_library: true,
+            library_detached: false,
             show_fx: true,
             use_collection: true,
             columns: crate::browser::TrackColumn::default_set(),
             sort: None,
             number_column_added: true,
             preview_column_added: true,
-            grid_moved: true,
             tours_done: Vec::new(),
             prefs: Preferences::default(),
             recordings_dir: None,
@@ -537,11 +546,6 @@ impl Config {
         }
         config.layout_two.repair();
         config.layout_four.repair();
-        if !config.grid_moved {
-            config.grid_moved = true;
-            config.layout_two.grid_next_to_gate();
-            config.layout_four.grid_next_to_gate();
-        }
         config.screen_layout.repair();
         config
     }
@@ -630,9 +634,9 @@ mod tests {
         let mut applied = Config::default();
         applied.set_view(view.clone());
         assert!(applied.view().matches(&view));
-        // Presets saved before view presets existed have no view.
+        // Presets from before the grid are left behind.
         let old = "[[layout_presets]]\nname = \"Old\"\n[layout_presets.layout]\nmain = []\nside = []\nhidden = []\n";
         let read: Config = toml::from_str(old).unwrap();
-        assert_eq!(read.layout_presets[0].view, None);
+        assert!(read.layout_presets.is_empty());
     }
 }

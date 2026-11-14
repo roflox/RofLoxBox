@@ -3,6 +3,7 @@
 
 use std::f32::consts::PI;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use eframe::egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, Response, Sense, Shape, Stroke,
@@ -17,8 +18,18 @@ const ARC: Color32 = Color32::from_rgb(90, 170, 255);
 const SWEEP: f32 = 1.5 * PI;
 const START: f32 = 0.75 * PI;
 
-/// A rotary knob. Drag up/down to turn (hold Shift for fine control);
-/// double-click returns to `default`. With `bipolar`, the value arc starts
+/// How far scrolling over a knob turns it (Preferences → Mixer), as
+/// `f32` bits; 1.0 turns a knob through its whole range in 200 points of
+/// scrolling, about four wheel notches.
+static KNOB_SCROLL: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+
+/// Sets how far scrolling over a knob turns it; 0 turns scrolling off.
+pub fn set_knob_scroll(sensitivity: f32) {
+    KNOB_SCROLL.store(sensitivity.max(0.0).to_bits(), Ordering::Relaxed);
+}
+
+/// A rotary knob. Drag up/down or scroll over it to turn (hold Shift for
+/// fine control); double-click returns to `default`. With `bipolar`, the value arc starts
 /// at the center (EQ, filter) instead of the minimum.
 pub fn knob(
     ui: &mut Ui,
@@ -39,6 +50,25 @@ pub fn knob(
         if new != *value {
             *value = new;
             response.mark_changed();
+        }
+    }
+    let sensitivity = f32::from_bits(KNOB_SCROLL.load(Ordering::Relaxed));
+    if response.hovered() && sensitivity > 0.0 {
+        let (delta, fine) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
+        // Shift turns a wheel's vertical scroll into horizontal on some systems.
+        let delta = if delta.y != 0.0 { delta.y } else { delta.x };
+        if delta != 0.0 {
+            // The knob takes the scroll, so a list or panel around it stays put.
+            ui.input_mut(|i| {
+                i.smooth_scroll_delta = Vec2::ZERO;
+                i.raw_scroll_delta = Vec2::ZERO;
+            });
+            let per_point = (max - min) * sensitivity / if fine { 800.0 } else { 200.0 };
+            let new = (*value + delta * per_point).clamp(min, max);
+            if new != *value {
+                *value = new;
+                response.mark_changed();
+            }
         }
     }
     if response.double_clicked() && *value != default {
@@ -205,8 +235,10 @@ pub fn lit_button_sized(
     let width =
         ui.painter().layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
     let height = text_size + 8.0;
+    // At least its text's size; filling its cell in a justified layout
+    // (the decks' grid).
     let (rect, response) =
-        ui.allocate_exact_size(vec2((width + padding).max(height), height), Sense::click());
+        ui.allocate_at_least(vec2((width + padding).max(height), height), Sense::click());
     if ui.is_rect_visible(rect) {
         let enabled = ui.is_enabled();
         let hovered = response.hovered() && enabled;

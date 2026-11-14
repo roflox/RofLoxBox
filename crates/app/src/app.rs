@@ -668,6 +668,7 @@ impl DeckhandApp {
             self.config.prefs.tempo_ranges = crate::deck::TempoRange::DEFAULTS.to_vec();
         }
         let p = self.config.prefs.clone();
+        crate::widgets::set_knob_scroll(p.knob_scroll);
         self.effects.set_pad_slots(&p.pad_fx);
         // A range taken off the list: stopped decks move to the nearest one;
         // a playing deck keeps its range (and tempo) until changed.
@@ -1688,10 +1689,17 @@ impl eframe::App for DeckhandApp {
         }
         self.status_bar(ctx);
         if performing && self.config.show_library {
-            egui::TopBottomPanel::bottom("library")
-                .resizable(true)
-                .default_height(if self.config.four_decks { 200.0 } else { 300.0 })
-                .show(ctx, |ui| self.library_ui(ui, ctx));
+            // In full screen macOS makes a new window a tab of the app's,
+            // hiding the app: then the library stays in the main window.
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            if self.config.library_detached && !fullscreen {
+                self.library_window(ctx);
+            } else {
+                egui::TopBottomPanel::bottom("library")
+                    .resizable(true)
+                    .default_height(if self.config.four_decks { 200.0 } else { 300.0 })
+                    .show(ctx, |ui| self.library_ui(ui, ctx));
+            }
             self.reveal_playlist = false;
         }
         if performing {
@@ -2148,11 +2156,13 @@ impl DeckhandApp {
         if let Some(seconds) = drag {
             deck.drag_waveform(seconds, engine);
         }
-        if !response.dragged() {
-            deck.release_waveform(engine);
-        }
+        let snap = !response.dragged() && deck.release_waveform(engine) && deck.sync;
         if let Some(seconds) = jump {
             self.decks[index].seek(seconds, engine);
+        }
+        if snap {
+            // Onto the master's beat at once (the nearest one).
+            self.follow_master(index, true);
         }
         painter.text(
             rect.left_top() + vec2(6.0, 4.0),
@@ -2917,6 +2927,26 @@ impl DeckhandApp {
         });
     }
 
+    /// The library in a window of its own; closing it puts the library
+    /// back under the decks.
+    fn library_window(&mut self, ctx: &egui::Context) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title("RofLoxBox — Library")
+            .with_inner_size([1100.0, 650.0]);
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("library"), builder, |ctx, class| {
+            if class == egui::ViewportClass::Embedded {
+                // No separate windows here: back under the decks.
+                self.config.library_detached = false;
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| self.library_ui(ui, ctx));
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.config.library_detached = false;
+                self.config.save();
+            }
+        });
+    }
+
     fn library_ui(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let focus_stroke =
             |focused: bool| if focused { Stroke::new(1.0_f32, ACTIVE) } else { Stroke::NONE };
@@ -3129,6 +3159,8 @@ impl DeckhandApp {
     }
 
     fn prefs_window(&mut self, ctx: &egui::Context) {
+        /// The height of every Preferences page.
+        const PREFS_PAGE_HEIGHT: f32 = 500.0;
         const BUFFERS: [u32; 8] = [32, 64, 128, 256, 512, 1024, 2048, 4096];
         let device = self.config.audio_device.clone();
         if self.audio_caps.as_ref().is_none_or(|(d, ..)| *d != device) {
@@ -3154,6 +3186,14 @@ impl DeckhandApp {
                     }
                 });
                 ui.separator();
+                // Every page gets the same height, so the window doesn't
+                // jump when switching tabs; longer pages scroll.
+                egui::ScrollArea::vertical()
+                    .id_salt(("prefs page", self.prefs_tab))
+                    .max_height(PREFS_PAGE_HEIGHT)
+                    .min_scrolled_height(PREFS_PAGE_HEIGHT)
+                    .auto_shrink([true, false])
+                    .show(ui, |ui| {
                 match self.prefs_tab {
                     PrefsTab::Deck => {
                         prefs_changed |= deck_prefs(ui, &mut self.config.prefs, decks);
@@ -3260,6 +3300,7 @@ impl DeckhandApp {
                     .small()
                     .weak(),
             );
+                    });
             },
         );
         self.show_prefs = open;
