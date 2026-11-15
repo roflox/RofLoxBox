@@ -69,7 +69,7 @@ fn lock(ui: &mut Ui, locked: &mut bool) -> bool {
 /// Dark, light or the system's, and the text size; returns whether
 /// anything changed.
 pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
-    let before = (p.theme, p.text_scale);
+    let before = (p.theme, p.text_scale, p.button_scale, p.tempo_display_scale);
     section(ui, "Theme", "Waveforms stay dark.", |ui| {
         ui.radio_value(&mut p.theme, Theme::Dark, "Dark");
         ui.radio_value(&mut p.theme, Theme::Light, "Light");
@@ -84,7 +84,23 @@ pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             }
         });
     });
-    (p.theme, p.text_scale) != before
+    section(ui, "Button size", "The decks' buttons and pads: smaller fits more on screen.", |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut p.button_scale, 50..=150).suffix(" %").step_by(5.0));
+            if ui.add_enabled(p.button_scale != 100, egui::Button::new("Reset")).clicked() {
+                p.button_scale = 100;
+            }
+        });
+    });
+    section(ui, "Tempo display size", "The ring with the BPM by each deck.", |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut p.tempo_display_scale, 50..=200).suffix(" %").step_by(5.0));
+            if ui.add_enabled(p.tempo_display_scale != 100, egui::Button::new("Reset")).clicked() {
+                p.tempo_display_scale = 100;
+            }
+        });
+    });
+    (p.theme, p.text_scale, p.button_scale, p.tempo_display_scale) != before
 }
 
 /// Deck settings; returns whether anything changed.
@@ -221,6 +237,22 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
 /// Mixer settings; returns whether anything changed.
 pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
     let before = p.clone();
+    section(ui, "Beat FX to step through", "A controller's next / previous FX buttons go through these.", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for kind in deckhand_audio::BeatFxKind::ALL {
+                let mut on = p.beat_fx_cycle.contains(&kind);
+                if ui.checkbox(&mut on, kind.label()).changed() {
+                    p.beat_fx_cycle.retain(|k| *k != kind);
+                    if on {
+                        p.beat_fx_cycle.push(kind);
+                    }
+                }
+            }
+        });
+        if p.beat_fx_cycle.is_empty() {
+            ui.label(egui::RichText::new("None chosen: all of them.").small().weak());
+        }
+    });
     section(ui, "Crossfader Curve", "", |ui| {
         for curve in CrossfaderCurveSetting::ALL {
             ui.radio_value(&mut p.crossfader_curve, curve, curve.label());

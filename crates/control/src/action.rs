@@ -290,6 +290,10 @@ pub enum GlobalAction {
     FxTap,
     /// Beat FX type 0–13 (Delay … Mobius Tri).
     FxType(u8),
+    /// The next (or previous) Beat FX of those chosen to step through
+    /// (Preferences → Mixer), for a controller with one select button.
+    FxTypeNext,
+    FxTypePrev,
     /// Beat FX on channel 0–3, 4 = master, 5 = sampler.
     FxAssign(u8),
     CrossfaderStartPlayA,
@@ -506,6 +510,7 @@ impl GlobalAction {
             FxTap,
         ];
         all.extend((0..14).map(FxType));
+        all.extend([FxTypeNext, FxTypePrev]);
         all.extend((0..6).map(FxAssign));
         all.extend([
             CrossfaderStartPlayA,
@@ -544,6 +549,8 @@ impl GlobalAction {
             FxAutoBeat => "fx_auto_beat".into(),
             FxTap => "fx_tap".into(),
             FxType(n) => format!("fx_type_{}", n + 1),
+            FxTypeNext => "fx_type_next".into(),
+            FxTypePrev => "fx_type_prev".into(),
             FxAssign(n @ 0..=3) => format!("fx_assign_ch{}", n + 1),
             FxAssign(4) => "fx_assign_master".into(),
             FxAssign(_) => "fx_assign_sampler".into(),

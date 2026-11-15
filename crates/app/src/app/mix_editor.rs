@@ -4797,14 +4797,9 @@ impl MixEditor {
             .any(|t| self.span_pieces(t).iter().any(|&(f, e)| f <= at && at < e))
     }
 
-    /// Deletes `from`–`to` of `deck`, as in a DAW: a clip it cuts through
-    /// becomes two clips of their own.
-    fn cut_out(&mut self, deck: usize, from: u64, to: u64, what: &str) {
-        self.cut_out_with(deck, from, to, what, DeleteOptions::default());
-    }
-
     /// Deletes `deck`'s audio from `from` to `to` (its jog, loops and jumps
-    /// with it), and what `options` say.
+    /// with it), and what `options` say: a clip it cuts through becomes two
+    /// clips of their own.
     fn cut_out_with(&mut self, deck: usize, from: u64, to: u64, what: &str, options: DeleteOptions) {
         let shared = self.session.clone();
         let Ok(mut session) = shared.lock() else { return };

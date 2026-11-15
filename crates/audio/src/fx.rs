@@ -14,6 +14,88 @@ use crate::eq::{Biquad, Filter};
 const MAX_DELAY_SECS: f32 = 6.0;
 /// Filter coefficients of swept effects are updated every this many frames.
 const SWEEP_EVERY: u32 = 16;
+/// Mobius: the octaves of its endless tone, from `SHEPARD_LOW` Hz up.
+/// (The state keeps room for 8; [`MOBIUS_TONES`] are used.)
+const SHEPARD_PARTIALS: usize = 8;
+const SHEPARD_LOW: f32 = 55.0;
+/// Mobius: its tones, two octaves apart.
+const MOBIUS_TONES: usize = 4;
+/// Reverb time (seconds, to −60 dB) of the Beat FX reverb.
+const REVERB_DECAY_SECS: f32 = 8.0;
+/// The depth knob's middle: anything within ±1.5 % of it is exactly the
+/// middle.
+const KNOB_DETENT: (f32, f32) = (0.485, 0.515);
+/// Echo feedback: −3 dB a repeat.
+const ECHO_FEEDBACK: f32 = 0.708;
+/// Flanger and phaser feedback.
+const SWEEP_FEEDBACK: f32 = 0.25;
+
+/// The depth knob as the effects read it: a detent in the middle, each half
+/// stretched to fill its side (0–0.5, 0.5–1).
+fn centered(knob: f32) -> f32 {
+    let (low, high) = KNOB_DETENT;
+    let k = knob.clamp(0.0, 1.0);
+    if k < low {
+        k * 0.5 / low
+    } else if k > high {
+        0.5 + (k - high) * 0.5 / (1.0 - high)
+    } else {
+        0.5
+    }
+}
+
+/// Echo-type mix (original, effect): the effect comes in up to 75 %, then
+/// the original goes out, so at full depth only the effect is heard.
+fn echo_mix(d: f32) -> (f32, f32) {
+    if d < 0.75 { (1.0, d / 0.75) } else { (4.0 - 4.0 * d, 1.0) }
+}
+
+/// Roll-type mix: a curved crossfade over the first half (about 1 − x²),
+/// only the roll from the middle on.
+fn roll_mix(d: f32) -> (f32, f32) {
+    let x = (d * 2.0).clamp(0.0, 1.0);
+    (1.0 - x * x, 1.0 - (1.0 - x) * (1.0 - x))
+}
+
+/// Flanger and phaser mix: depth works over its first quarter, then both
+/// stay at 0.75.
+fn sweep_mix(d: f32) -> (f32, f32) {
+    if d < 0.25 { (1.0 - d, 3.0 * d) } else { (0.75, 0.75) }
+}
+
+/// Filter mix: the original fades into the filtered sound over the first
+/// sixth of the knob, at equal power.
+fn filter_mix(d: f32) -> (f32, f32) {
+    if d * 6.0 >= 1.0 {
+        return (0.0, 1.0);
+    }
+    let x = d * 6.0 * PI / 2.0;
+    (x.cos(), x.sin())
+}
+
+/// Spiral's feedback for its depth: up to 0.8 by 10 %, held to the middle,
+/// then on to nearly 1.
+fn spiral_feedback(d: f32) -> f32 {
+    if d < 0.1 {
+        8.0 * d
+    } else if d <= 0.5 {
+        0.8
+    } else {
+        (0.8 + 0.4 * (d - 0.5)).min(0.99)
+    }
+}
+
+/// Mobius' level for its depth: from nothing at the bottom straight up to
+/// 1 at the middle, then on a square curve to 4.4 at the top.
+fn mobius_level(d: f32) -> f32 {
+    let d = d.clamp(0.0, 1.0);
+    if d < 0.5 {
+        2.0 * d
+    } else {
+        let u = 2.0 * d - 1.0;
+        1.0 + 3.4 * u * u
+    }
+}
 
 /// A stereo delay line with a fixed maximum length.
 #[derive(Debug)]
@@ -89,6 +171,7 @@ impl AllPass {
 struct Reverb {
     combs: [Vec<Comb>; 2],
     allpasses: [Vec<AllPass>; 2],
+    rate: f32,
 }
 
 impl Reverb {
@@ -111,7 +194,32 @@ impl Reverb {
         };
         let (left_combs, left_allpasses) = channel(0.0);
         let (right_combs, right_allpasses) = channel(0.52);
-        Self { combs: [left_combs, right_combs], allpasses: [left_allpasses, right_allpasses] }
+        Self {
+            combs: [left_combs, right_combs],
+            allpasses: [left_allpasses, right_allpasses],
+            rate,
+        }
+    }
+
+    /// Rings for `decay` seconds (to −60 dB): each comb loses 60 dB over that
+    /// time, whatever its length.
+    fn process_decay(&mut self, x: [f32; 2], decay: f32) -> [f32; 2] {
+        let input = (x[0] + x[1]) * 0.03;
+        let rate = self.rate;
+        std::array::from_fn(|ch| {
+            let mut y: f32 = self.combs[ch]
+                .iter_mut()
+                .map(|c| {
+                    let length = c.buffer.len() as f32 / rate;
+                    let feedback = 10f32.powf(-3.0 * length / decay.max(0.05));
+                    c.process(input, feedback, 0.2)
+                })
+                .sum();
+            for allpass in &mut self.allpasses[ch] {
+                y = allpass.process(y);
+            }
+            y
+        })
     }
 
     /// `size` 0.0–1.0 sets the decay time.
@@ -194,16 +302,17 @@ struct Phaser {
 }
 
 impl Phaser {
-    fn process(&mut self, x: [f32; 2], freq: f32, rate: f32) -> [f32; 2] {
+    /// Only the phase-shifted signal, with `feedback` around the stages.
+    fn shifted(&mut self, x: [f32; 2], freq: f32, rate: f32, feedback: f32) -> [f32; 2] {
         let t = (PI * freq / rate).tan();
         let a = (t - 1.0) / (t + 1.0);
         std::array::from_fn(|ch| {
-            let mut y = x[ch] + self.feedback[ch] * 0.5;
+            let mut y = x[ch] + self.feedback[ch] * feedback;
             for stage in &mut self.stages {
                 y = stage.process(ch, y, a);
             }
             self.feedback[ch] = y;
-            (x[ch] + y) * 0.5
+            y
         })
     }
 }
@@ -332,6 +441,8 @@ pub struct BeatFx {
     lfo: f32,
     /// Roll: frames captured since it was switched on.
     roll_filled: f32,
+    /// Mobius: each octave's oscillator phase (0.0–1.0).
+    shepard: [f32; SHEPARD_PARTIALS],
     tick: u32,
     was_on: bool,
 }
@@ -352,6 +463,7 @@ impl BeatFx {
             tone: Biquad::default(),
             lfo: 0.0,
             roll_filled: 0.0,
+            shepard: [0.0; SHEPARD_PARTIALS],
             tick: 0,
             was_on: false,
         }
@@ -371,6 +483,7 @@ impl BeatFx {
             tone: self.tone,
             lfo: self.lfo,
             roll_filled: self.roll_filled,
+            shepard: self.shepard,
             tick: self.tick,
             was_on: self.was_on,
         }
@@ -385,9 +498,11 @@ impl BeatFx {
             tone,
             lfo,
             roll_filled,
+            shepard,
             tick,
             was_on,
         } = *state;
+        self.shepard = shepard;
         (self.params, self.delay_frames, self.phasers) = (params, delay_frames, phasers);
         (self.filter, self.tone, self.lfo) = (filter, tone, lfo);
         (self.roll_filled, self.tick, self.was_on) = (roll_filled, tick, was_on);
@@ -417,104 +532,150 @@ impl BeatFx {
         }
         self.was_on = on;
         let beat = (p.beat_secs * self.rate).clamp(16.0, self.rate * (MAX_DELAY_SECS - 0.1));
+        let lfo_before = self.lfo;
         self.lfo = (self.lfo + 1.0 / beat) % 1.0;
+        let lfo_wrapped = self.lfo < lfo_before;
         self.tick = self.tick.wrapping_add(1);
         let sweep = self.tick.is_multiple_of(SWEEP_EVERY);
-        // The depth knob is the wet/dry balance: 0 the sound as it is, a
-        // half each, 1 only what the effect makes (echoes and reverb ring
-        // over the sound, as on the mixer).
-        let d = p.depth.clamp(0.0, 1.0);
-        let dry = if p.release { [0.0; 2] } else { x };
+        let raw = p.depth.clamp(0.0, 1.0);
+        let d = centered(raw);
         // What goes into echo-like effects: nothing once switched off, so the tail fades.
         let send = if on && !p.release { x } else { [0.0; 2] };
-        let mix = |a: [f32; 2], b: [f32; 2], wet: f32| {
-            [a[0] * (1.0 - wet) + b[0] * wet, a[1] * (1.0 - wet) + b[1] * wet]
+        // (original, effect) levels: switched off, the original is whole and
+        // a tail rings on; released, the original is cut.
+        let levels = |(original, effect): (f32, f32)| {
+            let original = if p.release {
+                0.0
+            } else if on {
+                original
+            } else {
+                1.0
+            };
+            (original, effect)
         };
-        let add = |a: [f32; 2], b: [f32; 2], wet: f32| [a[0] + b[0] * wet, a[1] + b[1] * wet];
+        let blend = |a: [f32; 2], b: [f32; 2], (ga, gb): (f32, f32)| {
+            [a[0] * ga + b[0] * gb, a[1] * ga + b[1] * gb]
+        };
 
         match p.kind {
-            BeatFxKind::Delay | BeatFxKind::Echo | BeatFxKind::LowCutEcho | BeatFxKind::Spiral => {
-                let glide = if p.kind == BeatFxKind::Spiral { 0.00005 } else { 0.01 };
-                self.delay_frames += (beat - self.delay_frames) * glide;
+            BeatFxKind::Delay | BeatFxKind::Echo | BeatFxKind::LowCutEcho => {
+                self.delay_frames += (beat - self.delay_frames) * 0.01;
                 let echo = self.delay.read(self.delay_frames);
-                let feedback = match p.kind {
-                    BeatFxKind::Delay => 0.15,
-                    BeatFxKind::Spiral => 0.75,
-                    _ => 0.55,
-                };
+                // Delay: one repeat. Echo, Low Cut Echo: −3 dB a repeat.
+                let feedback = if p.kind == BeatFxKind::Delay { 0.0 } else { ECHO_FEEDBACK };
                 let mut fed = [send[0] + echo[0] * feedback, send[1] + echo[1] * feedback];
                 if p.kind == BeatFxKind::LowCutEcho {
                     if sweep || self.tick == 1 {
-                        self.tone.high_pass(self.rate, 900.0, 0.7);
+                        self.tone.high_pass(self.rate, 500.0, 0.7);
                     }
                     fed = [self.tone.process(0, fed[0]), self.tone.process(1, fed[1])];
                 }
                 self.delay.push(fed);
-                add(dry, echo, d)
+                blend(x, echo, levels(echo_mix(d)))
+            }
+            BeatFxKind::Spiral => {
+                // Its echoes glide to a new beat length (bending their pitch);
+                // the depth sets how loud they are and how long they ring.
+                self.delay_frames += (beat - self.delay_frames) * 0.00005;
+                let echo = self.delay.read(self.delay_frames);
+                let feedback = spiral_feedback(raw);
+                self.delay.push([send[0] + echo[0] * feedback, send[1] + echo[1] * feedback]);
+                blend(x, echo, levels((1.0, (2.0 * raw).min(1.0))))
             }
             BeatFxKind::Helix => {
-                // Holds one beat and keeps repeating it, fading new sound in less.
+                // Repeats the last beat: the depth turns the repeat up and
+                // records less new sound into it, frozen all the way right.
+                let (heard, record) = if raw < 0.5 {
+                    let w = (1.0 - 2.0 * raw).powi(2);
+                    (0.85 * (1.0 - w), 0.45 + 0.55 * w)
+                } else {
+                    (0.7 + 0.3 * raw, 0.9 - 0.9 * raw)
+                };
                 let held = self.delay.read(beat);
-                let input = if on { 0.4 } else { 0.0 };
-                let feedback = if on { 0.97 } else { 0.6 };
+                let (input, keep) = if on { (record, 1.0 - record) } else { (0.0, 0.6) };
                 self.delay.push([
-                    send[0] * input + held[0] * feedback,
-                    send[1] * input + held[1] * feedback,
+                    send[0] * input + held[0] * keep,
+                    send[1] * input + held[1] * keep,
                 ]);
-                mix(dry, held, d)
+                blend(x, held, levels((1.0 - heard, heard)))
             }
             BeatFxKind::Reverb => {
-                let wet = self.reverb.process(send, 0.7);
-                add(dry, wet, d)
+                let wet = self.reverb.process_decay(send, REVERB_DECAY_SECS);
+                blend(x, wet, levels(echo_mix(d)))
             }
             _ if !on => x,
             BeatFxKind::Flanger => {
+                // A short delay swept up to 2.5 ms and back once a cycle, with
+                // a little feedback.
                 let lfo = 0.5 - 0.5 * (2.0 * PI * self.lfo).cos();
-                let tap = self.flange.read(self.rate * (0.0005 + 0.006 * lfo));
-                self.flange.push([x[0] + tap[0] * 0.6, x[1] + tap[1] * 0.6]);
-                mix(x, [(x[0] + tap[0]) * 0.5, (x[1] + tap[1]) * 0.5], d)
+                let tap = self.flange.read(self.rate * (0.0001 + 0.0024 * lfo));
+                self.flange.push([x[0] + tap[0] * SWEEP_FEEDBACK, x[1] + tap[1] * SWEEP_FEEDBACK]);
+                blend(x, tap, sweep_mix(d))
             }
             BeatFxKind::Phaser => {
                 let lfo = 0.5 - 0.5 * (2.0 * PI * self.lfo).cos();
                 let freq = 200.0 * 20f32.powf(lfo);
-                mix(x, self.phasers[0].process(x, freq, self.rate), d)
+                let shifted = self.phasers[0].shifted(x, freq, self.rate, SWEEP_FEEDBACK);
+                blend(x, shifted, sweep_mix(d))
             }
             BeatFxKind::MobiusSaw | BeatFxKind::MobiusTri => {
-                // Two phasers half a cycle apart, each faded in and out over its
-                // sweep: an endless rise (saw) or rise and fall (triangle).
-                let shape = |phase: f32| match p.kind {
-                    BeatFxKind::MobiusSaw => phase,
-                    _ => 1.0 - (2.0 * phase - 1.0).abs(),
+                // A tone of its own, mixed in (the depth is its level, steeply
+                // louder towards the top): sines two octaves apart, from 55 Hz,
+                // each gliding up two octaves per cycle of the beat length,
+                // loudest in the middle and silent at the ends, so the whole
+                // seems to rise for ever (saw) or to rise and fall (triangle).
+                // It sounds without any input too.
+                let position = match p.kind {
+                    BeatFxKind::MobiusSaw => self.lfo,
+                    _ => 1.0 - (2.0 * self.lfo - 1.0).abs(),
                 };
-                let (pa, pb) = (self.lfo, (self.lfo + 0.5) % 1.0);
-                let a = self.phasers[0].process(x, 150.0 * 30f32.powf(shape(pa)), self.rate);
-                let b = self.phasers[1].process(x, 150.0 * 30f32.powf(shape(pb)), self.rate);
-                let (ga, gb) = ((PI * pa).sin().powi(2), (PI * pb).sin().powi(2));
-                mix(x, [a[0] * ga + b[0] * gb, a[1] * ga + b[1] * gb], d)
+                if p.kind == BeatFxKind::MobiusSaw && lfo_wrapped {
+                    // Each oscillator steps up into the next one's place.
+                    self.shepard[..MOBIUS_TONES].rotate_right(1);
+                    self.shepard[0] = 0.0;
+                }
+                let n = MOBIUS_TONES as f32;
+                let mut tone = 0.0;
+                for (i, phase) in self.shepard[..MOBIUS_TONES].iter_mut().enumerate() {
+                    let place = i as f32 + position;
+                    let freq = SHEPARD_LOW * 4f32.powf(place);
+                    let weight = 0.5 - 0.5 * (2.0 * PI * place / n).cos();
+                    *phase = (*phase + freq / self.rate) % 1.0;
+                    tone += weight * (2.0 * PI * *phase).sin();
+                }
+                let tone = tone * 0.1 * mobius_level(raw);
+                [x[0] + tone, x[1] + tone]
             }
             BeatFxKind::Filter => {
+                // The cutoff sweeps its whole range (40 Hz – 16 kHz) once a
+                // cycle; the depth fades it in over the first sixth.
                 if sweep || self.tick == 1 {
                     let lfo = 0.5 - 0.5 * (2.0 * PI * self.lfo).cos();
-                    self.filter.low_pass(self.rate, 150.0 * 60f32.powf(lfo), 3.0);
+                    self.filter.low_pass(self.rate, 40.0 * 400f32.powf(lfo), 2.9);
                 }
                 let y = [self.filter.process(0, x[0]), self.filter.process(1, x[1])];
-                mix(x, y, d)
+                blend(x, y, filter_mix(d))
             }
             BeatFxKind::Trans => {
-                // Cuts the sound for the second half of each beat, with 2 ms edges.
-                let edge = 0.002 * self.rate / beat;
+                // Cuts the second half of each beat length, with 10 ms edges;
+                // the depth is how deep, fully cut from the middle on.
+                let edge = 0.01 * self.rate / beat;
                 let gate = if self.lfo < 0.5 {
                     (self.lfo / edge).min(1.0).min((0.5 - self.lfo) / edge)
                 } else {
                     0.0
                 };
-                let gain = 1.0 - d * (1.0 - gate);
+                let gain = 1.0 - (2.0 * d).min(1.0) * (1.0 - gate);
                 [x[0] * gain, x[1] * gain]
             }
             BeatFxKind::Pitch => {
-                // An octave up.
-                let pitched = self.pitch.process(x, 2.0);
-                mix(x, pitched, d)
+                // The depth is the pitch: −1 octave the way left, the original
+                // in the middle, +1 octave the way right.
+                if (d - 0.5).abs() < 1e-4 {
+                    x
+                } else {
+                    self.pitch.process(x, 2f32.powf(2.0 * d - 1.0))
+                }
             }
             BeatFxKind::Roll => {
                 // Records one beat after switching on, then repeats it.
@@ -527,7 +688,7 @@ impl BeatFx {
                     self.delay.push(repeat);
                     repeat
                 };
-                mix(x, looped, d)
+                blend(x, looped, roll_mix(raw))
             }
         }
     }
@@ -843,6 +1004,8 @@ pub(crate) struct BeatFxState {
     tone: Biquad,
     lfo: f32,
     roll_filled: f32,
+    #[serde(default)]
+    shepard: [f32; SHEPARD_PARTIALS],
     tick: u32,
     was_on: bool,
 }
@@ -919,7 +1082,7 @@ mod tests {
         assert!(peak(4790, 4810) > 0.5, "first echo at 100 ms");
         assert!(peak(100, 4700) < 1e-3, "nothing between");
         assert!(peak(9590, 9610) > 0.2, "second echo");
-        assert!(peak(40_000, 48_000) < 0.05, "the tail fades");
+        assert!(peak(40_000, 48_000) < 0.1, "the tail fades");
     }
 
     #[test]
@@ -939,17 +1102,49 @@ mod tests {
     }
 
     #[test]
-    fn trans_cuts_half_of_each_beat() {
+    /// At full depth Trans cuts three quarters of each beat; at half depth
+    /// less, and not all the way.
+    fn trans_cuts_more_the_deeper_it_is() {
+        let run = |depth| {
+            let mut fx = BeatFx::new(RATE);
+            fx.set(BeatFxParams { kind: BeatFxKind::Trans, on: true, depth, beat_secs: 0.1, ..Default::default() });
+            (0..4800).map(|_| fx.process([1.0, 1.0])[0]).collect::<Vec<_>>()
+        };
+        // The second half of each beat length is cut, fully from the middle
+        // of the knob on, half as deep at a quarter.
+        let full = run(1.0);
+        assert!(full[1200] > 0.99 && full[3600] < 1e-6);
+        let middle = run(0.5);
+        assert!(middle[1200] > 0.99 && middle[3600] < 1e-6);
+        let quarter = run(0.25);
+        assert!((quarter[3600] - (1.0 - 2.0 * centered(0.25))).abs() < 1e-4);
+    }
+
+    /// Mobius makes a sound of its own, with nothing coming in; its level is
+    /// the depth.
+    #[test]
+    fn mobius_sounds_without_input() {
+        let level = |depth| {
+            let mut fx = BeatFx::new(RATE);
+            fx.set(BeatFxParams { kind: BeatFxKind::MobiusSaw, on: true, depth, beat_secs: 0.5, ..Default::default() });
+            let out: Vec<f32> = (0..RATE as usize * 2).map(|_| fx.process([0.0, 0.0])[0]).collect();
+            (out.iter().map(|v| v * v).sum::<f32>() / out.len() as f32).sqrt()
+        };
+        // Up to 1 in the middle, then steeply to 4.4 at the top.
+        let (half, full) = (level(0.5), level(1.0));
+        assert!(full > 0.05 && (full / half - 4.4).abs() < 0.05, "{half} {full}");
+        assert_eq!(level(0.0), 0.0);
+    }
+
+    /// Pitch: the depth is the pitch, from the original up to an octave.
+    #[test]
+    fn pitch_depth_is_the_pitch() {
         let mut fx = BeatFx::new(RATE);
-        fx.set(BeatFxParams {
-            kind: BeatFxKind::Trans,
-            on: true,
-            depth: 1.0,
-            beat_secs: 0.1,
-            ..Default::default()
-        });
-        let out: Vec<_> = (0..4800).map(|_| fx.process([1.0, 1.0])[0]).collect();
-        assert!(out[1200] > 0.99 && out[3600] < 1e-6);
+        // The middle of the knob (anywhere in its detent) is the original.
+        fx.set(BeatFxParams { kind: BeatFxKind::Pitch, on: true, depth: 0.5, beat_secs: 0.5, ..Default::default() });
+        assert_eq!(fx.process([0.3, -0.2]), [0.3, -0.2]);
+        fx.set(BeatFxParams { kind: BeatFxKind::Pitch, on: true, depth: 0.505, beat_secs: 0.5, ..Default::default() });
+        assert_eq!(fx.process([0.3, -0.2]), [0.3, -0.2]);
     }
 
     #[test]
@@ -974,7 +1169,8 @@ mod tests {
     /// exactly as it is.
     #[test]
     fn beat_fx_at_zero_depth_is_dry() {
-        for kind in BeatFxKind::ALL {
+        // (Pitch's depth is the pitch: its middle is the original.)
+        for kind in BeatFxKind::ALL.into_iter().filter(|k| *k != BeatFxKind::Pitch) {
             let mut fx = BeatFx::new(RATE);
             fx.set(BeatFxParams {
                 kind,
@@ -1052,5 +1248,57 @@ mod tests {
                 assert_eq!(fx.process(x), x, "{kind:?}");
             }
         }
+    }
+
+    /// The depth knob's middle is a detent; its ends are its ends.
+    #[test]
+    fn depth_knob_has_a_middle_detent() {
+        assert_eq!(centered(0.0), 0.0);
+        assert_eq!(centered(1.0), 1.0);
+        assert_eq!(centered(0.49), 0.5);
+        assert_eq!(centered(0.51), 0.5);
+        assert!((centered(0.25) - 0.25 * 0.5 / 0.485).abs() < 1e-6);
+        assert!(centered(0.6) > 0.5 && centered(0.6) < 0.6);
+    }
+
+    /// Echo-type effects: the effect comes in up to 75 %, then the original
+    /// goes, so at full depth only the echo is heard; Filter is fully in by
+    /// a sixth of the knob.
+    #[test]
+    fn mix_laws() {
+        assert_eq!(echo_mix(0.0), (1.0, 0.0));
+        assert_eq!(echo_mix(0.75), (1.0, 1.0));
+        assert_eq!(echo_mix(1.0), (0.0, 1.0));
+        assert_eq!(filter_mix(0.0).0, 1.0);
+        assert_eq!(filter_mix(0.2), (0.0, 1.0));
+        assert_eq!(sweep_mix(0.5), (0.75, 0.75));
+        assert_eq!(roll_mix(0.5), (0.0, 1.0));
+        // Echo at full depth: before the first echo arrives, silence.
+        let mut fx = BeatFx::new(RATE);
+        fx.set(BeatFxParams { kind: BeatFxKind::Echo, on: true, depth: 1.0, beat_secs: 0.5, ..Default::default() });
+        assert!((0..1000).all(|i| fx.process(tone(i, 330.0))[0].abs() < 1e-6));
+    }
+
+    /// The reverb rings long (about 8 s to −60 dB): two seconds after a
+    /// burst it has fallen some 14 dB, not died away.
+    #[test]
+    fn reverb_rings_long() {
+        let mut fx = BeatFx::new(RATE);
+        fx.set(BeatFxParams { kind: BeatFxKind::Reverb, on: true, depth: 0.6, beat_secs: 0.5, ..Default::default() });
+        let rms = |fx: &mut BeatFx, n: usize, input: bool| {
+            let mut sum = 0.0;
+            for i in 0..n {
+                let x = if input { tone(i, 330.0) } else { [0.0; 2] };
+                let y = fx.process(x)[0];
+                sum += y * y;
+            }
+            (sum / n as f32).sqrt()
+        };
+        rms(&mut fx, RATE as usize / 10, true);
+        let early = rms(&mut fx, RATE as usize / 10, false);
+        rms(&mut fx, RATE as usize * 19 / 10, false);
+        let late = rms(&mut fx, RATE as usize / 10, false);
+        let drop = 20.0 * (early / late).log10();
+        assert!((8.0..22.0).contains(&drop), "fell {drop} dB in 2 s");
     }
 }

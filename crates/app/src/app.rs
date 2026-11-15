@@ -1377,6 +1377,8 @@ impl DeckhandApp {
             (GlobalAction::FxType(n), _) if pressed => {
                 fx.kind = BeatFxKind::ALL[usize::from(n) % BeatFxKind::ALL.len()];
             }
+            (GlobalAction::FxTypeNext, _) if pressed => fx.step_kind(1, &self.config.prefs.beat_fx_cycle),
+            (GlobalAction::FxTypePrev, _) if pressed => fx.step_kind(-1, &self.config.prefs.beat_fx_cycle),
             (GlobalAction::FxAssign(n), _) if pressed => {
                 fx.target = match n {
                     0..=3 => FxTarget::Channel(usize::from(n)),
@@ -1973,119 +1975,7 @@ impl DeckhandApp {
                         egui::containers::menu::MenuConfig::new()
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
                     )
-                    .ui(ui, |ui| {
-                        let before = (
-                            self.config.vertical_waveforms,
-                            self.config.show_waveforms,
-                            self.config.show_mixer,
-                            self.config.show_library,
-                            self.config.show_fx,
-                        );
-                        ui.label(RichText::new("Waveforms").small().weak());
-                        ui.radio_value(
-                            &mut self.config.vertical_waveforms,
-                            false,
-                            "Horizontal (top)",
-                        );
-                        ui.radio_value(
-                            &mut self.config.vertical_waveforms,
-                            true,
-                            "Vertical (between decks)",
-                        );
-                        ui.separator();
-                        ui.checkbox(&mut self.config.show_waveforms, "Waveforms");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.config.show_mixer, "Mixer");
-                            sticky_menu(ui, "parts", |ui| {
-                                use crate::parts::{MixerPart, grouped_checkboxes};
-                                let hidden = &mut self.config.hidden_mixer_parts;
-                                if grouped_checkboxes(
-                                    ui,
-                                    &MixerPart::GROUPS,
-                                    MixerPart::label,
-                                    hidden,
-                                ) {
-                                    self.config.save();
-                                }
-                            });
-                        });
-                        ui.checkbox(&mut self.config.show_library, "Library");
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.config.show_fx, "FX and sampler");
-                            sticky_menu(ui, "parts", |ui| {
-                                use crate::parts::{FxPart, grouped_checkboxes};
-                                let hidden = &mut self.config.hidden_fx_parts;
-                                if grouped_checkboxes(ui, &FxPart::GROUPS, FxPart::label, hidden) {
-                                    self.config.save();
-                                }
-                            });
-                        });
-                        ui.separator();
-                        let four = self.config.four_decks;
-                        let which = if four { "4-deck" } else { "2-deck" };
-                        sticky_menu(ui, format!("Deck elements ({which} layout)"), |ui| {
-                            use crate::layout::DeckElement;
-                            let layout = self.config.deck_layout_mut(four);
-                            let mut changed = ScrollArea::vertical()
-                                .show(ui, |ui| {
-                                    crate::parts::grouped_checkboxes(
-                                        ui,
-                                        &DeckElement::GROUPS,
-                                        DeckElement::label,
-                                        &mut layout.hidden,
-                                    )
-                                })
-                                .inner;
-                            ui.separator();
-                            for section in crate::layout::Section::ALL.into_iter().filter(|s| s.can_stack()) {
-                                let mut stacked = layout.is_stacked(section);
-                                let label = format!("{} one on the other", section.label());
-                                if ui.checkbox(&mut stacked, label).changed() {
-                                    layout.set_stacked(section, stacked);
-                                    changed = true;
-                                }
-                            }
-                            if changed {
-                                self.config.save();
-                            }
-                        });
-                        if ui
-                            .checkbox(&mut self.editing_layout, "Edit deck layout (drag sections)")
-                            .changed()
-                        {
-                            ui.close();
-                        }
-                        sticky_menu(ui, format!("View presets ({which})"), |ui| {
-                            self.layout_presets_menu(ui, four);
-                        });
-                        ui.menu_button("Screen arrangement", |ui| {
-                            for (name, layout) in crate::screen_layout::ScreenLayout::built_in() {
-                                let current = self.config.screen_layout == layout;
-                                if ui.selectable_label(current, name).clicked() {
-                                    self.config.screen_layout = layout;
-                                    self.config.save();
-                                    ui.close();
-                                }
-                            }
-                            ui.label(
-                                RichText::new(
-                                    "Or move them yourself: Edit layout, then drag their bars.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        });
-                        let after = (
-                            self.config.vertical_waveforms,
-                            self.config.show_waveforms,
-                            self.config.show_mixer,
-                            self.config.show_library,
-                            self.config.show_fx,
-                        );
-                        if before != after {
-                            self.config.save();
-                        }
-                    });
+                    .ui(ui, |ui| self.view_menu(ui));
                 view_button.tour(Target::ViewMenu);
                 ui.menu_button("Tours", |ui| {
                     for tour in &self.tours {
@@ -2117,6 +2007,123 @@ impl DeckhandApp {
         });
         if let Some(id) = start {
             self.start_tour(&id);
+        }
+    }
+
+    /// The View menu's contents: waveforms, what is shown, deck elements and
+    /// layout, presets, screen arrangement. Also on Preferences →
+    /// Appearance, so both are the same.
+    fn view_menu(&mut self, ui: &mut Ui) {
+        let before = (
+            self.config.vertical_waveforms,
+            self.config.show_waveforms,
+            self.config.show_mixer,
+            self.config.show_library,
+            self.config.show_fx,
+        );
+        ui.label(RichText::new("Waveforms").small().weak());
+        ui.radio_value(
+            &mut self.config.vertical_waveforms,
+            false,
+            "Horizontal (top)",
+        );
+        ui.radio_value(
+            &mut self.config.vertical_waveforms,
+            true,
+            "Vertical (between decks)",
+        );
+        ui.separator();
+        ui.checkbox(&mut self.config.show_waveforms, "Waveforms");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.config.show_mixer, "Mixer");
+            sticky_menu(ui, "parts", |ui| {
+                use crate::parts::{MixerPart, grouped_checkboxes};
+                let hidden = &mut self.config.hidden_mixer_parts;
+                if grouped_checkboxes(
+                    ui,
+                    &MixerPart::GROUPS,
+                    MixerPart::label,
+                    hidden,
+                ) {
+                    self.config.save();
+                }
+            });
+        });
+        ui.checkbox(&mut self.config.show_library, "Library");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.config.show_fx, "FX and sampler");
+            sticky_menu(ui, "parts", |ui| {
+                use crate::parts::{FxPart, grouped_checkboxes};
+                let hidden = &mut self.config.hidden_fx_parts;
+                if grouped_checkboxes(ui, &FxPart::GROUPS, FxPart::label, hidden) {
+                    self.config.save();
+                }
+            });
+        });
+        ui.separator();
+        let four = self.config.four_decks;
+        let which = if four { "4-deck" } else { "2-deck" };
+        sticky_menu(ui, format!("Deck elements ({which} layout)"), |ui| {
+            use crate::layout::DeckElement;
+            let layout = self.config.deck_layout_mut(four);
+            let mut changed = ScrollArea::vertical()
+                .show(ui, |ui| {
+                    crate::parts::grouped_checkboxes(
+                        ui,
+                        &DeckElement::GROUPS,
+                        DeckElement::label,
+                        &mut layout.hidden,
+                    )
+                })
+                .inner;
+            ui.separator();
+            for section in crate::layout::Section::ALL.into_iter().filter(|s| s.can_stack()) {
+                let mut stacked = layout.is_stacked(section);
+                let label = format!("{} one on the other", section.label());
+                if ui.checkbox(&mut stacked, label).changed() {
+                    layout.set_stacked(section, stacked);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.config.save();
+            }
+        });
+        if ui
+            .checkbox(&mut self.editing_layout, "Edit deck layout (drag sections)")
+            .changed()
+        {
+            ui.close();
+        }
+        sticky_menu(ui, format!("View presets ({which})"), |ui| {
+            self.layout_presets_menu(ui, four);
+        });
+        ui.menu_button("Screen arrangement", |ui| {
+            for (name, layout) in crate::screen_layout::ScreenLayout::built_in() {
+                let current = self.config.screen_layout == layout;
+                if ui.selectable_label(current, name).clicked() {
+                    self.config.screen_layout = layout;
+                    self.config.save();
+                    ui.close();
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "Or move them yourself: Edit layout, then drag their bars.",
+                )
+                .small()
+                .weak(),
+            );
+        });
+        let after = (
+            self.config.vertical_waveforms,
+            self.config.show_waveforms,
+            self.config.show_mixer,
+            self.config.show_library,
+            self.config.show_fx,
+        );
+        if before != after {
+            self.config.save();
         }
     }
 
@@ -3263,6 +3270,12 @@ impl DeckhandApp {
                     }
                     PrefsTab::Appearance => {
                         prefs_changed |= appearance_prefs(ui, &mut self.config.prefs);
+                        // The View menu too, so both are the same.
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(RichText::new("View").strong());
+                        ui.label(RichText::new("As in the View menu.").small().weak());
+                        self.view_menu(ui);
                         return;
                     }
                     PrefsTab::Audio => {}
@@ -3840,11 +3853,6 @@ fn sticky_menu<R>(ui: &mut Ui, label: impl Into<String>, content: impl FnOnce(&m
 
 fn toggle(ui: &mut Ui, on: bool, label: &str) -> egui::Response {
     crate::widgets::lit_button(ui, label, on, ACTIVE)
-}
-
-/// A button lit in its own colour while `on`.
-fn toggle_in(ui: &mut Ui, on: bool, label: &str, accent: Color32) -> egui::Response {
-    crate::widgets::lit_button(ui, label, on, accent)
 }
 
 #[cfg(test)]

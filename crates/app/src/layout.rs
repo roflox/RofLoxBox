@@ -94,6 +94,24 @@ impl Section {
         matches!(self, Self::Tempo | Self::Key)
     }
 
+    /// Whether it can go in the track info's top line, by EJECT (a row of
+    /// small buttons).
+    pub fn fits_header(self) -> bool {
+        matches!(self, Self::Transport | Self::Functions)
+    }
+
+    /// Whether its size can be changed (its edges while editing the
+    /// layout): not the track info, which is text and the overview.
+    pub fn resizable(self) -> bool {
+        self != Self::Track
+    }
+
+    /// Whether it is round buttons (CUE, Play): sized the same both ways,
+    /// by its corner rather than its edges.
+    pub fn round(self) -> bool {
+        self == Self::Play
+    }
+
     /// Whether it can be drawn one on the other instead of side by side.
     pub fn can_stack(self) -> bool {
         self == Self::Play
@@ -247,6 +265,9 @@ pub enum Place {
     NewRow,
     /// At the bottom of the side column.
     SideEnd,
+    /// In the track info's top line, by EJECT (only sections that
+    /// [`Section::fits_header`]).
+    Header,
 }
 
 /// Where a deck's sections are, and the controls not shown.
@@ -257,6 +278,18 @@ pub struct DeckLayout {
     pub main: Vec<Vec<Section>>,
     /// The column beside it (tempo and key by default).
     pub side: Vec<Section>,
+    /// On a line of their own under the deck's name, above the title
+    /// (transport and SHIFT / GATE / GRID by default; layouts saved before
+    /// take them there too).
+    pub header: Vec<Section>,
+    /// That line's buttons against its right side (else its left; mirrored
+    /// on a right deck).
+    pub header_right: bool,
+    /// Sections drawn wider or narrower, taller or shorter (percent across,
+    /// percent down; 100 when not listed), set by dragging their right or
+    /// bottom edge while editing the layout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stretch: Vec<(Section, u16, u16)>,
     /// Controls not shown; a section with none shown is not drawn.
     pub hidden: Vec<DeckElement>,
     /// Sections drawn one on the other (CUE over Play) rather than side by
@@ -386,12 +419,15 @@ impl DeckLayout {
         Self {
             main: vec![
                 vec![S::Track],
-                vec![S::Play, S::Transport, S::Functions],
+                vec![S::Play],
                 vec![S::Loop],
                 vec![S::Jump, S::Memory],
                 vec![S::Pads],
             ],
             side: vec![S::Tempo, S::Key],
+            header: vec![S::Transport, S::Functions],
+            header_right: true,
+            stretch: Vec::new(),
             hidden: Vec::new(),
             stacked: Vec::new(),
         }
@@ -427,6 +463,11 @@ impl DeckLayout {
     /// layout lacks (where the full layout has them).
     pub fn repair(&mut self) {
         let mut seen = Vec::new();
+        self.header.retain(|s| {
+            let new = s.fits_header() && !seen.contains(s);
+            seen.push(*s);
+            new
+        });
         for row in &mut self.main {
             row.retain(|s| {
                 let new = !seen.contains(s);
@@ -442,6 +483,10 @@ impl DeckLayout {
         self.main.retain(|row| !row.is_empty());
         let everything = Self::everything();
         for section in Section::ALL.into_iter().filter(|s| !seen.contains(s)) {
+            if everything.header.contains(&section) {
+                self.header.push(section);
+                continue;
+            }
             if everything.side.contains(&section) {
                 self.side.push(section);
                 continue;
@@ -469,11 +514,14 @@ impl DeckLayout {
             row.retain(|s| *s != section);
         }
         self.side.retain(|s| *s != section);
+        self.header.retain(|s| *s != section);
     }
 
     /// Moves a section.
     pub fn move_to(&mut self, section: Section, place: Place) {
-        if matches!(place, Place::Next { to, .. } if to == section) {
+        if matches!(place, Place::Next { to, .. } if to == section)
+            || place == Place::Header && !section.fits_header()
+        {
             return;
         }
         // Emptied rows are dropped only at the end, so row numbers hold.
@@ -486,6 +534,13 @@ impl DeckLayout {
                     row.insert(at, section);
                 } else if let Some(at) = self.side.iter().position(|s| *s == to) {
                     self.side.insert(at + offset, section);
+                } else if let Some(at) = self.header.iter().position(|s| *s == to) {
+                    // Only what fits there; others go on a row of their own.
+                    if section.fits_header() {
+                        self.header.insert(at + offset, section);
+                    } else {
+                        self.main.push(vec![section]);
+                    }
                 } else {
                     self.main.push(vec![section]);
                 }
@@ -493,8 +548,28 @@ impl DeckLayout {
             Place::RowEnd(row) if row < self.main.len() => self.main[row].push(section),
             Place::RowEnd(_) | Place::NewRow => self.main.push(vec![section]),
             Place::SideEnd => self.side.push(section),
+            Place::Header => self.header.push(section),
         }
         self.main.retain(|row| !row.is_empty());
+    }
+
+    /// A section's size across and down (1.0 as usual).
+    pub fn size(&self, section: Section) -> (f32, f32) {
+        self.stretch
+            .iter()
+            .find(|s| s.0 == section)
+            .map_or((1.0, 1.0), |s| (f32::from(s.1) / 100.0, f32::from(s.2) / 100.0))
+    }
+
+    /// Sets a section's size across and down (each 0.5–2.0; 1.0 both ways
+    /// forgets it).
+    pub fn set_size(&mut self, section: Section, (x, y): (f32, f32)) {
+        self.stretch.retain(|s| s.0 != section);
+        let percent = |v: f32| (v.clamp(0.5, 2.0) * 100.0).round() as u16;
+        let (x, y) = (percent(x), percent(y));
+        if (x, y) != (100, 100) {
+            self.stretch.push((section, x, y));
+        }
     }
 
     pub fn is_stacked(&self, section: Section) -> bool {
@@ -584,17 +659,71 @@ mod tests {
     #[test]
     fn repair_puts_back_missing_sections() {
         use Section as S;
-        let mut layout =
-            DeckLayout { main: vec![vec![S::Loop, S::Loop]], side: vec![], hidden: vec![], stacked: vec![] };
+        let mut layout = DeckLayout {
+            main: vec![vec![S::Loop, S::Loop]],
+            side: vec![],
+            header: vec![],
+            header_right: true,
+            stretch: vec![],
+            hidden: vec![],
+            stacked: vec![],
+        };
         layout.repair();
         assert_eq!(layout.main[0], vec![S::Loop]);
-        let all: usize = layout.main.iter().map(Vec::len).sum::<usize>() + layout.side.len();
+        let all: usize =
+            layout.main.iter().map(Vec::len).sum::<usize>() + layout.side.len() + layout.header.len();
         assert_eq!(all, Section::ALL.len());
         assert!(layout.side.contains(&S::Tempo));
         // One the full layout has by another goes back next to it.
         let mut layout = DeckLayout::everything();
-        layout.remove(S::Play);
+        layout.remove(S::Memory);
         layout.repair();
-        assert_eq!(layout.main[1], vec![S::Play, S::Transport, S::Functions]);
+        assert_eq!(layout.main[3], vec![S::Jump, S::Memory]);
+    }
+
+    /// Transport and SHIFT / GATE / GRID go by EJECT by default (layouts
+    /// saved before too); only they can go there, and they can leave.
+    #[test]
+    fn the_header_takes_the_transport() {
+        use Section as S;
+        assert_eq!(DeckLayout::default().header, vec![S::Transport, S::Functions]);
+        // Saved before the header was: theirs come off the rows.
+        let saved = r#"{"main":[["Track"],["Play","Transport","Functions"],["Loop"],["Jump","Memory"],["Pads"]],"side":["Tempo","Key"],"hidden":[]}"#;
+        let mut layout: DeckLayout = serde_json::from_str(saved).unwrap();
+        layout.repair();
+        assert_eq!(layout.header, vec![S::Transport, S::Functions]);
+        assert_eq!(layout.main[1], vec![S::Play]);
+        // Nothing else goes there.
+        layout.move_to(S::Loop, Place::Header);
+        assert!(!layout.header.contains(&S::Loop));
+        layout.move_to(S::Loop, Place::Next { to: S::Transport, after: true });
+        assert!(!layout.header.contains(&S::Loop));
+        // Moved away, and back.
+        layout.move_to(S::Transport, Place::NewRow);
+        assert_eq!(layout.header, vec![S::Functions]);
+        assert_eq!(layout.main.last().unwrap(), &vec![S::Transport]);
+        layout.move_to(S::Transport, Place::Header);
+        assert_eq!(layout.header, vec![S::Functions, S::Transport]);
+        // Saved moved away, it stays away.
+        layout.move_to(S::Functions, Place::SideEnd);
+        let mut again: DeckLayout = serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+        again.repair();
+        assert_eq!(again.header, vec![S::Transport]);
+    }
+
+    /// A section's size: kept in percent, within 50–200 %, 100 % forgotten.
+    #[test]
+    fn section_sizes() {
+        use Section as S;
+        let mut layout = DeckLayout::default();
+        assert_eq!(layout.size(S::Pads), (1.0, 1.0));
+        layout.set_size(S::Pads, (1.25, 1.0));
+        layout.set_size(S::Tempo, (9.0, 0.1));
+        assert_eq!(layout.size(S::Pads), (1.25, 1.0));
+        assert_eq!(layout.size(S::Tempo), (2.0, 0.5));
+        layout.set_size(S::Pads, (1.0, 1.0));
+        assert_eq!(layout.stretch, vec![(S::Tempo, 200, 50)]);
+        let again: DeckLayout = serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+        assert_eq!(again.size(S::Tempo), (2.0, 0.5));
     }
 }

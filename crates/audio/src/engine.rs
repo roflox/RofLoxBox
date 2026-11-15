@@ -2123,7 +2123,8 @@ mod tests {
             tx.push(Command::Load { deck, audio }).unwrap();
             tx.push(Command::SetPlaying { deck, playing: true }).unwrap();
         }
-        // Trans fully cuts the second half of each beat, on channel 2 only.
+        // Trans at full depth cuts all but the first quarter of each beat,
+        // on channel 2 only.
         tx.push(Command::SetBeatFx(BeatFxParams {
             kind: crate::fx::BeatFxKind::Trans,
             on: true,
@@ -2135,7 +2136,7 @@ mod tests {
         .unwrap();
         let mut out = vec![0f32; 100 * 2];
         mixer.render(&mut out, 2);
-        let (first, second) = (out[25 * 2], out[75 * 2]);
+        let (first, second) = (out[10 * 2], out[75 * 2]);
         assert!(first > second && second > 0.0, "{first} {second}");
     }
 

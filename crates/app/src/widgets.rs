@@ -231,15 +231,36 @@ pub fn lit_button_sized(
     text_size: f32,
     padding: f32,
 ) -> Response {
+    lit_button_stretched(ui, label, on, accent, text_size, padding, None)
+}
+
+/// [`lit_button_sized`] stretched across: `(by, at least)` makes it `by`
+/// times its usual width (never narrower than its text), and at least
+/// `at least` wide, whatever its height. Without, it is at least as wide
+/// as it is tall.
+pub fn lit_button_stretched(
+    ui: &mut Ui,
+    label: &str,
+    on: bool,
+    accent: Color32,
+    text_size: f32,
+    padding: f32,
+    stretch: Option<(f32, f32)>,
+) -> Response {
     let font = FontId::proportional(text_size);
     let width =
         ui.painter().layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x;
-    // At least a button's height (the decks' sections set it).
-    let height = (text_size + 8.0).max(ui.spacing().interact_size.y);
+    // At least a button's height (the decks' sections set it); stretched
+    // ones as short as their text allows.
+    let least = if stretch.is_some() { text_size + 4.0 } else { text_size + 8.0 };
+    let height = least.max(ui.spacing().interact_size.y);
+    let wide = match stretch {
+        Some((by, least)) => ((width + padding) * by).max(width + 4.0).max(least),
+        None => (width + padding).max(height),
+    };
     // At least its text's size; filling its cell in a justified layout
     // (the decks' grid).
-    let (rect, response) =
-        ui.allocate_at_least(vec2((width + padding).max(height), height), Sense::click());
+    let (rect, response) = ui.allocate_at_least(vec2(wide, height), Sense::click());
     if ui.is_rect_visible(rect) {
         let enabled = ui.is_enabled();
         let hovered = response.hovered() && enabled;

@@ -283,6 +283,29 @@ impl Effects {
         engine.send(Command::SetColorFx(kind));
     }
 
+    /// The next (`by` 1) or previous (−1) Beat FX of `chosen` (all when
+    /// none are), in the mixer's order.
+    pub fn step_kind(&mut self, by: i32, chosen: &[BeatFxKind]) {
+        let list: Vec<BeatFxKind> =
+            BeatFxKind::ALL.into_iter().filter(|k| chosen.is_empty() || chosen.contains(k)).collect();
+        let n = list.len() as i32;
+        // From where the current one is, or would be, in the list.
+        let at = BeatFxKind::ALL.iter().position(|&k| k == self.kind).unwrap_or(0);
+        let next = match list.iter().position(|&k| k == self.kind) {
+            Some(i) => (i as i32 + by).rem_euclid(n),
+            None => {
+                let after = list.iter().position(|k| BeatFxKind::ALL.iter().position(|a| a == k).unwrap_or(0) > at);
+                match (after, by > 0) {
+                    (Some(i), true) => i as i32,
+                    (Some(i), false) => (i as i32 - 1).rem_euclid(n),
+                    (None, true) => 0,
+                    (None, false) => n - 1,
+                }
+            }
+        };
+        self.kind = list[next as usize];
+    }
+
     pub fn next_color(&mut self, engine: &mut Engine) {
         let all = ColorFxKind::ALL;
         let at = all.iter().position(|&k| k == self.color).unwrap_or(0);
@@ -361,5 +384,33 @@ mod tests {
         );
         fx.pad = None;
         assert_eq!(fx.params(120.0).kind, BeatFxKind::Echo);
+    }
+
+    /// Next / previous go through the chosen Beat FX only, round and round;
+    /// from one not chosen, to the nearest chosen one that way.
+    #[test]
+    fn stepping_through_chosen_beat_fx() {
+        use deckhand_audio::BeatFxKind as K;
+        let mut fx = Effects::default();
+        let chosen = [K::Echo, K::Reverb, K::Roll];
+        fx.kind = K::Echo;
+        fx.step_kind(1, &chosen);
+        assert_eq!(fx.kind, K::Reverb);
+        fx.step_kind(1, &chosen);
+        fx.step_kind(1, &chosen);
+        assert_eq!(fx.kind, K::Echo);
+        fx.step_kind(-1, &chosen);
+        assert_eq!(fx.kind, K::Roll);
+        // Flanger isn't chosen: on to Roll, back to Reverb.
+        fx.kind = K::Flanger;
+        fx.step_kind(1, &chosen);
+        assert_eq!(fx.kind, K::Roll);
+        fx.kind = K::Flanger;
+        fx.step_kind(-1, &chosen);
+        assert_eq!(fx.kind, K::Reverb);
+        // None chosen: all of them.
+        fx.kind = K::Delay;
+        fx.step_kind(1, &[]);
+        assert_eq!(fx.kind, K::Echo);
     }
 }

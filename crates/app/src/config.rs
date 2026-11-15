@@ -206,6 +206,10 @@ pub struct Preferences {
     pub theme: Theme,
     /// Text size in percent of the normal size.
     pub text_scale: u32,
+    /// The deck controls' size in percent (buttons, pads, the side column).
+    pub button_scale: u32,
+    /// The tempo display's (BPM ring's) size in percent.
+    pub tempo_display_scale: u32,
     /// The stem separation model (its folder's name in `models/`).
     pub stem_model: String,
     /// Decks can play stems (separating, mixing parts); off, decks play
@@ -304,6 +308,8 @@ pub struct Preferences {
     pub iso_low_hz: f32,
     pub iso_high_hz: f32,
     pub limiter: bool,
+    /// The Beat FX a controller's next / previous buttons step through.
+    pub beat_fx_cycle: Vec<deckhand_audio::BeatFxKind>,
 }
 
 impl Preferences {
@@ -332,9 +338,12 @@ impl Default for Preferences {
             highlight_compatible_keys: true,
             edit_follow_playhead: false,
             edit_eq_boost: false,
+            beat_fx_cycle: deckhand_audio::BeatFxKind::ALL.to_vec(),
             edit_delete: None,
             theme: Theme::Dark,
             text_scale: 100,
+            button_scale: 100,
+            tempo_display_scale: 100,
             stem_model: String::new(),
             stems_folder: None,
             live_stems: true,
