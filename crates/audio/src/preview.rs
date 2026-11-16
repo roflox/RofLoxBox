@@ -37,8 +37,9 @@ struct Shared {
 
 impl SessionPlayer {
     /// Plays `session` from `from` (frames from its start) on `device`
-    /// (the system's default if `None`). The mixer plays everything before
-    /// `from` too, unheard, so it can take a moment to start.
+    /// (the system's default if `None`). The mixer goes through everything
+    /// before `from` too, unheard and mostly without sound
+    /// ([`Session::render_from`]), so it starts quickly.
     pub fn start(session: Session, from: u64, device: Option<&str>) -> Result<Self> {
         let rate = session.sample_rate();
         let device = Engine::find_device(device)?;
@@ -127,7 +128,7 @@ fn play_into(
 ) -> Result<()> {
     let mut clock = 0u64;
     let stopped = || anyhow!("stopped");
-    session.render(|buffer| {
+    session.render_from(from, |buffer| {
         if shared.stop.load(Ordering::Relaxed) {
             return Err(stopped());
         }

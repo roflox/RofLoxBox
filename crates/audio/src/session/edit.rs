@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Grid, JUMP_SPLIT_SECS, Logged, OPENED, Opened, PLACES_FOUND, Point, Run, STEMS, Session,
     Setting, Sources, StemLevels, StemsSource, TAIL_SECS, TRACKS, copy_value, copy_with, deck_of,
-    lane_value, open_stems, open_track, source_of,
+    lane_value, open_stems, open_track, remember_stems, source_of, stems_on_disk,
 };
 use crate::decode::TrackAudio;
 use crate::engine::{Command, DECKS, Offline, Snapshot};
@@ -389,8 +389,11 @@ pub struct Edit {
     /// The mixer as recording started (its settings; the decks are emptied
     /// at once).
     snapshot: Arc<Snapshot>,
-    tracks: HashMap<PathBuf, Arc<TrackAudio>>,
-    stems: HashMap<StemsSource, Arc<StemLayers>>,
+    pub(crate) tracks: HashMap<PathBuf, Arc<TrackAudio>>,
+    pub(crate) stems: HashMap<StemsSource, Arc<StemLayers>>,
+    /// Stems no clip changes the parts of yet, left on disk (where): the
+    /// deck plays the track as it is. Loaded when a clip's parts change.
+    on_disk: HashMap<StemsSource, PathBuf>,
     warnings: Vec<String>,
 }
 
@@ -850,6 +853,7 @@ impl Edit {
             snapshot: Arc::new(s.copy(&*s.snapshot)?),
             tracks: s.tracks.clone(),
             stems: s.stems.clone(),
+            on_disk: HashMap::new(),
             warnings: s.warnings.clone(),
         })
     }
@@ -865,7 +869,7 @@ impl Edit {
             folder: path.parent().map(Path::to_path_buf),
         };
         OPENED.set(Some(opened));
-        let read = (|| -> Result<Saved> {
+        let read = (|| -> Result<(Saved, HashMap<StemsSource, PathBuf>)> {
             let saved: Saved = serde_json::from_reader(BufReader::new(file))?;
             if saved.format != FORMAT {
                 bail!("not an edit");
@@ -873,16 +877,31 @@ impl Edit {
             if saved.version > VERSION {
                 bail!("made by a newer version of the app");
             }
+            // Stems only where a clip turns a part up or down: with every
+            // part full the deck plays the track itself (the same sound), so
+            // those stay on disk, not in memory.
+            let used = |source: &StemsSource| {
+                saved.clips.iter().any(|c| c.stems.as_ref() == Some(source) && changes_parts(c))
+            };
+            let folder = path.parent();
+            let mut on_disk = HashMap::new();
             for clip in &saved.clips {
                 open_track(&clip.track)?;
                 if let Some(stems) = &clip.stems {
-                    open_stems(stems)?;
+                    match stems_on_disk(folder, stems).filter(|_| !used(stems)) {
+                        Some(dir) => {
+                            on_disk.insert(stems.clone(), dir);
+                        }
+                        None => {
+                            open_stems(stems)?;
+                        }
+                    }
                 }
             }
-            Ok(saved)
+            Ok((saved, on_disk))
         })();
         let opened = OPENED.take();
-        let saved = read.with_context(|| format!("reading {}", path.display()))?;
+        let (saved, on_disk) = read.with_context(|| format!("reading {}", path.display()))?;
         let opened = opened.ok_or_else(|| anyhow!("the tracks were not kept"))?;
         Ok(Self {
             rate: saved.rate,
@@ -898,6 +917,7 @@ impl Edit {
             snapshot: Arc::from(saved.snapshot),
             tracks: opened.tracks,
             stems: opened.stems,
+            on_disk,
             warnings: opened.warnings,
         })
     }
@@ -1077,6 +1097,29 @@ impl Edit {
     /// is now.
     pub fn shift_range(&mut self, deck: usize, from: u64, to: u64, by: i64) -> Result<(u64, u64)> {
         let (from, to) = (self.snap(from), self.snap(to));
+        // Before the set's start: what would be before it is cut off (as a
+        // DAW does), the rest starts at 0.
+        let before_start = -(from as i64 + by);
+        if before_start > 0 && from < to {
+            let cut = self.snap(from + before_start as u64);
+            if cut >= to {
+                bail!("it would all be before the start");
+            }
+            let undo = self.clips.clone();
+            for at in [cut, to] {
+                if self.clip_at(deck, at).is_some_and(|i| self.clips[i].at < at) {
+                    self.split(deck, at)?;
+                }
+            }
+            self.clips.retain(|c| !(c.deck == deck && from <= c.at && c.end() <= cut));
+            return match self.shift_range(deck, cut, to, -(cut as i64)) {
+                Ok(done) => Ok(done),
+                Err(err) => {
+                    self.clips = undo;
+                    Err(err)
+                }
+            };
+        }
         let new_from = self.snap((from as i64 + by).max(0) as u64);
         if from >= to || new_from == from {
             return Ok((from, to));
@@ -1290,6 +1333,8 @@ impl Edit {
                     .ok_or_else(|| anyhow!("{} is not open", clip.track.display()))?;
                 events.push((at, 2, command(Command::Load { deck, audio })));
                 let stems = match &clip.stems {
+                    // Left on disk: no part changed, the track as it is.
+                    Some(source) if !self.stems.contains_key(source) && self.on_disk.contains_key(source) => None,
                     Some(source) => Some(self.stems.get(source).cloned().ok_or_else(|| {
                         anyhow!("stems for {} are not open", clip.track.display())
                     })?),
@@ -1405,10 +1450,79 @@ struct Backup {
     lanes: Vec<(Setting, Vec<Point>)>,
     beat_fx: Vec<(u64, BeatFxParams)>,
     markers: Vec<u64>,
+    /// Sync's state (who is master) among the rest; older backups have none.
+    #[serde(default)]
+    others: Option<Vec<(u64, serde_json::Value)>>,
 }
 
 /// What the editor asks of a session, answered by the clips.
 impl Edit {
+    /// Makes `master` the sync master from `from` to `to` (`None`: sync
+    /// off there; a deck made master syncs). What was before and after
+    /// stays; sync has to be done again for the decks to follow.
+    pub(crate) fn set_master(&mut self, from: u64, to: u64, master: Option<usize>) {
+        let (from, to) = (self.snap(from), self.snap(to).min(self.length));
+        if from >= to {
+            return;
+        }
+        let made = |(_, mut synced): SyncSet| {
+            if let Some(d) = master.filter(|&d| d < DECKS) {
+                synced[d] = true;
+            }
+            (master, synced)
+        };
+        let starting = made(sync_at(&self.others, from));
+        let after = sync_at(&self.others, to);
+        let set_at_end = self.others.iter().any(|(at, v)| *at == to && sync_state(v).is_some());
+        for (_, v) in self.others.iter_mut().filter(|(at, _)| from <= *at && *at < to) {
+            if let Some(s) = sync_state(v) {
+                *v = sync_value(made(s));
+            }
+        }
+        self.others.retain(|(at, v)| !(*at == from && sync_state(v).is_some()));
+        self.others.push((from, sync_value(starting)));
+        if !set_at_end && to < self.length {
+            self.others.push((to, sync_value(after)));
+        }
+        self.others.sort_by_key(|(at, _)| *at);
+    }
+
+    /// Adds a point to the master's lane at `at`: the master stays, but can
+    /// change from there. False if there is one already (or at the ends).
+    pub(crate) fn add_master_point(&mut self, at: u64) -> bool {
+        let at = self.snap(at);
+        if at == 0 || at >= self.length || self.others.iter().any(|(t, v)| *t == at && sync_state(v).is_some()) {
+            return false;
+        }
+        let state = sync_at(&self.others, at);
+        self.others.push((at, sync_value(state)));
+        self.others.sort_by_key(|(at, _)| *at);
+        true
+    }
+
+    /// Moves the master's point at `from` to `to`, kept between the points
+    /// beside it; returns where it went.
+    pub(crate) fn move_master_point(&mut self, from: u64, to: u64) -> u64 {
+        let block = u64::from(self.block.max(1));
+        let points: Vec<u64> =
+            self.others.iter().filter(|(_, v)| sync_state(v).is_some()).map(|(at, _)| *at).collect();
+        let before = points.iter().copied().filter(|&p| p < from).max().map_or(block, |p| p + block);
+        let after = points.iter().copied().filter(|&p| p > from).min().unwrap_or(self.length).saturating_sub(block);
+        let to = self.snap(to).clamp(before, after.max(before));
+        for (at, v) in &mut self.others {
+            if *at == from && sync_state(v).is_some() {
+                *at = to;
+            }
+        }
+        self.others.sort_by_key(|(at, _)| *at);
+        to
+    }
+
+    /// Takes the master's point at `at` away: what was before it goes on.
+    pub(crate) fn remove_master_point(&mut self, at: u64) {
+        self.others.retain(|(t, v)| !(*t == at && sync_state(v).is_some()));
+    }
+
     /// The clips as the editor draws them: each a span of its own,
     /// played throughout.
     pub(crate) fn spans(&self) -> Vec<super::TrackSpan> {
@@ -1421,6 +1535,7 @@ impl Edit {
                 to: c.end(),
                 playing: vec![(c.at, c.end())],
                 scratch: c.scratch,
+                source: c.looped.is_none().then_some(c.source),
             })
             .collect()
     }
@@ -1487,18 +1602,24 @@ impl Edit {
     pub(crate) fn play_limits(&self, deck: usize, from: u64, to: u64) -> Option<(i64, i64)> {
         let i = self.find(deck, from, to)?;
         let clip = &self.clips[i];
-        let before = self.on_deck(deck).filter(|(_, c)| c.end() <= clip.at).map(|(_, c)| c.end()).max().unwrap_or(0);
+        let before = self.on_deck(deck).filter(|(_, c)| c.end() <= clip.at).map(|(_, c)| c.end()).max();
         let after = self.on_deck(deck).filter(|(_, c)| c.at >= clip.end()).map(|(_, c)| c.at).min();
         let later = after.map_or(i64::MAX / 4, |a| (a - clip.end()) as i64);
-        Some((-((clip.at - before) as i64), later))
+        // The first on its deck can go past the set's start (cut off there),
+        // keeping a block of it.
+        let earlier = match before {
+            Some(end) => clip.at - end,
+            None => clip.end().saturating_sub(u64::from(self.block.max(1))),
+        };
+        Some((-(earlier as i64), later))
     }
 
     pub(crate) fn move_play(&mut self, deck: usize, from: u64, to: u64, by: i64) -> (u64, u64) {
         let Some((least, most)) = self.play_limits(deck, from, to) else { return (from, to) };
         let Some(i) = self.find(deck, from, to) else { return (from, to) };
-        let length = self.clips[i].length;
         match self.move_clip(i, by.clamp(least, most)) {
-            Ok(at) => (at, at + length),
+            // Shorter if it went past the start.
+            Ok(at) => (at, self.on_deck(deck).find(|(_, c)| c.at == at).map_or(at, |(_, c)| c.end())),
             Err(_) => (from, to),
         }
     }
@@ -1622,6 +1743,48 @@ impl Edit {
             levels.dedup_by(|b, a| a.1 == b.1);
             clip.stem_levels = if levels == [(0, ALL_STEMS)] { Vec::new() } else { levels };
         }
+        self.load_used_stems();
+    }
+
+    /// Lets go of the stems no clip changes the parts of, kept on disk
+    /// (beside `folder`, the session's) to load when needed: the memory
+    /// they took is free.
+    pub(crate) fn leave_unused_stems(&mut self, folder: Option<&Path>) {
+        let unused: Vec<StemsSource> = self
+            .stems
+            .keys()
+            .filter(|s| !self.clips.iter().any(|c| c.stems.as_ref() == Some(*s) && changes_parts(c)))
+            .cloned()
+            .collect();
+        for source in unused {
+            if let Some(dir) = stems_on_disk(folder, &source) {
+                self.stems.remove(&source);
+                self.on_disk.insert(source, dir);
+            }
+        }
+    }
+
+    /// Loads the stems left on disk that a clip now changes the parts of.
+    fn load_used_stems(&mut self) {
+        let wanted: Vec<StemsSource> = self
+            .clips
+            .iter()
+            .filter(|c| changes_parts(c))
+            .filter_map(|c| c.stems.clone())
+            .filter(|s| !self.stems.contains_key(s) && self.on_disk.contains_key(s))
+            .collect();
+        for source in wanted {
+            let Some(dir) = self.on_disk.get(&source) else { continue };
+            match StemLayers::load(dir) {
+                Ok(stems) => {
+                    let stems = Arc::new(stems);
+                    remember_stems(&stems, source.clone());
+                    self.stems.insert(source.clone(), stems);
+                    self.on_disk.remove(&source);
+                }
+                Err(err) => self.warnings.push(format!("stems not loaded: {err:#}")),
+            }
+        }
     }
 
     /// Gives the clip on `deck` at `at` `stems` (remembered with their
@@ -1665,12 +1828,16 @@ impl Edit {
             lanes: self.lanes.iter().map(|(s, p)| (*s, p.clone())).collect(),
             beat_fx: self.beat_fx.clone(),
             markers: self.markers.clone(),
+            others: Some(self.others.clone()),
         })?)
     }
 
     pub(crate) fn restore(&mut self, backup: &[u8]) -> Result<()> {
         let b: Backup = serde_json::from_slice(backup)?;
         (self.length, self.clips, self.beat_fx, self.markers) = (b.length, b.clips, b.beat_fx, b.markers);
+        if let Some(others) = b.others {
+            self.others = others;
+        }
         self.lanes = b.lanes.into_iter().collect();
         Ok(())
     }
@@ -1713,6 +1880,36 @@ impl Clip {
             opening_from: 0.0,
         }
     }
+}
+
+/// Whether a clip turns any of its stems' parts up or down.
+fn changes_parts(clip: &Clip) -> bool {
+    clip.stem_levels.iter().any(|(_, levels)| levels.iter().any(|&l| l != 1.0))
+}
+
+/// Sync's state as recorded: the master, and the decks synced.
+type SyncSet = (Option<usize>, [bool; DECKS]);
+
+/// A recorded command's sync state, if it is one.
+fn sync_state(v: &serde_json::Value) -> Option<SyncSet> {
+    let s = v.get("SyncState")?;
+    let master = serde_json::from_value(s.get("master")?.clone()).ok()?;
+    let synced = serde_json::from_value(s.get("synced")?.clone()).ok()?;
+    Some((master, synced))
+}
+
+fn sync_value((master, synced): SyncSet) -> serde_json::Value {
+    serde_json::json!({ "SyncState": { "master": master, "synced": synced } })
+}
+
+/// Sync's state at `t`: the last one set by then (none set: off).
+fn sync_at(others: &[(u64, serde_json::Value)], t: u64) -> SyncSet {
+    others
+        .iter()
+        .filter(|(at, _)| *at <= t)
+        .filter_map(|(_, v)| sync_state(v))
+        .next_back()
+        .unwrap_or((None, [false; DECKS]))
 }
 
 /// Takes a lane's points from `from` to `to` out, keeping its value after
@@ -1821,6 +2018,29 @@ mod tests {
         assert!(worst(&a[from..to], &b[from..to]) < 1e-3, "{}", worst(&a[from..to], &b[from..to]));
         // Nothing heard before it.
         assert!(a[..from].iter().all(|s| s.abs() < 1e-6));
+    }
+
+    /// A deck's first clip moved past the set's start: the part before it
+    /// is cut off, the rest plays from 0 as it did; it can't go all the way.
+    #[test]
+    fn a_clip_moved_past_the_start_is_cut_there() {
+        let (session, _) = deck_session("edit-past-start", vec![cue(2, 1.0), play(10, true), play(200, false)]);
+        let mut edit = Edit::from_session(&session).unwrap();
+        let first = edit.clips.iter().position(|c| c.deck == 0).unwrap();
+        let (at, end, source) = (edit.clips[first].at, edit.clips[first].end(), edit.clips[first].source);
+        assert_eq!(at, 10 * BLOCK);
+        // 30 blocks earlier: 20 of it go before the start.
+        let (least, _) = edit.play_limits(0, at, end).unwrap();
+        assert!(least < -(at as i64), "only to the start: {least}");
+        let (from, to) = edit.move_play(0, at, end, -(30 * BLOCK as i64));
+        assert_eq!((from, to), (0, end - 30 * BLOCK));
+        let clip = edit.clips.iter().find(|c| c.deck == 0).unwrap();
+        let secs = (20 * BLOCK) as f64 / 48_000.0;
+        assert!((clip.source - (source + secs)).abs() < 1e-6, "{} vs {}", clip.source, source + secs);
+        // Past its end: refused, nothing changed.
+        let before = edit.clips.clone();
+        assert!(edit.shift_range(0, 0, to, -((to + BLOCK) as i64)).is_err());
+        assert_eq!(edit.clips.len(), before.len());
     }
 
     /// Split in two, a clip sounds the same; its moves go with each half.

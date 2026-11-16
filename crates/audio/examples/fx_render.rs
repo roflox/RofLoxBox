@@ -28,8 +28,8 @@ fn main() -> anyhow::Result<()> {
             target: FxTarget::Master,
             release: false,
         });
-        let mut samples = Vec::with_capacity(audio.samples.len());
-        for frame in audio.samples.chunks_exact(2) {
+        let mut samples = Vec::with_capacity(audio.len());
+        for frame in audio.to_f32().chunks_exact(2) {
             let y = fx.process([frame[0], frame[1]]);
             samples.extend_from_slice(&y);
         }

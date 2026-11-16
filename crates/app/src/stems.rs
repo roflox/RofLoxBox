@@ -35,7 +35,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// On Windows, runs a command-line tool without opening a console window
-/// for it (its output is read through pipes anyway).
+/// for it (its output is read through pipes anyway): the stems engine,
+/// curl, tasklist.
 pub fn no_window(command: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
@@ -499,7 +500,8 @@ fn layers(
     let all: Vec<&deckhand_audio::TrackAudio> = decoded.iter().map(|(_, audio)| audio).collect();
     let gains = deckhand_audio::fit_gains(track, &all);
     for ((_, audio), gain) in decoded.iter_mut().zip(gains) {
-        audio.samples.iter_mut().for_each(|s| *s *= gain);
+        let scaled = audio.to_f32().iter().map(|s| s * gain).collect();
+        *audio = deckhand_audio::TrackAudio::new(audio.sample_rate, scaled);
     }
     let part =
         |is: &dyn Fn(&str) -> bool| decoded.iter().find(|(name, _)| is(name)).map(|(_, a)| a);
@@ -867,12 +869,9 @@ impl Live {
         let work = self.dir.with_extension("work").join(format!("piece-{first}"));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-        let piece = deckhand_audio::TrackAudio {
-            sample_rate: rate,
-            samples: self.track.samples[from * 2..to * 2].to_vec(),
-        };
+        let piece = deckhand_audio::TrackAudio::new(rate, (from * 2..to * 2).map(|i| self.track.sample(i)).collect());
         let wav = work.join("input.wav");
-        deckhand_audio::write_wav_file(&wav, rate, &piece.samples)?;
+        deckhand_audio::write_wav_file(&wav, rate, &piece.to_f32())?;
         let output = work.join("out");
         let model = &self.job.model;
         let by_helper = match helper.as_mut().filter(|h| h.model == *model) {
@@ -1156,7 +1155,7 @@ fn separate(
     std::fs::create_dir_all(&output).with_context(|| format!("creating {}", output.display()))?;
     let audio = deckhand_audio::decode_file(input)?;
     let wav = work.join("input.wav");
-    deckhand_audio::write_wav_file(&wav, audio.sample_rate, &audio.samples)?;
+    deckhand_audio::write_wav_file(&wav, audio.sample_rate, &audio.to_f32())?;
     drop(audio);
 
     let found = run_model(model, &wav, &output, &work, running, progress)?;
@@ -1456,10 +1455,11 @@ fn mix(files: &[&Path], out: &Path) -> Result<()> {
             bail!("the stems have different sample rates");
         }
         rate = Some(audio.sample_rate);
-        if sum.len() < audio.samples.len() {
-            sum.resize(audio.samples.len(), 0.0);
+        let samples = audio.to_f32();
+        if sum.len() < samples.len() {
+            sum.resize(samples.len(), 0.0);
         }
-        for (s, v) in sum.iter_mut().zip(&audio.samples) {
+        for (s, v) in sum.iter_mut().zip(samples.iter()) {
             *s += v;
         }
     }
@@ -1684,8 +1684,8 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         )
         .unwrap();
         let vocals = deckhand_audio::decode_file(&kept["vocals"]).unwrap();
-        assert_eq!(vocals.samples.len(), original.samples.len());
-        assert!(vocals.samples.iter().zip(&original.samples).all(|(v, o)| (v - o).abs() < 1e-4));
+        assert_eq!(vocals.len(), original.len());
+        assert!(vocals.to_f32().iter().zip(original.to_f32().iter()).all(|(v, o)| (v - o).abs() < 1e-4));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1771,8 +1771,8 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         let made = deckhand_audio::decode_file(&out).unwrap();
         let original = deckhand_audio::decode_file(&input).unwrap();
         assert_eq!(made.sample_rate, 48_000);
-        assert_eq!(made.samples.len(), original.samples.len());
-        for (m, o) in made.samples.iter().zip(&original.samples).step_by(997) {
+        assert_eq!(made.len(), original.len());
+        for (m, o) in made.to_f32().iter().zip(original.to_f32().iter()).step_by(997) {
             assert!((m - 2.0 * o).abs() < 1e-4, "{m} vs {o}");
         }
         let _ = std::fs::remove_dir_all(&root);

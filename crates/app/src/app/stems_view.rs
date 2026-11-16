@@ -109,7 +109,7 @@ impl DeckhandApp {
         if !on {
             self.stop_live_stems();
         } else if self.config.prefs.stems_on_load {
-            for d in 0..self.deck_count() {
+            for d in 0..deckhand_audio::DECKS {
                 if matches!(self.decks[d].stems, Stems::None | Stems::Failed) {
                     self.separate_deck(d);
                 }
@@ -129,7 +129,7 @@ impl DeckhandApp {
 
     /// Newly loaded tracks get separated, when Preferences say so.
     fn separate_new_tracks(&mut self) {
-        for d in 0..self.deck_count() {
+        for d in 0..deckhand_audio::DECKS {
             let path = self.decks[d].track.as_ref().map(|t| t.path.clone());
             if path == self.stems_for[d] {
                 continue;

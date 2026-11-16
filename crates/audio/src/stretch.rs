@@ -172,7 +172,7 @@ mod tests {
                 [v, v]
             })
             .collect();
-        TrackAudio { sample_rate: rate, samples }
+        TrackAudio::new(rate, samples)
     }
 
     /// Zero crossings per second of the left channel.

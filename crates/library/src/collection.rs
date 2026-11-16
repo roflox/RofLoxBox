@@ -172,6 +172,10 @@ pub struct Cue {
     pub color: Option<[u8; 3]>,
     #[serde(default)]
     pub name: String,
+    /// A memory loop that is active: it loops by itself when playback gets
+    /// there (one per track, like rekordbox's).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -844,6 +848,7 @@ mod tests {
             end: Some(16.5),
             color: Some([1, 2, 3]),
             name: "Drop".into(),
+            active: false,
         };
         c.update_track(song, |t| {
             t.cues = vec![cue.clone()];

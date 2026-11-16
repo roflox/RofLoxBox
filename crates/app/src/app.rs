@@ -471,6 +471,12 @@ impl DeckhandApp {
         if self.config.four_decks { DECKS } else { 2 }
     }
 
+    /// The decks on screen: all four, or with two the active one on each
+    /// side (1 or 3, 2 or 4; the other plays on unseen).
+    fn shown_decks(&self) -> Vec<usize> {
+        if self.config.four_decks { (0..DECKS).collect() } else { self.active_decks.to_vec() }
+    }
+
     /// (Re)starts the audio output with the configured options; loaded
     /// tracks carry on where they were.
     fn start_engine(&mut self, device: Option<String>) {
@@ -526,8 +532,21 @@ impl DeckhandApp {
                 self.engine_error = None;
                 self.config.audio_device = device;
                 self.config.save();
+                self.start_mirror();
             }
             Err(err) => self.engine_error = Some(format!("{err:#}")),
+        }
+    }
+
+    /// Plays the master on the chosen second output too (Preferences →
+    /// Audio), or not.
+    fn start_mirror(&mut self) {
+        let Some(engine) = self.engine.as_mut() else { return };
+        // Not onto the output itself (heard twice, out of step).
+        let wanted = self.config.mirror_device.clone().filter(|d| *d != engine.info().device);
+        if let Err(err) = engine.mirror_to(wanted.as_deref()) {
+            self.status = Some(format!("Can't play the master on {} too: {err:#}", wanted.unwrap_or_default()));
+            let _ = engine.mirror_to(None);
         }
     }
 
@@ -605,7 +624,7 @@ impl DeckhandApp {
             return;
         }
         let Some(engine) = &self.engine else { return };
-        self.decks[deck].double_of = (0..self.deck_count()).find(|&d| {
+        self.decks[deck].double_of = (0..DECKS).find(|&d| {
             d != deck
                 && engine.is_playing(d)
                 && self.decks[d]
@@ -847,7 +866,8 @@ impl DeckhandApp {
             let free = |d: &usize| {
                 self.decks[*d].track.is_some() && !self.decks[*d].sync && engine.is_playing(*d)
             };
-            let decks = 0..self.deck_count();
+            // Every deck: one not on screen (two decks shown) plays too.
+            let decks = 0..DECKS;
             decks
                 .clone()
                 .filter(free)
@@ -904,7 +924,7 @@ impl DeckhandApp {
 
     /// Each deck's gain in the mix while it plays a track (`None` otherwise).
     fn playing_gains(&self) -> Vec<Option<f32>> {
-        (0..self.deck_count()).map(|d| self.in_mix(d, -1.0).then(|| self.mix_gain(d))).collect()
+        (0..DECKS).map(|d| self.in_mix(d, -1.0).then(|| self.mix_gain(d))).collect()
     }
 
     /// Makes the loudest deck in the mix (other than `from`) the master.
@@ -992,6 +1012,37 @@ impl DeckhandApp {
         }
     }
 
+    /// A synced deck whose waveform was let go of: onto the nearest beat of
+    /// the master, or for the master itself, of a synced deck playing
+    /// (whose beat it then keeps), playing or paused.
+    fn snap_onto_beat(&mut self, deck: usize) {
+        let master = self.master_deck();
+        let Some(engine) = self.engine.as_mut() else { return };
+        let reference = match master {
+            Some(master) if master != deck => Some(master),
+            _ => (0..DECKS).find(|&d| {
+                d != deck && self.decks[d].sync && self.decks[d].track.is_some() && engine.is_playing(d)
+            }),
+        };
+        let Some(reference) = reference else { return };
+        let (Some(other), Some(track)) = (self.decks[reference].track.as_ref(), self.decks[deck].track.as_ref())
+        else {
+            return;
+        };
+        if track.bpm <= 0.0 || other.bpm <= 0.0 {
+            return;
+        }
+        let beat = track.beat_at(engine.position_secs(deck));
+        let mut phase = beat.fract() - other.beat_at(engine.position_secs(reference)).fract();
+        phase -= phase.round();
+        if phase.abs() > 1e-4 {
+            let seconds = track.time_of_beat(beat - phase) - track.time_of_beat(beat);
+            engine.send(Command::SyncShift { deck, seconds });
+        }
+        let target = &mut self.decks[deck];
+        (target.phase_offset, target.rephase) = (0.0, false);
+    }
+
     fn update_sync(&mut self) {
         self.update_master();
         let master = self.master_deck();
@@ -1022,7 +1073,7 @@ impl DeckhandApp {
                 let due = self.decks[deck].snap_at.is_some_and(|at| Instant::now() >= at);
                 if due && settled {
                     self.decks[deck].snap_at = None;
-                    self.follow_master(deck, playing);
+                    self.snap_onto_beat(deck);
                     continue;
                 }
                 self.follow_master(deck, check_drift && playing);
@@ -1077,6 +1128,11 @@ impl DeckhandApp {
     ) {
         use DeckAction as A;
         let pressed = matches!(value, Value::Pressed(true));
+        // A two-deck controller (no layers for decks 3 and 4) with two
+        // decks on screen: each side works the deck shown there (1 or 3,
+        // 2 or 4).
+        let layers = self.controller.mapping().bindings.iter().any(|b| matches!(b.action, Action::Deck(d, _) if d >= 2));
+        let d = if !layers && !self.config.four_decks { self.active_decks[d % 2] } else { d };
         // The deck a control layer is on becomes that side's active deck;
         // mixer channel controls do not switch layers. Controllers with DECK
         // buttons say so themselves: other messages arriving just after a
@@ -2385,7 +2441,11 @@ impl DeckhandApp {
         let (left_waves, right_waves) = channels.split_at(channels.len() / 2);
         let (left_waves, right_waves) = (left_waves.to_vec(), right_waves.to_vec());
         let (left, right): (Vec<usize>, Vec<usize>) =
-            if self.config.four_decks { (vec![0, 2], vec![1, 3]) } else { (vec![0], vec![1]) };
+            if self.config.four_decks {
+                (vec![0, 2], vec![1, 3])
+            } else {
+                (vec![self.active_decks[0]], vec![self.active_decks[1]])
+            };
         let rect = ui
             .allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
                 ui.set_width(size.x);
@@ -2525,11 +2585,12 @@ impl DeckhandApp {
         });
     }
 
-    /// Mixer channels left to right: 1 2 with two decks; with four, the
-    /// connected controller's order or the chosen default.
+    /// Mixer channels left to right: the two decks shown (1 or 3, 2 or
+    /// 4) with two; with four, the connected controller's order or the
+    /// chosen default.
     fn mixer_channels(&self) -> Vec<usize> {
         if !self.config.four_decks {
-            return vec![0, 1];
+            return self.active_decks.to_vec();
         }
         let order = self.config.channel_order;
         order.iter().map(|&ch| ch.clamp(1, DECKS) - 1).collect()
@@ -2973,8 +3034,7 @@ impl DeckhandApp {
                 {
                     let dir = crate::config::samples_dir();
                     let _ = std::fs::create_dir_all(&dir);
-                    let opener = if cfg!(windows) { "explorer" } else { "open" };
-                    let _ = std::process::Command::new(opener).arg(&dir).spawn();
+                    crate::app::collection_view::open_folder(&dir);
                 }
             }
         });
@@ -3054,7 +3114,7 @@ impl DeckhandApp {
         let mut usb_edit = None;
         let mut load: Option<(u32, usize)> = None;
         let mut double_clicked = None;
-        let deck_count = self.deck_count();
+        let shown = self.shown_decks();
         let rows = self.usb_rows();
         let loaded: Vec<Option<u32>> = self
             .decks
@@ -3074,7 +3134,7 @@ impl DeckhandApp {
             .tour(Target::LibrarySearch);
             if let Some(id) = self.selected {
                 ui.separator();
-                for deck in 0..deck_count {
+                for &deck in &shown {
                     if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                         load = Some((id, deck));
                     }
@@ -3106,7 +3166,7 @@ impl DeckhandApp {
                     &options,
                     &mut |ui, row| {
                         use library_tree::UsbEdit;
-                        for deck in 0..deck_count {
+                        for &deck in &shown {
                             if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                                 context_load = Some((row.id, deck));
                                 ui.close();
@@ -3205,9 +3265,9 @@ impl DeckhandApp {
 
     /// A deck to load into by double-click: an empty one, else one not playing.
     fn free_deck(&self, loaded: &[Option<u32>]) -> Option<usize> {
-        let count = self.deck_count();
-        (0..count).find(|&d| loaded[d].is_none() && self.decks[d].track.is_none()).or_else(|| {
-            (0..count).find(|&d| !self.engine.as_ref().is_some_and(|e| e.is_playing(d)))
+        let shown = self.shown_decks();
+        shown.iter().copied().find(|&d| loaded[d].is_none() && self.decks[d].track.is_none()).or_else(|| {
+            shown.iter().copied().find(|&d| !self.engine.as_ref().is_some_and(|e| e.is_playing(d)))
         })
     }
 
@@ -3291,6 +3351,31 @@ impl DeckhandApp {
                         }
                     }
                 });
+                ui.end_row();
+
+                ui.label("Also play on").on_hover_text(
+                    "The master on a second output as well, like the computer's speakers while the \
+                     controller is the output (a few hundredths of a second behind it)",
+                );
+                let main = info.as_ref().map(|i| i.device.clone());
+                let shown = self.config.mirror_device.clone().unwrap_or_else(|| "Off".to_owned());
+                let mut mirror = None;
+                egui::ComboBox::from_id_salt("mirror device").selected_text(shown).width(240.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(self.config.mirror_device.is_none(), "Off").clicked() {
+                        mirror = Some(None);
+                    }
+                    for name in Engine::output_devices().into_iter().filter(|n| Some(n) != main.as_ref()) {
+                        let on = self.config.mirror_device.as_deref() == Some(&name);
+                        if ui.selectable_label(on, &name).clicked() {
+                            mirror = Some(Some(name));
+                        }
+                    }
+                });
+                if let Some(device) = mirror {
+                    self.config.mirror_device = device;
+                    self.config.save();
+                    self.start_mirror();
+                }
                 ui.end_row();
 
                 ui.label("Sample rate");
@@ -3465,8 +3550,7 @@ impl DeckhandApp {
                 {
                     let dir = crate::config::extra_mapping_dir();
                     let _ = std::fs::create_dir_all(&dir);
-                    let opener = if cfg!(windows) { "explorer" } else { "open" };
-                    let _ = std::process::Command::new(opener).arg(&dir).spawn();
+                    crate::app::collection_view::open_folder(&dir);
                 }
             });
                 if let Some(notice) = &self.controller.notice {

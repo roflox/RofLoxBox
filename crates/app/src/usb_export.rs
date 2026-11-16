@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use anyhow::{Context, Result};
 use deckhand_formats::anlz::{
     AnlzFile, Beat, BeatGrid, Cue as AnlzCue, CueKind as AnlzCueKind, CueList, CueListKind,
-    HotCueColor, Section, Waveform, WaveformKind,
+    CueStatus, HotCueColor, Section, Waveform, WaveformKind,
 };
 use deckhand_formats::pdb::{
     Album, Artist, Database, DatabaseWriter, Genre, Key, Label, PlaylistTables, Track, TrackExtras,
@@ -448,12 +448,25 @@ fn rekordbox_analysis(
             }
         }
     };
+    // The basic memory lists: the collection's, with its active loop.
+    let basic = |file: &mut AnlzFile| {
+        for section in &mut file.sections {
+            if let Section::Cues(list) = section
+                && !list.extended
+                && list.kind == CueListKind::Memory
+            {
+                list.cues = basic_memory(&track.cues, &list.cues);
+            }
+        }
+    };
     set_path(&mut dat);
+    basic(&mut dat);
     if grid_changed {
         replace_grid(&mut dat, grid);
     }
     let ext = ext.map(|mut ext| {
         set_path(&mut ext);
+        basic(&mut ext);
         if grid_changed {
             // Its summary of the old grid would no longer match.
             ext.sections.retain(|s| !matches!(s, Section::ExtendedBeatGrid(_)));
@@ -573,6 +586,46 @@ fn collection_cues(track: &CollectionTrack, original: &[AnlzCue]) -> (CueList, C
     (list(CueListKind::Hot, hot), list(CueListKind::Memory, memory))
 }
 
+/// The collection's memory cues and loops as a basic list's entries, the
+/// active loop flagged there (where players and deckhand read it from);
+/// entries already in the list keep their details.
+fn basic_memory(cues: &[deckhand_library::Cue], original: &[AnlzCue]) -> Vec<AnlzCue> {
+    let mut cues: Vec<AnlzCue> = cues
+        .iter()
+        .filter(|c| c.kind == CueKind::Memory)
+        .map(|cue| {
+            let time_ms = (cue.start * 1000.0).round().max(0.0) as u32;
+            let loop_end_ms = cue.end.map(|end| (end * 1000.0).round().max(0.0) as u32);
+            let known = original.iter().find(|o| {
+                o.hot_cue.is_none()
+                    && o.time_ms.abs_diff(time_ms) <= 1
+                    && o.loop_end_ms.is_some() == loop_end_ms.is_some()
+            });
+            let mut entry = known.cloned().unwrap_or_else(|| AnlzCue {
+                hot_cue: None,
+                kind: if loop_end_ms.is_some() { AnlzCueKind::Loop } else { AnlzCueKind::Cue },
+                time_ms,
+                loop_end_ms,
+                status: None,
+                color_id: None,
+                loop_beats: None,
+                comment: None,
+                hot_cue_color: None,
+                order: None,
+                trailer: Vec::new(),
+            });
+            entry.loop_end_ms = loop_end_ms;
+            let active = cue.active && loop_end_ms.is_some();
+            entry.status = Some(if active { CueStatus::ActiveLoop } else { CueStatus::Enabled });
+            // Linked again in their new order.
+            entry.order = None;
+            entry
+        })
+        .collect();
+    cues.sort_by_key(|c| c.time_ms);
+    cues
+}
+
 /// `.DAT` and `.EXT` worked out from the audio, in rekordbox's section order.
 fn own_analysis(
     audio: &deckhand_audio::TrackAudio,
@@ -582,6 +635,8 @@ fn own_analysis(
 ) -> (AnlzFile, AnlzFile) {
     let peaks = deckhand_audio::peak_waveform(audio);
     let bands = deckhand_audio::band_waveform(audio);
+    // As floats, once, for rekordbox's analyses.
+    let samples = audio.to_f32();
     let top = peaks.iter().copied().fold(0f32, f32::max).max(1e-6);
     let level = |i: usize| peaks.get(i).copied().unwrap_or(0.0) / top;
     let highs = |i: usize| bands.get(i).map_or(0.0, |b| b[2]);
@@ -608,7 +663,7 @@ fn own_analysis(
     // the peaks.
     let (preview, tiny): (Vec<u8>, Vec<u8>) = match method {
         AnalysisMethod::Rekordbox => {
-            deckhand_analysis::preview::preview(&audio.samples, audio.sample_rate)
+            deckhand_analysis::preview::preview(&samples, audio.sample_rate)
         }
         AnalysisMethod::Deckhand => (
             squeeze(400).into_iter().map(|(h, w)| mono(h, w)).collect(),
@@ -623,7 +678,7 @@ fn own_analysis(
     // from the bands.
     let color: Vec<u16> = match method {
         AnalysisMethod::Rekordbox => {
-            deckhand_analysis::waveform::color_detail(&audio.samples, audio.sample_rate)
+            deckhand_analysis::waveform::color_detail(&samples, audio.sample_rate)
         }
         AnalysisMethod::Deckhand => (0..peaks.len())
             .map(|i| {
@@ -638,7 +693,7 @@ fn own_analysis(
     // columns as the colour one.
     let detail: Vec<u8> = match method {
         AnalysisMethod::Rekordbox => {
-            deckhand_analysis::waveform::mono_detail(&audio.samples, audio.sample_rate)
+            deckhand_analysis::waveform::mono_detail(&samples, audio.sample_rate)
         }
         AnalysisMethod::Deckhand => (0..color.len()).map(|i| mono(level(i), highs(i))).collect(),
     };
@@ -658,7 +713,12 @@ fn own_analysis(
         waveform(WaveformKind::Preview, 1, preview),
         waveform(WaveformKind::TinyPreview, 1, tiny),
         empty(CueListKind::Hot),
-        empty(CueListKind::Memory),
+        Section::Cues(CueList {
+            kind: CueListKind::Memory,
+            extended: false,
+            memory_count: u32::MAX,
+            cues: basic_memory(&track.cues, &[]),
+        }),
     ]);
     let mut ext = vec![
         Section::Path(file_path.to_owned()),
@@ -672,7 +732,7 @@ fn own_analysis(
     // The colour overview, which only the rekordbox-compatible analysis has.
     if method == AnalysisMethod::Rekordbox {
         let overview =
-            deckhand_analysis::waveform::color_overview(&audio.samples, audio.sample_rate);
+            deckhand_analysis::waveform::color_overview(&samples, audio.sample_rate);
         let data = overview.iter().flatten().map(|&b| b as u8).collect();
         ext.push(waveform(WaveformKind::ColorPreview, 6, data));
     }
@@ -682,6 +742,46 @@ fn own_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The basic memory list holds the collection's memory cues and loops
+    /// in order, the active loop flagged, entries rekordbox wrote kept.
+    #[test]
+    fn basic_memory_list_flags_the_active_loop() {
+        let cue = |start: f64, end: Option<f64>, active| deckhand_library::Cue {
+            kind: CueKind::Memory,
+            start,
+            end,
+            color: None,
+            name: String::new(),
+            active,
+        };
+        let cues = [cue(30.0, Some(34.0), true), cue(10.0, None, false), cue(50.0, Some(52.0), false)];
+        let original = AnlzCue {
+            hot_cue: None,
+            kind: AnlzCueKind::Loop,
+            time_ms: 30_000,
+            loop_end_ms: Some(34_000),
+            status: Some(CueStatus::Enabled),
+            color_id: Some(3),
+            loop_beats: None,
+            comment: None,
+            hot_cue_color: None,
+            order: Some((7, 9)),
+            trailer: vec![1, 2],
+        };
+        let list = basic_memory(&cues, &[original]);
+        let got: Vec<(u32, Option<u32>, Option<CueStatus>)> =
+            list.iter().map(|c| (c.time_ms, c.loop_end_ms, c.status)).collect();
+        assert_eq!(
+            got,
+            [
+                (10_000, None, Some(CueStatus::Enabled)),
+                (30_000, Some(34_000), Some(CueStatus::ActiveLoop)),
+                (50_000, Some(52_000), Some(CueStatus::Enabled)),
+            ]
+        );
+        assert_eq!((list[1].color_id, list[1].trailer.as_slice(), list[1].order), (Some(3), &[1u8, 2][..], None));
+    }
 
     #[test]
     fn names_fit_usb_file_systems() {
@@ -732,6 +832,7 @@ mod export_tests {
             end: None,
             color: Some([10, 20, 30]),
             name: "Added".into(),
+            active: false,
         });
         tracks[1].analysis = None;
         let stick = temp.join("stick");

@@ -75,6 +75,15 @@ impl Layer {
 const PIECE_SCALE: f32 = 2.0;
 
 impl StemLayers {
+    /// The memory its audio takes, in bytes.
+    pub fn bytes(&self) -> usize {
+        [&self.vocals, &self.bass, &self.drums]
+            .into_iter()
+            .flatten()
+            .map(|l| l.samples.len() * std::mem::size_of::<AtomicI16>())
+            .sum()
+    }
+
     /// Takes the stems (at any sample rate) for a track of `frames` frames
     /// at `rate`, all ready. Allocates and resamples: not for the audio thread.
     pub fn new(
@@ -87,7 +96,7 @@ impl StemLayers {
         let layer = |stem: &TrackAudio| {
             let step = f64::from(stem.sample_rate) / f64::from(rate.max(1));
             // A little above the peak: cubic interpolation can overshoot it.
-            let scale = stem.samples.iter().fold(1.0_f32, |peak, s| peak.max(s.abs())) * 1.01;
+            let scale = (0..stem.len()).map(|i| stem.sample(i)).fold(1.0_f32, |peak, s| peak.max(s.abs())) * 1.01;
             let layer = Layer::silent(frames, scale);
             for i in 0..frames {
                 let sample = if stem.sample_rate == rate {
@@ -384,7 +393,7 @@ mod tests {
     use super::*;
 
     fn constant(rate: u32, frames: usize, value: f32) -> TrackAudio {
-        TrackAudio { sample_rate: rate, samples: vec![value; frames * 2] }
+        TrackAudio::new(rate, vec![value; frames * 2])
     }
 
     #[test]
@@ -453,11 +462,8 @@ mod tests {
         };
         let (a, b) = (wave(0.031), wave(0.17));
         let track: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
-        let track = TrackAudio { sample_rate: rate, samples: track };
-        let scaled = |w: &[f32], g: f32| TrackAudio {
-            sample_rate: rate,
-            samples: w.iter().map(|x| x * g).collect(),
-        };
+        let track = TrackAudio::new(rate, track);
+        let scaled = |w: &[f32], g: f32| TrackAudio::new(rate, w.iter().map(|x| x * g).collect(),);
         let gains = fit_gains(&track, &[&scaled(&a, 0.5), &scaled(&b, 0.8)]);
         assert!((gains[0] - 2.0).abs() < 1e-3 && (gains[1] - 1.25).abs() < 1e-3, "{gains:?}");
     }

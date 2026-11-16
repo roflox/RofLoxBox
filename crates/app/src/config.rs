@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub library_root: Option<PathBuf>,
     pub audio_device: Option<String>,
+    /// The master played on this output too (the computer's speakers while
+    /// the controller is the output); off when `None`.
+    #[serde(default)]
+    pub mirror_device: Option<String>,
     pub midi_port: Option<String>,
     #[serde(default)]
     pub four_decks: bool,
@@ -198,6 +202,10 @@ pub struct Preferences {
     pub highlight_compatible_keys: bool,
     /// EDIT: the view moves along with the playhead while playing.
     pub edit_follow_playhead: bool,
+    /// EDIT: selections, the cursor and automation points land on beats.
+    pub edit_quantize: bool,
+    /// EDIT: how tall the decks' rows (their waveforms) are, in points.
+    pub edit_track_row: f32,
     /// EDIT: EQ points can go above 0 dB without holding Option/Alt.
     pub edit_eq_boost: bool,
     /// EDIT: what deleting a deck's audio takes along without asking
@@ -236,6 +244,9 @@ pub struct Preferences {
     /// With writing allowed, changes go into rekordbox's library on their
     /// own, a moment after they're made.
     pub rekordbox_autosave: bool,
+    /// Saves into rekordbox's library wait for rekordbox to close (it is
+    /// looked for); off, they happen whether it runs or not.
+    pub rekordbox_wait_closed: bool,
     /// Where tracks made from stems go; the default when unset.
     pub stems_folder: Option<PathBuf>,
     /// The computer keyboard plays the decks.
@@ -337,6 +348,8 @@ impl Default for Preferences {
             key_notation: Default::default(),
             highlight_compatible_keys: true,
             edit_follow_playhead: false,
+            edit_quantize: true,
+            edit_track_row: 96.0,
             edit_eq_boost: false,
             beat_fx_cycle: deckhand_audio::BeatFxKind::ALL.to_vec(),
             edit_delete: None,
@@ -355,6 +368,7 @@ impl Default for Preferences {
             rekordbox_at_start: true,
             rekordbox_write: false,
             rekordbox_autosave: true,
+            rekordbox_wait_closed: false,
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),
@@ -480,6 +494,7 @@ impl Default for Config {
         Self {
             library_root: None,
             audio_device: None,
+            mirror_device: None,
             midi_port: None,
             four_decks: false,
             waveform_style: crate::waveform::WaveformStyle::default(),

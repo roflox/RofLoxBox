@@ -65,13 +65,16 @@ fn work(
     while !cancelled.load(Ordering::Relaxed) {
         let Some((id, path)) = queue.lock().ok().and_then(|mut q| q.next()) else { break };
         let result = match deckhand_audio::decode_file(&path) {
-            Ok(audio) => Analysed {
-                id,
-                overwrite,
-                grid: beat_grid(&audio.samples, audio.sample_rate, DEFAULT_RANGE),
-                key: detect_key(&audio.samples, audio.sample_rate),
-                failed: false,
-            },
+            Ok(audio) => {
+                let samples = audio.to_f32();
+                Analysed {
+                    id,
+                    overwrite,
+                    grid: beat_grid(&samples, audio.sample_rate, DEFAULT_RANGE),
+                    key: detect_key(&samples, audio.sample_rate),
+                    failed: false,
+                }
+            }
             Err(_) => Analysed { id, overwrite, grid: None, key: None, failed: true },
         };
         if cancelled.load(Ordering::Relaxed) || tx.send(result).is_err() {

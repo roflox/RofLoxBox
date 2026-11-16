@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use deckhand_formats::anlz::{AnlzFile, CueKind as AnlzCueKind, CueListKind};
+use deckhand_formats::anlz::{AnlzFile, CueKind as AnlzCueKind, CueListKind, CueStatus};
 use deckhand_formats::pdb::{LibraryTrack, PlaylistKind, PlaylistNode};
 use deckhand_library::{
     Cue, CueKind, ScannedFile, TempoMarker, XmlLibrary, XmlNode, XmlTrack, file_stamp,
@@ -191,6 +191,13 @@ fn cues_and_grid(dat: Option<&AnlzFile>, ext: Option<&AnlzFile>) -> (Vec<Cue>, V
         .chain(dat.into_iter().flat_map(AnlzFile::cue_lists))
         .collect();
     let extended = lists.iter().any(|l| l.extended && !l.cues.is_empty());
+    // The active loop is flagged in the basic memory list only.
+    let active = lists
+        .iter()
+        .filter(|l| !l.extended && l.kind == CueListKind::Memory)
+        .flat_map(|l| &l.cues)
+        .find(|c| c.status == Some(CueStatus::ActiveLoop))
+        .map(|c| c.time_ms);
     let mut cues = Vec::new();
     for list in lists.into_iter().filter(|l| l.extended == extended) {
         for cue in &list.cues {
@@ -209,6 +216,9 @@ fn cues_and_grid(dat: Option<&AnlzFile>, ext: Option<&AnlzFile>) -> (Vec<Cue>, V
                 end,
                 color: cue.hot_cue_color.map(|c| c.rgb),
                 name: cue.comment.clone().unwrap_or_default(),
+                active: kind == CueKind::Memory
+                    && end.is_some()
+                    && active.is_some_and(|t| t.abs_diff(cue.time_ms) <= 1),
             });
         }
     }

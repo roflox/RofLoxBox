@@ -76,11 +76,37 @@ pub enum CrossfaderSide {
 enum Garbage {
     Track(Arc<TrackAudio>),
     Stems(Arc<crate::stems::StemLayers>),
+    Mirror(crate::mirror::MirrorTap),
+}
+
+/// A recording's tap on its way to the audio thread ([`Command::Record`]):
+/// it has one writer, so a copy of the command carries none (sessions,
+/// which are copied, never hold one).
+#[derive(Debug, Default)]
+pub struct Handoff(pub Option<crate::record::RecordTap>);
+
+impl Clone for Handoff {
+    fn clone(&self) -> Self {
+        debug_assert!(self.0.is_none(), "a live recording's tap copied");
+        Self(None)
+    }
+}
+
+/// A mirror's tap on its way to the audio thread ([`Command::Mirror`]); a
+/// copy carries none, as with [`Handoff`].
+#[derive(Debug, Default)]
+pub struct MirrorHandoff(pub Option<crate::mirror::MirrorTap>);
+
+impl Clone for MirrorHandoff {
+    fn clone(&self) -> Self {
+        debug_assert!(self.0.is_none(), "a live mirror's tap copied");
+        Self(None)
+    }
 }
 
 /// What the mixer can be told. Recorded in sessions (see
 /// [`crate::session`]), where tracks are named by their file.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     Load {
         deck: usize,
@@ -192,7 +218,11 @@ pub enum Command {
     SetCrossfaderCurve(CrossfaderCurve),
     /// Starts (Some) or ends (None) taking the master into a recording.
     #[serde(skip)]
-    Record(Option<crate::record::RecordTap>),
+    Record(Handoff),
+    /// Starts (Some) or ends (None) playing the master on a second output
+    /// too ([`Engine::mirror_to`]).
+    #[serde(skip)]
+    Mirror(MirrorHandoff),
     SetFaderCurve(FaderCurve),
     /// Off: the master is only clipped at full scale.
     SetLimiter(bool),
@@ -408,6 +438,8 @@ pub struct Engine {
     trash: rtrb::Consumer<Garbage>,
     shared: Arc<Shared>,
     info: OutputInfo,
+    /// The master on a second output too, if asked for.
+    mirror: Option<crate::mirror::Mirror>,
     _stream: cpal::Stream,
 }
 
@@ -501,7 +533,30 @@ impl Engine {
             other => return Err(anyhow!("unsupported sample format {other}")),
         };
         stream.play()?;
-        Ok(Self { jog: Some(JogSender(jog_tx)), commands, trash, shared, info, _stream: stream })
+        Ok(Self { jog: Some(JogSender(jog_tx)), commands, trash, shared, info, mirror: None, _stream: stream })
+    }
+
+    /// Plays the master on `device` too (as well as this output), or stops
+    /// that (`None`). The second output plays a few hundredths of a second
+    /// behind.
+    pub fn mirror_to(&mut self, device: Option<&str>) -> Result<()> {
+        let Some(device) = device else {
+            if self.mirror.take().is_some() {
+                let _ = self.commands.push(Command::Mirror(MirrorHandoff(None)));
+            }
+            return Ok(());
+        };
+        let (mirror, tap) = crate::mirror::Mirror::start(Some(device), self.info.sample_rate)?;
+        if self.commands.push(Command::Mirror(MirrorHandoff(Some(tap)))).is_err() {
+            return Err(anyhow!("the audio engine is busy; try again"));
+        }
+        self.mirror = Some(mirror);
+        Ok(())
+    }
+
+    /// The device the master is played on too, if any.
+    pub fn mirror_device(&self) -> Option<&str> {
+        self.mirror.as_ref().map(|m| m.device.as_str())
     }
 
     pub fn info(&self) -> &OutputInfo {
@@ -546,7 +601,7 @@ impl Engine {
     /// Starts recording the master to a 24-bit WAV at `path`.
     pub fn start_recording(&mut self, path: &std::path::Path) -> Result<crate::record::Recording> {
         let (recording, tap) = crate::record::Recording::start(path, self.info.sample_rate)?;
-        if self.commands.push(Command::Record(Some(tap))).is_err() {
+        if self.commands.push(Command::Record(Handoff(Some(tap)))).is_err() {
             return Err(anyhow!("the audio engine is busy; try again"));
         }
         Ok(recording)
@@ -559,7 +614,7 @@ impl Engine {
     ) -> Result<std::path::PathBuf> {
         // Retry briefly if the command queue is momentarily full.
         for _ in 0..100 {
-            if self.commands.push(Command::Record(None)).is_ok() {
+            if self.commands.push(Command::Record(Handoff(None))).is_ok() {
                 return recording.finish();
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -689,6 +744,8 @@ struct Mixer {
     master_peak: f32,
     master_cue: bool,
     recorder: Option<crate::record::RecordTap>,
+    /// The master played on a second output too.
+    mirror: Option<crate::mirror::MirrorTap>,
     /// Measure each deck's low end (offline only).
     measure_low: bool,
     /// Only the decks move (no sound is made): for finding where they are,
@@ -881,6 +938,7 @@ impl Mixer {
             master_peak: 0.0,
             master_cue: false,
             recorder: None,
+            mirror: None,
             measure_low: false,
             positions_only: false,
             crossfader_curve: CrossfaderCurve::default(),
@@ -1074,7 +1132,7 @@ impl Mixer {
             }
             Command::SetCrossfaderCurve(curve) => self.crossfader_curve = curve,
             // Taken by `render`.
-            Command::Record(_) => {}
+            Command::Record(_) | Command::Mirror(_) => {}
             Command::SetFaderCurve(curve) => self.fader_curve = curve,
             Command::SetLimiter(on) => self.limiter = on,
             Command::SetStems { deck, ref stems } => {
@@ -1319,7 +1377,13 @@ impl Mixer {
         let now = self.clock;
         while let Ok(command) = self.commands.pop() {
             match command {
-                Command::Record(tap) => self.set_recorder(tap),
+                Command::Record(Handoff(tap)) => self.set_recorder(tap),
+                // The tap let go of is freed off the audio thread.
+                Command::Mirror(MirrorHandoff(tap)) => {
+                    if let Some(old) = std::mem::replace(&mut self.mirror, tap) {
+                        let _ = self.trash.push(Garbage::Mirror(old));
+                    }
+                }
                 command => {
                     self.apply(&command);
                     if let Some(session) = self.session() {
@@ -1527,6 +1591,9 @@ impl Mixer {
             self.master_peak = self.master_peak.max(master[0].abs()).max(master[1].abs());
             if let Some(recorder) = self.recorder.as_mut() {
                 recorder.push(master);
+            }
+            if let Some(mirror) = self.mirror.as_mut() {
+                mirror.push(master);
             }
             for (channel, slot) in frame.iter_mut().enumerate() {
                 let value = match channel {
@@ -1791,6 +1858,15 @@ impl Offline {
         self.mixer.positions_only = true;
     }
 
+    /// Makes sound again after [`Offline::positions_only`], the decks'
+    /// time-stretchers starting afresh where they are.
+    pub(crate) fn sounding(&mut self) {
+        self.mixer.positions_only = false;
+        for deck in &mut self.mixer.decks {
+            deck.stretcher.reset();
+        }
+    }
+
     /// Takes in the commands sent so far now (the next buffer would), so
     /// [`Offline::deck`] tells where a deck is after them.
     pub(crate) fn settle(&mut self) {
@@ -1944,7 +2020,7 @@ mod tests {
     #[test]
     fn mixer_plays_at_tempo_and_stops_at_end() {
         let (mut mixer, mut tx, shared) = mixer(48_000);
-        let audio = Arc::new(TrackAudio { sample_rate: 48_000, samples: vec![0.5; 48_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(48_000, vec![0.5; 48_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
         tx.push(Command::SetTempo { deck: 0, ratio: 1.5 }).unwrap();
@@ -1964,7 +2040,7 @@ mod tests {
     #[test]
     fn loops_wrap_and_scratch_plays_backwards() {
         let (mut mixer, mut tx, shared) = mixer(1_000);
-        let audio = Arc::new(TrackAudio { sample_rate: 1_000, samples: vec![0.1; 10_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(1_000, vec![0.1; 10_000 * 2]));
         tx.push(Command::Load { deck: 2, audio }).unwrap();
         tx.push(Command::Seek { deck: 2, seconds: 1.0 }).unwrap();
         tx.push(Command::SetLoop { deck: 2, start: 1.0, end: 1.5 }).unwrap();
@@ -1993,7 +2069,7 @@ mod tests {
     fn a_waveform_let_go_plays_on_from_where_it_was_dragged() {
         let rate = 48_000;
         let (mut mixer, mut tx, shared) = mixer(rate);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 480_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
@@ -2015,7 +2091,7 @@ mod tests {
     fn jog_steps_become_smooth_motion() {
         let rate = 48_000;
         let (mut mixer, mut tx, shared) = mixer(rate);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 480_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
         tx.push(Command::Hold { deck: 0, held: true }).unwrap();
@@ -2047,7 +2123,7 @@ mod tests {
     fn crossfader_assignment_and_thru() {
         let (mut mixer, mut tx, _shared) = mixer(1_000);
         for deck in [0, 3] {
-            let audio = Arc::new(TrackAudio { sample_rate: 1_000, samples: vec![0.2; 1_000 * 2] });
+            let audio = Arc::new(TrackAudio::new(1_000, vec![0.2; 1_000 * 2]));
             tx.push(Command::Load { deck, audio }).unwrap();
             tx.push(Command::SetPlaying { deck, playing: true }).unwrap();
         }
@@ -2065,7 +2141,7 @@ mod tests {
     #[test]
     fn headphones_hear_cued_deck_before_fader() {
         let (mut mixer, mut tx, _shared) = mixer(48_000);
-        let audio = Arc::new(TrackAudio { sample_rate: 48_000, samples: vec![0.25; 48_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(48_000, vec![0.25; 48_000 * 2]));
         tx.push(Command::Load { deck: 1, audio }).unwrap();
         tx.push(Command::SetPlaying { deck: 1, playing: true }).unwrap();
         tx.push(Command::SetVolume { deck: 1, level: 0.0 }).unwrap();
@@ -2080,7 +2156,7 @@ mod tests {
     #[test]
     fn slip_returns_to_where_the_track_would_be() {
         let (mut mixer, mut tx, shared) = mixer(1_000);
-        let audio = Arc::new(TrackAudio { sample_rate: 1_000, samples: vec![0.1; 20_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(1_000, vec![0.1; 20_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::SetSlip { deck: 0, on: true }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
@@ -2101,7 +2177,7 @@ mod tests {
     #[test]
     fn sampler_plays_once_and_master_cue_reaches_headphones() {
         let (mut mixer, mut tx, shared) = mixer(1_000);
-        let audio = Arc::new(TrackAudio { sample_rate: 1_000, samples: vec![0.5; 100 * 2] });
+        let audio = Arc::new(TrackAudio::new(1_000, vec![0.5; 100 * 2]));
         tx.push(Command::SamplerLoad { slot: 3, audio }).unwrap();
         tx.push(Command::SamplerPlay { slot: 3 }).unwrap();
         tx.push(Command::SetMasterCue(true)).unwrap();
@@ -2119,7 +2195,7 @@ mod tests {
     fn beat_fx_on_a_channel_leaves_the_others_dry() {
         let (mut mixer, mut tx, _shared) = mixer(1_000);
         for deck in [0, 1] {
-            let audio = Arc::new(TrackAudio { sample_rate: 1_000, samples: vec![0.2; 10_000 * 2] });
+            let audio = Arc::new(TrackAudio::new(1_000, vec![0.2; 10_000 * 2]));
             tx.push(Command::Load { deck, audio }).unwrap();
             tx.push(Command::SetPlaying { deck, playing: true }).unwrap();
         }
@@ -2154,7 +2230,7 @@ mod tests {
     #[test]
     fn vinyl_start_and_brake_take_time() {
         let (mut mixer, mut tx, shared) = mixer(1_000);
-        let audio = Arc::new(TrackAudio { sample_rate: 1_000, samples: vec![0.1; 10_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(1_000, vec![0.1; 10_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::SetVinylSpeed { deck: 0, start: 0.5, brake: 1.0 }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
@@ -2183,7 +2259,7 @@ mod tests {
         let (jog_tx, jog_rx) = rtrb::RingBuffer::new(256);
         mixer.jog = Some(jog_rx);
         let mut jog = JogSender(jog_tx);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 480_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
         let mut out = vec![0f32; 256 * 2];
@@ -2209,7 +2285,7 @@ mod tests {
     fn held_deck_stops_and_only_moves_with_the_drag() {
         let rate = 48_000;
         let (mut mixer, mut tx, shared) = mixer(rate);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 480_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
@@ -2255,8 +2331,8 @@ mod tests {
         let rate = 48_000;
         let (mut mixer, mut tx, _shared) = mixer(rate);
         let frames = 48_000;
-        let track = TrackAudio { sample_rate: rate, samples: vec![0.3; frames * 2] };
-        let vocals = TrackAudio { sample_rate: rate, samples: vec![0.1; frames * 2] };
+        let track = TrackAudio::new(rate, vec![0.3; frames * 2]);
+        let vocals = TrackAudio::new(rate, vec![0.1; frames * 2]);
         let stems = crate::stems::StemLayers::new(Some(&vocals), None, None, rate, frames);
         tx.push(Command::Load { deck: 0, audio: Arc::new(track) }).unwrap();
         tx.push(Command::SetStems { deck: 0, stems: Some(Arc::new(stems)) }).unwrap();
@@ -2289,7 +2365,7 @@ mod tests {
         let (jog_tx, jog_rx) = rtrb::RingBuffer::new(256);
         mixer.jog = Some(jog_rx);
         let mut jog = JogSender(jog_tx);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 480_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
         tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
@@ -2320,7 +2396,7 @@ mod tests {
     fn publishes_how_fast_the_record_moves() {
         let rate = 48_000;
         let (mut mixer, mut tx, shared) = mixer(rate);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 480_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 480_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         let mut out = vec![0f32; 256 * 2];
         let speed = |shared: &Shared| f64::from_bits(shared.decks[0].speed.load(Ordering::Relaxed));
@@ -2343,7 +2419,7 @@ mod tests {
         let (jog_tx, jog_rx) = rtrb::RingBuffer::new(256);
         mixer.jog = Some(jog_rx);
         let mut jog = JogSender(jog_tx);
-        let audio = Arc::new(TrackAudio { sample_rate: rate, samples: vec![0.1; 4_800_000 * 2] });
+        let audio = Arc::new(TrackAudio::new(rate, vec![0.1; 4_800_000 * 2]));
         tx.push(Command::Load { deck: 0, audio }).unwrap();
         tx.push(Command::SetJogResolution(6480.0)).unwrap();
         tx.push(Command::Hold { deck: 0, held: true }).unwrap();

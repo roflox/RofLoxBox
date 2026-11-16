@@ -4,6 +4,7 @@ mod decode;
 mod engine;
 mod eq;
 mod fx;
+mod mirror;
 mod preview;
 mod record;
 mod session;
@@ -11,7 +12,7 @@ mod stems;
 mod stretch;
 
 pub use decode::{
-    Frames, TrackAudio, band_waveform, band_waveform_at, decode_file, peak_waveform,
+    BandSplit, Frames, TrackAudio, band_waveform, band_waveform_at, decode_file, peak_waveform,
     peak_waveform_at,
 };
 pub use engine::{

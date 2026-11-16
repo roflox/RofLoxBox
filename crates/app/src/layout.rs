@@ -309,8 +309,6 @@ impl Default for DeckLayout {
                 E::LoopResize,
                 E::BeatLoops,
                 E::BeatJump,
-                E::Cue,
-                E::Play,
                 E::MemoryCall,
                 E::MemorySet,
                 E::PadShift,

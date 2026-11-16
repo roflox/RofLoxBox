@@ -303,7 +303,7 @@ impl DeckhandApp {
             ui.label("Choose a folder in EXPLORER.");
             return;
         };
-        let deck_count = self.deck_count();
+        let shown = self.shown_decks();
         let mut load = None;
         ui.horizontal(|ui| {
             ui.label("🔍");
@@ -314,7 +314,7 @@ impl DeckhandApp {
             );
             if let Some(id) = self.selected {
                 ui.separator();
-                for deck in 0..deck_count {
+                for &deck in &shown {
                     if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                         load = Some((id, deck));
                     }
@@ -373,7 +373,7 @@ impl DeckhandApp {
                     &mut self.config.sort,
                     &options,
                     &mut |ui, row| {
-                        for deck in 0..deck_count {
+                        for &deck in &shown {
                             if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                                 load = Some((row.id, deck));
                                 ui.close();

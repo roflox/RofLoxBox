@@ -73,7 +73,7 @@ impl Saved {
     }
 }
 
-/// rekordbox is running: its library can't be changed now.
+/// rekordbox is running (and the preference says to wait for it to close).
 #[derive(Debug)]
 pub struct RekordboxRunning;
 
@@ -86,10 +86,16 @@ impl std::fmt::Display for RekordboxRunning {
 impl std::error::Error for RekordboxRunning {}
 
 /// Writes `snapshot` into rekordbox's library at `path` where it differs.
-/// rekordbox must be closed ([`RekordboxRunning`] otherwise); the library
-/// is copied into `backups` first.
-pub fn save(path: &Path, key: &str, snapshot: &Snapshot, backups: &Path) -> Result<Saved> {
-    let closed = rekordbox_closed().ok_or(RekordboxRunning)?;
+/// With `wait_closed`, rekordbox must be closed ([`RekordboxRunning`]
+/// otherwise); the library is copied into `backups` first.
+pub fn save(
+    path: &Path,
+    key: &str,
+    snapshot: &Snapshot,
+    backups: &Path,
+    wait_closed: bool,
+) -> Result<Saved> {
+    let closed = rekordbox_closed(wait_closed).ok_or(RekordboxRunning)?;
     let share = path.parent().unwrap_or(Path::new("")).join("share");
     let written = write(&closed, path, key, backups, |db, usn| {
         if usn.0 != snapshot.read_count {
@@ -504,12 +510,12 @@ impl<'a> Library<'a> {
     /// and loops (only tells, without `write`); returns whether they
     /// changed. rekordbox's other cue kinds stay.
     fn save_cues(&mut self, id: &str, uuid: &str, cues: &[Cue], write: bool) -> Result<bool> {
-        // (row id, kind, in, out, colour index, comment)
+        // (row id, kind, in, out, colour index, comment, active loop)
         let mut statement = self.db.prepare(
-            "SELECT ID, Kind, InMsec, OutMsec, ColorTableIndex, Comment FROM djmdCue
+            "SELECT ID, Kind, InMsec, OutMsec, ColorTableIndex, Comment, ActiveLoop FROM djmdCue
              WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec",
         )?;
-        let mut existing: Vec<(String, i64, i64, i64, i64, String)> = statement
+        let mut existing: Vec<(String, i64, i64, i64, i64, String, bool)> = statement
             .query_map([id], |row| {
                 Ok((
                     row.get(0)?,
@@ -518,6 +524,7 @@ impl<'a> Library<'a> {
                     integer(row, 3)?,
                     integer(row, 4)?,
                     row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    integer(row, 6)? != 0,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -548,15 +555,15 @@ impl<'a> Library<'a> {
                     let row = &existing[i];
                     let out = if row.3 > 0 { row.3 } else { -1 };
                     let color = color.unwrap_or(row.4);
-                    if out != end || row.4 != color || row.5 != cue.name {
+                    if out != end || row.4 != color || row.5 != cue.name || row.6 != cue.active {
                         if !write {
                             return Ok(true);
                         }
                         self.db.execute(
                             "UPDATE djmdCue SET OutMsec = ?2, OutFrame = ?3, ColorTableIndex = ?4,
-                                Comment = ?5, BeatLoopSize = 0, updated_at = ?6
+                                Comment = ?5, BeatLoopSize = 0, ActiveLoop = ?7, updated_at = ?6
                              WHERE ID = ?1",
-                            params![row.0, end, frames(end), color, cue.name, self.now],
+                            params![row.0, end, frames(end), color, cue.name, self.now, i64::from(cue.active)],
                         )?;
                         changed = true;
                     }
@@ -573,7 +580,7 @@ impl<'a> Library<'a> {
                             ColorTableIndex, ActiveLoop, Comment, BeatLoopSize, CueMicrosec,
                             InPointSeekInfo, OutPointSeekInfo, ContentUUID, UUID, created_at,
                             updated_at)
-                         VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6, 0, 0, ?7, ?8, ?9, 0, ?10, 0, 0,
+                         VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6, 0, 0, ?7, ?8, ?9, ?14, ?10, 0, 0,
                             '', '', ?11, ?12, ?13, ?13)",
                         params![
                             cue_id,
@@ -590,6 +597,7 @@ impl<'a> Library<'a> {
                             uuid,
                             self::uuid()?,
                             self.now,
+                            i64::from(cue.active),
                         ],
                     )?;
                     changed = true;
@@ -1149,6 +1157,58 @@ mod tests {
         c.nodes.iter().find(|n| n.name == name).unwrap().id
     }
 
+    /// The active loop goes to rekordbox's ActiveLoop and comes back from
+    /// it; moving it to another loop clears the old one.
+    #[test]
+    fn saves_the_active_loop() {
+        let root = folder("active");
+        let backups = root.join("backups");
+        let mut c = collection(&root);
+        let one = c.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap().id;
+        let memory_loop = |start: f64, active| Cue {
+            kind: CueKind::Memory,
+            start,
+            end: Some(start + 4.0),
+            color: None,
+            name: String::new(),
+            active,
+        };
+        c.update_track(one, |t| t.cues.extend([memory_loop(20.0, true), memory_loop(40.0, false)]));
+        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        let flags = |root: &Path| -> Vec<(i64, i64)> {
+            let db = plain(root);
+            let mut statement = db
+                .prepare(
+                    "SELECT InMsec, coalesce(ActiveLoop, 0) FROM djmdCue
+                     WHERE ContentID = 't1' AND Kind = 0 AND OutMsec > 0 ORDER BY InMsec",
+                )
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let saved = flags(&root);
+        assert!(saved.contains(&(20_000, 1)) && saved.contains(&(40_000, 0)), "{saved:?}");
+        let mut c = collection(&root);
+        let read = |c: &Collection| -> Vec<f64> {
+            let track = c.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap();
+            track.cues.iter().filter(|q| q.active).map(|q| q.start).collect()
+        };
+        assert_eq!(read(&c), [20.0]);
+        let one = c.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap().id;
+        c.update_track(one, |t| {
+            for cue in &mut t.cues {
+                cue.active = cue.end.is_some() && (cue.start - 40.0).abs() < 0.01;
+            }
+        });
+        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        let saved = flags(&root);
+        assert!(saved.contains(&(20_000, 0)) && saved.contains(&(40_000, 1)), "{saved:?}");
+        assert_eq!(read(&collection(&root)), [40.0]);
+    }
+
     #[test]
     fn saves_tags_cues_grids_tracks_and_playlists() {
         let root = folder("all");
@@ -1175,6 +1235,7 @@ mod tests {
                 end: None,
                 color: None,
                 name: String::new(),
+                active: false,
             });
             t.tempo[0].start = 0.12;
         });
@@ -1205,7 +1266,7 @@ mod tests {
         let made = c.create("Made", NodeKind::Playlist, Some(node(&c, "Sets")));
         c.add_to_playlist(made, &[new, one]);
 
-        let saved = save(&root.join("master.db"), "secret", &snapshot(&c), &backups).unwrap();
+        let saved = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
         assert_eq!((saved.tracks, saved.cues, saved.grids, saved.added), (1, 1, 1, 1), "{saved:?}");
         assert_eq!(saved.ids.len(), 1);
         assert_eq!(saved.ids[0].0, made);
@@ -1335,7 +1396,7 @@ mod tests {
 
         // Saved again: nothing left to change, nothing written.
         c.saved_to_rekordbox(&saved.ids, saved.count);
-        let again = save(&root.join("master.db"), "secret", &snapshot(&c), &backups).unwrap();
+        let again = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
 
@@ -1357,7 +1418,7 @@ mod tests {
         c.update_track(first, |t| t.rating = 1);
         let before = std::fs::read(root.join("master.db")).unwrap();
         let err =
-            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b")).unwrap_err();
+            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b"), false).unwrap_err();
         assert!(err.to_string().contains("changed its library"), "{err}");
         // Never read from rekordbox: there's nothing to save with.
         c.rekordbox_count = None;
@@ -1367,7 +1428,7 @@ mod tests {
         let mut c = collection(&root);
         c.delete(node(&c, "rekordbox"));
         let saved =
-            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b")).unwrap();
+            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b"), false).unwrap();
         assert!(saved.is_empty(), "{saved:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1396,7 +1457,7 @@ mod tests {
             c.tracks.iter().map(|t| (t.path.clone(), rows(&t.path))).collect();
         c.import_rekordbox(opened.library);
         c.rekordbox_count = Some(opened.count);
-        let saved = save(&path, &key, &snapshot(&c), &backups).unwrap();
+        let saved = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
         println!("unchanged: {saved:?}");
         // Only tags edited in deckhand go over.
         let edited = c.tracks.iter().filter(|t| !t.edited.is_empty()).count();
@@ -1418,6 +1479,7 @@ mod tests {
                 end: None,
                 color: Some([230, 40, 40]),
                 name: "deckhand".into(),
+                active: false,
             })
         });
         c.rename(list, &format!("{name} (deckhand)"));
@@ -1445,14 +1507,14 @@ mod tests {
         c.update_track(gridded, |t| t.tempo[0].start += 0.01);
         // The new track's cues go along.
         let new_cues = usize::from(new.is_some_and(|n| !c.track(n).unwrap().cues.is_empty()));
-        let saved = save(&path, &key, &snapshot(&c), &backups).unwrap();
+        let saved = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
         println!("edited: {saved:?}");
         assert_eq!(
             (saved.cues, saved.ids.len(), saved.tracks, saved.grids, saved.added),
             (1 + new_cues, 1, 0, 1, usize::from(new.is_some()))
         );
         c.saved_to_rekordbox(&saved.ids, saved.count);
-        let again = save(&path, &key, &snapshot(&c), &backups).unwrap();
+        let again = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
         assert!(again.is_empty(), "{again:?}");
 
         let reread = crate::rekordbox_db::open_any(&path, &key).unwrap();

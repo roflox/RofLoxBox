@@ -26,6 +26,8 @@ struct DeckOut {
     /// A section stretched by its edges while editing the layout (across,
     /// down).
     resized: Option<(Section, (f32, f32))>,
+    /// Two decks shown: show this deck on this side instead.
+    switch_to: Option<usize>,
     play: bool,
     eject: bool,
     toggle_sync: bool,
@@ -66,6 +68,9 @@ struct Parts<'a> {
     /// The CUE and Play buttons' size when they fill a column (the side
     /// column's width); their usual size otherwise.
     round_size: Option<f32>,
+    /// Two decks shown: the other deck on this side (1 ↔ 3, 2 ↔ 4), and
+    /// whether it is playing unseen.
+    other_deck: Option<(usize, bool)>,
     /// The deck's layout (what goes by EJECT), and whether it is being
     /// edited (then that is shown apart, to drag).
     layout: &'a DeckLayout,
@@ -234,6 +239,9 @@ impl DeckhandApp {
         // The line under the deck name's buttons set to one side.
         let mut align: Option<bool> = None;
         let stem_model = self.stem_model().is_some();
+        let other = (index + 2) % deckhand_audio::DECKS;
+        let other_deck = (!four)
+            .then(|| (other, self.engine.as_ref().is_some_and(|e| e.is_playing(other))));
         let Some(engine) = self.engine.as_mut() else { return };
         let mut parts = Parts {
             deck: &mut self.decks[index],
@@ -252,6 +260,7 @@ impl DeckhandApp {
             live_stems: self.config.prefs.live_stems,
             pads_shown: layout.is_shown(DeckElement::Pads),
             round_size: None,
+            other_deck,
             layout: &layout,
             editing,
             out: DeckOut::default(),
@@ -386,6 +395,9 @@ impl DeckhandApp {
         }
         if out.separate {
             self.separate_deck(index);
+        }
+        if let Some(deck) = out.switch_to {
+            self.active_decks[deck % 2] = deck;
         }
         if let Some((section, size)) = out.resized {
             self.config.deck_layout_mut(four).set_size(section, size);
@@ -1018,6 +1030,20 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                             .strong()
                             .color(DECK_COLORS[index]),
                     );
+                    // Two decks shown: the other deck on this side, lit
+                    // while it plays unseen.
+                    if let Some((other, playing)) = p.other_deck {
+                        let label = RichText::new(format!("⇄ {}", other + 1)).small().strong();
+                        let label = if playing { label.color(DECK_COLORS[other]) } else { label.weak() };
+                        let hint = if playing {
+                            format!("Show deck {} (playing)", other + 1)
+                        } else {
+                            format!("Show deck {} here", other + 1)
+                        };
+                        if ui.small_button(label).on_hover_text(hint).clicked() {
+                            p.out.switch_to = Some(other);
+                        }
+                    }
                     if p.deck.sync {
                         ui.label(RichText::new("SYNC").small().strong().color(ACTIVE));
                     }
@@ -1386,10 +1412,19 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::PadModes => {
             // Pad modes like rekordbox; the controller's mode buttons switch them too.
             let weight = if compact { 1.0 } else { 1.3 };
-            split(ui, &[weight; 8], |ui, i| {
-                let mode = PadMode::ALL[i];
+            // Then the memory list, in the pads' place.
+            split(ui, &[weight; 9], |ui, i| {
+                let Some(&mode) = PadMode::ALL.get(i) else {
+                    let label = RichText::new("MEM").small();
+                    let hover = "MEMORY: the track's memory cues and loops, and which loop is active";
+                    if ui.selectable_label(deck.memory_list && !deck.grid_edit, label).on_hover_text(hover).clicked() {
+                        deck.grid_edit = false;
+                        deck.memory_list = !deck.memory_list;
+                    }
+                    return;
+                };
                 let label = RichText::new(pad_mode_short(mode)).small();
-                let lit = deck.pad_mode == mode && !deck.grid_edit;
+                let lit = deck.pad_mode == mode && !deck.grid_edit && !deck.memory_list;
                 if ui.selectable_label(lit, label).on_hover_text(mode.label()).clicked() {
                     deck.grid_edit = false;
                     deck.set_pad_mode(mode);
@@ -1410,6 +1445,10 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         E::Pads if deck.grid_edit => {
             let pads = PadBox::new(ui, compact);
             pads.show(ui, |ui| grid_editor(ui, deck, position, index, compact, &mut p.out));
+        }
+        E::Pads if deck.memory_list => {
+            let pads = PadBox::new(ui, compact);
+            pads.show(ui, |ui| memory_list(ui, deck, engine, position, &pads, compact, &mut p.out));
         }
         E::Pads if deck.pad_mode == PadMode::PadFx => {
             let shift_held = deck.screen_shift || ui.input(|i| i.modifiers.shift);
@@ -1540,6 +1579,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 .clicked()
             {
                 deck.grid_edit = !deck.grid_edit;
+                deck.memory_list &= !deck.grid_edit;
             }
             // Without the pads on screen, the editor opens under the button.
             if deck.grid_edit && !p.pads_shown {
@@ -1857,6 +1897,119 @@ fn caption(ui: &mut Ui, text: &str) {
 /// The pads' box, the same in every pad mode: as tall as the Pad FX
 /// settings need, four pads across and two rows filling it above a row for
 /// pages and the cog.
+/// The memory list in the pads' place: the track's memory cues and loops
+/// in order, the one played last lit. A row calls it; a loop's ACTIVE makes
+/// it the track's active loop (it loops by itself when playback gets
+/// there, as in rekordbox; one per track); ✕ deletes. Under them, as under
+/// the pads: MEMORY stores the cue point or the loop playing.
+fn memory_list(
+    ui: &mut Ui,
+    deck: &mut Deck,
+    engine: &mut Engine,
+    position: f64,
+    pads: &PadBox,
+    compact: bool,
+    out: &mut DeckOut,
+) {
+    let Some(track) = &deck.track else {
+        ui.label(RichText::new("Load a track to see its memory cues").weak());
+        return;
+    };
+    let points = deck.memory_points();
+    let bpm = track.bpm;
+    let active: Vec<bool> =
+        points.iter().map(|&(s, e)| e.is_some_and(|e| track.is_active_loop((s, e)))).collect();
+    // The one playback is at or past last.
+    let here = points.iter().rposition(|p| p.0 <= position + 0.005);
+    let size = if compact { 11.0 } else { 13.0 };
+    let row = pads.row;
+    let mut call = None;
+    let mut remove = None;
+    let mut set_active = None;
+    egui::ScrollArea::vertical()
+        .id_salt(("memory list", deck.index))
+        .max_height(pads.body)
+        .min_scrolled_height(pads.body)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if points.is_empty() {
+                ui.add_space(row * 0.5);
+                ui.label(
+                    RichText::new("No memory cues yet. MEMORY below stores the cue point, or the loop playing.")
+                        .weak(),
+                );
+            }
+            for (i, &(start, end)) in points.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let width = ui.available_width();
+                    let (active_w, delete_w) = (width * 0.24, row);
+                    let main = width - active_w - delete_w - 2.0 * s(PAD_GAP);
+                    let what = match end {
+                        Some(end) if bpm > 0.0 => {
+                            let beats = ((end - start) * bpm / 60.0 * 100.0).round() / 100.0;
+                            format!("LOOP {} beats", beats_label(beats))
+                        }
+                        Some(end) => format!("LOOP {:.2} s", end - start),
+                        None => "CUE".to_owned(),
+                    };
+                    let tenths = (start * 10.0).round() as u64;
+                    let time = format!("{}:{:02}.{}", tenths / 600, tenths / 10 % 60, tenths % 10);
+                    let text = RichText::new(format!("{:>2}  {time}   {what}", i + 1)).monospace().size(size);
+                    let mut button = egui::Button::new(text).min_size(vec2(main, row)).selected(here == Some(i));
+                    if active[i] {
+                        button = button.stroke(Stroke::new(1.5f32, WARN));
+                    }
+                    if ui.add(button).on_hover_text("Call it").clicked() {
+                        call = Some((start, end));
+                    }
+                    if let Some(end) = end {
+                        let label = RichText::new("ACTIVE").size(size - 2.0).strong();
+                        let button = egui::Button::new(label)
+                            .fill(if active[i] { WARN.gamma_multiply(0.6) } else { Color32::TRANSPARENT })
+                            .min_size(vec2(active_w, row));
+                        let hover = if active[i] {
+                            "Active loop: it loops by itself when playback gets there. Click to stop that"
+                        } else {
+                            "Make it the active loop: it loops by itself when playback gets there (one per track)"
+                        };
+                        if ui.add(button).on_hover_text(hover).clicked() {
+                            set_active = Some(((start, end), !active[i]));
+                        }
+                    } else {
+                        ui.add_space(active_w);
+                    }
+                    let delete = egui::Button::new(RichText::new("✕").size(size)).min_size(vec2(delete_w, row));
+                    if ui.add(delete).on_hover_text("Delete it").clicked() {
+                        remove = Some((start, end));
+                    }
+                });
+            }
+        });
+    ui.horizontal(|ui| {
+        let side = (pads.size.x - 3.0 * s(PAD_GAP)) / 4.0;
+        let store = egui::Button::new(RichText::new("MEMORY").strong()).min_size(vec2(side, 0.0));
+        if ui.add(store).on_hover_text("Store the cue point, or the loop playing").clicked() {
+            deck.memory_set(engine);
+        }
+        let count = points.len();
+        let loops = points.iter().filter(|p| p.1.is_some()).count();
+        ui.label(
+            RichText::new(format!("{} cues, {loops} loops", count - loops)).small().monospace(),
+        );
+    });
+    if let Some((start, end)) = call {
+        deck.memory_go(start, end, engine);
+    }
+    if let Some((range, on)) = set_active {
+        deck.set_active_loop(range, on);
+        let what = if on { "is now the active loop" } else { "is no longer active" };
+        out.status = Some(format!("Deck {}: the loop at {} {what}", deck.index + 1, format_time(range.0)));
+    }
+    if let Some((start, end)) = remove {
+        deck.memory_remove(start, end);
+    }
+}
+
 struct PadBox {
     size: egui::Vec2,
     /// A settings row.
@@ -2149,6 +2302,7 @@ mod tests {
                         live_stems: false,
                         pads_shown: true,
                         round_size: None,
+                        other_deck: None,
                         layout: &layout,
                         editing: false,
                         out: DeckOut::default(),

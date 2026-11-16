@@ -11,17 +11,130 @@ use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
-/// A decoded track: interleaved stereo samples at the file's sample rate.
+/// A decoded track: interleaved stereo samples at the file's sample rate,
+/// held as the file has them (see [`Depth`]): a 16-bit WAV takes half the
+/// memory it would as floats, with every sample as it was.
 #[derive(Debug, Clone)]
 pub struct TrackAudio {
     pub sample_rate: u32,
     /// `[left, right, left, right, …]`
-    pub samples: Vec<f32>,
+    samples: Samples,
+    /// How many there are (both channels), kept: asked for on every frame.
+    len: usize,
+}
+
+/// How a track's samples are held, after its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// 16-bit files, and lossy ones (MP3, AAC…: they have no bit depth, and
+    /// their detail is far coarser than 16 bits).
+    Int16,
+    /// 24-bit files: three bytes a sample.
+    Int24,
+    /// Floating-point files (and audio made by the app).
+    Float,
+}
+
+#[derive(Debug, Clone)]
+enum Samples {
+    Float(Vec<f32>),
+    /// Times `step`, a sample's value: full scale over 32768, or more for a
+    /// decoded lossy file louder than full scale (so it isn't cut off).
+    Int16 { data: Vec<i16>, step: f32 },
+    /// Little-endian, three bytes each, full scale.
+    Int24(Vec<u8>),
+}
+
+const I16_FULL: f32 = 32768.0;
+const I24_FULL: f32 = 8_388_608.0;
+
+/// A 24-bit little-endian sample as a float.
+#[inline]
+fn int24(b: &[u8]) -> f32 {
+    (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 * (1.0 / I24_FULL)
 }
 
 impl TrackAudio {
+    /// Audio as floats, held as they are.
+    pub fn new(sample_rate: u32, samples: Vec<f32>) -> Self {
+        let len = samples.len();
+        Self { sample_rate, samples: Samples::Float(samples), len }
+    }
+
+    /// Audio held at `depth`: from a file of that depth, every sample
+    /// comes back as it was decoded.
+    pub fn with_depth(sample_rate: u32, samples: Vec<f32>, depth: Depth) -> Self {
+        let len = samples.len();
+        let samples = match depth {
+            Depth::Float => Samples::Float(samples),
+            Depth::Int16 => {
+                let peak = samples.iter().fold(0f32, |m, s| m.max(s.abs()));
+                let scale = peak.max(1.0);
+                let data = samples
+                    .iter()
+                    .map(|&s| (s / scale * I16_FULL).round().clamp(-I16_FULL, I16_FULL - 1.0) as i16)
+                    .collect();
+                Samples::Int16 { data, step: scale / I16_FULL }
+            }
+            Depth::Int24 => {
+                let mut data = Vec::with_capacity(samples.len() * 3);
+                for &s in &samples {
+                    let v = (s * I24_FULL).round().clamp(-I24_FULL, I24_FULL - 1.0) as i32;
+                    data.extend_from_slice(&v.to_le_bytes()[..3]);
+                }
+                Samples::Int24(data)
+            }
+        };
+        Self { sample_rate, samples, len }
+    }
+
+    /// How its samples are held.
+    pub fn depth(&self) -> Depth {
+        match self.samples {
+            Samples::Float(_) => Depth::Float,
+            Samples::Int16 { .. } => Depth::Int16,
+            Samples::Int24(_) => Depth::Int24,
+        }
+    }
+
+    /// Samples (both channels): twice the frames.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The sample at `i` (interleaved: frame × 2 + channel).
+    pub fn sample(&self, i: usize) -> f32 {
+        match &self.samples {
+            Samples::Float(s) => s[i],
+            Samples::Int16 { data, step } => f32::from(data[i]) * step,
+            Samples::Int24(data) => int24(&data[i * 3..i * 3 + 3]),
+        }
+    }
+
+    /// Every sample as floats (interleaved): borrowed when held as floats,
+    /// otherwise a copy for the while it's needed (analysing, exporting).
+    pub fn to_f32(&self) -> std::borrow::Cow<'_, [f32]> {
+        match &self.samples {
+            Samples::Float(s) => std::borrow::Cow::Borrowed(s),
+            _ => std::borrow::Cow::Owned((0..self.len()).map(|i| self.sample(i)).collect()),
+        }
+    }
+
+    /// The memory its samples take, in bytes.
+    pub fn bytes(&self) -> usize {
+        match &self.samples {
+            Samples::Float(s) => s.len() * 4,
+            Samples::Int16 { data, .. } => data.len() * 2,
+            Samples::Int24(data) => data.len(),
+        }
+    }
+
     pub fn frames(&self) -> usize {
-        self.samples.len() / 2
+        self.len() / 2
     }
 
     pub fn duration_secs(&self) -> f64 {
@@ -35,14 +148,26 @@ impl TrackAudio {
     }
 
     /// The stereo frame at `index`, or silence outside the track.
+    #[inline(always)]
     pub fn frame(&self, index: i64) -> [f32; 2] {
         if index < 0 {
             return [0.0; 2];
         }
+        // The deck's hot path: one look at how it is held, per frame.
         let at = index as usize * 2;
-        match self.samples.get(at..at + 2) {
-            Some(frame) => [frame[0], frame[1]],
-            None => [0.0; 2],
+        match &self.samples {
+            Samples::Float(s) => match s.get(at..at + 2) {
+                Some(f) => [f[0], f[1]],
+                None => [0.0; 2],
+            },
+            Samples::Int16 { data, step } => match data.get(at..at + 2) {
+                Some(f) => [f32::from(f[0]) * step, f32::from(f[1]) * step],
+                None => [0.0; 2],
+            },
+            Samples::Int24(data) => match data.get(at * 3..at * 3 + 6) {
+                Some(b) => [int24(&b[..3]), int24(&b[3..])],
+                None => [0.0; 2],
+            },
         }
     }
 }
@@ -110,6 +235,7 @@ pub fn decode_file(path: &Path) -> Result<TrackAudio> {
         .make_audio_decoder(&params, &decoder_options())
         .context("no decoder for this codec")?;
 
+    let depth = depth_of(&params);
     let mut sample_rate = params.sample_rate.unwrap_or(44_100);
     let mut samples = Vec::new();
     let mut interleaved: Vec<f32> = Vec::new();
@@ -148,7 +274,46 @@ pub fn decode_file(path: &Path) -> Result<TrackAudio> {
             samples.push(right);
         }
     }
-    Ok(TrackAudio { sample_rate, samples })
+    Ok(TrackAudio::with_depth(sample_rate, samples, depth))
+}
+
+/// How a file's audio is held: as its bits, 16-bit for lossy files.
+fn depth_of(params: &symphonia::core::codecs::audio::AudioCodecParameters) -> Depth {
+    use symphonia::core::audio::sample::SampleFormat as F;
+    use symphonia::core::codecs::audio::well_known as c;
+    // PCM (WAV, AIFF): its codec says how it is stored.
+    let int16 = [
+        c::CODEC_ID_PCM_S16LE, c::CODEC_ID_PCM_S16LE_PLANAR, c::CODEC_ID_PCM_S16BE, c::CODEC_ID_PCM_S16BE_PLANAR,
+        c::CODEC_ID_PCM_U16LE, c::CODEC_ID_PCM_U16LE_PLANAR, c::CODEC_ID_PCM_U16BE, c::CODEC_ID_PCM_U16BE_PLANAR,
+        c::CODEC_ID_PCM_S8, c::CODEC_ID_PCM_S8_PLANAR, c::CODEC_ID_PCM_U8, c::CODEC_ID_PCM_U8_PLANAR,
+        c::CODEC_ID_PCM_ALAW, c::CODEC_ID_PCM_MULAW,
+    ];
+    let int24 = [
+        c::CODEC_ID_PCM_S24LE, c::CODEC_ID_PCM_S24LE_PLANAR, c::CODEC_ID_PCM_S24BE, c::CODEC_ID_PCM_S24BE_PLANAR,
+        c::CODEC_ID_PCM_U24LE, c::CODEC_ID_PCM_U24LE_PLANAR, c::CODEC_ID_PCM_U24BE, c::CODEC_ID_PCM_U24BE_PLANAR,
+    ];
+    let float = [
+        c::CODEC_ID_PCM_S32LE, c::CODEC_ID_PCM_S32LE_PLANAR, c::CODEC_ID_PCM_S32BE, c::CODEC_ID_PCM_S32BE_PLANAR,
+        c::CODEC_ID_PCM_U32LE, c::CODEC_ID_PCM_U32LE_PLANAR, c::CODEC_ID_PCM_U32BE, c::CODEC_ID_PCM_U32BE_PLANAR,
+        c::CODEC_ID_PCM_F32LE, c::CODEC_ID_PCM_F32LE_PLANAR, c::CODEC_ID_PCM_F32BE, c::CODEC_ID_PCM_F32BE_PLANAR,
+        c::CODEC_ID_PCM_F64LE, c::CODEC_ID_PCM_F64LE_PLANAR, c::CODEC_ID_PCM_F64BE, c::CODEC_ID_PCM_F64BE_PLANAR,
+    ];
+    if int16.contains(&params.codec) {
+        return Depth::Int16;
+    }
+    if int24.contains(&params.codec) {
+        return Depth::Int24;
+    }
+    if float.contains(&params.codec) || matches!(params.sample_format, Some(F::F32 | F::F64)) {
+        return Depth::Float;
+    }
+    // Lossless (FLAC, ALAC) as its bits; lossy ones have none: 16-bit.
+    match params.bits_per_sample.or(params.bits_per_coded_sample) {
+        Some(bits) if bits <= 16 => Depth::Int16,
+        Some(bits) if bits <= 24 => Depth::Int24,
+        Some(_) => Depth::Float,
+        None => Depth::Int16,
+    }
 }
 
 /// Peak amplitude per 1/150 s, the resolution of rekordbox's detail
@@ -159,12 +324,21 @@ pub fn peak_waveform(audio: &TrackAudio) -> Vec<f32> {
 
 /// Peak level per `1 / per_second` s.
 pub fn peak_waveform_at(audio: &TrackAudio, per_second: u32) -> Vec<f32> {
-    let step = (audio.sample_rate / per_second.max(1)).max(1) as usize;
-    audio
-        .samples
-        .chunks(step * 2)
-        .map(|chunk| chunk.iter().fold(0f32, |peak, s| peak.max(s.abs())))
+    column_ranges(audio, per_second)
+        .map(|(a, b)| (a * 2..b * 2).map(|i| audio.sample(i)).fold(0f32, |peak, s| peak.max(s.abs())))
         .collect()
+}
+
+/// Each column's frames: column `k` from `k · rate / per_second` on, so
+/// columns stay on time even where the rate doesn't divide evenly (44.1 kHz
+/// at 600 a second is 73.5 frames each).
+fn column_ranges(audio: &TrackAudio, per_second: u32) -> impl Iterator<Item = (usize, usize)> {
+    let (rate, per_second) = (u64::from(audio.sample_rate.max(1)), u64::from(per_second.max(1)));
+    let frames = audio.frames() as u64;
+    let start = move |k: u64| (k * rate / per_second).min(frames) as usize;
+    (0..)
+        .map(move |k| (start(k), start(k + 1)))
+        .take_while(|&(a, b)| b > a)
 }
 
 /// Peak level of the low (< 200 Hz), mid and high (> 2.5 kHz) bands per
@@ -174,25 +348,69 @@ pub fn band_waveform(audio: &TrackAudio) -> Vec<[f32; 3]> {
     band_waveform_at(audio, 150)
 }
 
+/// Splits a signal into lows (under about 200 Hz), mids and highs (over
+/// about 2.5 kHz) for waveforms, each band with two-pole filters of its own
+/// (taking one band from another lets the mids into the highs).
+pub struct BandSplit {
+    low: [OnePole; 2],
+    mid_low: [OnePole; 2],
+    mid_high: [OnePole; 2],
+    high: [OnePole; 2],
+}
+
+/// A one-pole low-pass, or high-pass (what the low-pass takes out).
+#[derive(Clone, Copy)]
+struct OnePole {
+    a: f32,
+    y: f32,
+    high: bool,
+}
+
+impl OnePole {
+    fn new(hz: f32, rate: f32, high: bool) -> Self {
+        Self { a: 1.0 - (-2.0 * std::f32::consts::PI * hz / rate).exp(), y: 0.0, high }
+    }
+
+    fn next(&mut self, x: f32) -> f32 {
+        self.y += self.a * (x - self.y);
+        if self.high { x - self.y } else { self.y }
+    }
+}
+
+impl BandSplit {
+    pub fn new(sample_rate: u32) -> Self {
+        let rate = sample_rate.max(1) as f32;
+        let two = |hz, high| [OnePole::new(hz, rate, high); 2];
+        Self { low: two(200.0, false), mid_low: two(200.0, true), mid_high: two(2_500.0, false), high: two(2_500.0, true) }
+    }
+
+    /// The next sample's low, mid and high.
+    pub fn next(&mut self, x: f32) -> [f32; 3] {
+        let twice = |f: &mut [OnePole; 2], x| {
+            let y = f[0].next(x);
+            f[1].next(y)
+        };
+        let low = twice(&mut self.low, x);
+        let mid = twice(&mut self.mid_high, twice(&mut self.mid_low, x));
+        let high = twice(&mut self.high, x);
+        [low, mid, high]
+    }
+}
+
 /// [`band_waveform`] with `per_second` columns a second.
 pub fn band_waveform_at(audio: &TrackAudio, per_second: u32) -> Vec<[f32; 3]> {
-    // One-pole low-passes are enough for a display.
-    let coefficient =
-        |cutoff: f32| 1.0 - (-2.0 * std::f32::consts::PI * cutoff / audio.sample_rate as f32).exp();
-    let (a_low, a_high) = (coefficient(200.0), coefficient(2_500.0));
-    let (mut low, mut below_high) = (0f32, 0f32);
-    let step = (audio.sample_rate / per_second.max(1)).max(1) as usize;
-    let mut columns = Vec::with_capacity(audio.frames() / step + 1);
+    let mut split = BandSplit::new(audio.sample_rate);
+    let ends: Vec<usize> = column_ranges(audio, per_second).map(|(_, b)| b).collect();
+    let mut next = ends.iter().copied().peekable();
+    let mut columns = Vec::with_capacity(ends.len());
     let mut peak = [0f32; 3];
-    for (i, frame) in audio.samples.chunks_exact(2).enumerate() {
-        let x = (frame[0] + frame[1]) * 0.5;
-        low += a_low * (x - low);
-        below_high += a_high * (x - below_high);
-        let bands = [low, below_high - low, x - below_high];
+    for (i, frame) in audio.to_f32().chunks_exact(2).enumerate() {
+        let bands = split.next((frame[0] + frame[1]) * 0.5);
         for (p, b) in peak.iter_mut().zip(bands) {
             *p = p.max(b.abs());
         }
-        if (i + 1) % step == 0 {
+        if next.peek() == Some(&(i + 1)) {
+            next.next();
             columns.push(std::mem::take(&mut peak));
         }
     }
@@ -207,12 +425,69 @@ pub fn band_waveform_at(audio: &TrackAudio, per_second: u32) -> Vec<[f32; 3]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Held at a file's own depth, every sample comes back as decoded: all
+    /// 16-bit values; 24-bit ones across the range; a lossy file's overs
+    /// above full scale are kept, not cut off.
+    #[test]
+    fn depths_keep_every_sample() {
+        let values: Vec<f32> = (-32768..32768).map(|k| k as f32 / 32768.0).collect();
+        let held = TrackAudio::with_depth(44_100, values.clone(), Depth::Int16);
+        assert_eq!(held.bytes(), values.len() * 2);
+        assert!((0..values.len()).all(|i| held.sample(i) == values[i]));
+        let values: Vec<f32> = (-8_388_608..8_388_608).step_by(997).map(|k| k as f32 / 8_388_608.0).collect();
+        let held = TrackAudio::with_depth(44_100, values.clone(), Depth::Int24);
+        assert_eq!(held.bytes(), values.len() * 3);
+        assert!((0..values.len()).all(|i| held.sample(i) == values[i]));
+        let loud = vec![0.5, -1.25, 1.1, 0.0];
+        let held = TrackAudio::with_depth(44_100, loud.clone(), Depth::Int16);
+        assert!((0..4).all(|i| (held.sample(i) - loud[i]).abs() < 1e-4), "{:?}", held.to_f32());
+    }
+
+
+    /// Files kept as they are (`DECKHAND_DEPTH_FILES`: paths, `:`-separated):
+    /// prints each one's depth, memory and largest difference from floats.
+    #[test]
+    #[ignore]
+    fn files_keep_their_depth() {
+        for path in std::env::var("DECKHAND_DEPTH_FILES").unwrap().split(':') {
+            let audio = decode_file(Path::new(path)).unwrap();
+            println!("{path}: {:?}, {} bytes for {} samples", audio.depth(), audio.bytes(), audio.len());
+        }
+    }
+
+
+    /// 120 BPM clicks for 5 minutes at 44.1 kHz: at 600 columns a second
+    /// (73.5 frames each) the last click is still in its own column, not
+    /// seconds early.
+    #[test]
+    fn waveform_columns_do_not_drift() {
+        let rate = 44_100u32;
+        let frames = rate as usize * 300;
+        let mut samples = vec![0f32; frames * 2];
+        for beat in 0..600 {
+            let at = beat * rate as usize / 2;
+            for s in &mut samples[at * 2..(at + 20) * 2] {
+                *s = 0.9;
+            }
+        }
+        let audio = TrackAudio::new(rate, samples);
+        let peaks = peak_waveform_at(&audio, 600);
+        assert_eq!(peaks.len(), 180_000);
+        let last = peaks.iter().rposition(|&p| p > 0.5).unwrap();
+        assert_eq!(last, 599 * 300, "{} columns off", last as i64 - 599 * 300);
+        let bands = band_waveform_at(&audio, 600);
+        assert_eq!(bands.len(), 180_000);
+        let loudest = (179_000..180_000).max_by(|&a, &b| bands[a][2].total_cmp(&bands[b][2])).unwrap();
+        assert!((loudest as i64 - 599 * 300).abs() <= 1, "{loudest}");
+    }
+
     use super::*;
 
     #[test]
     fn interpolation_hits_frames_and_follows_curves() {
         let samples: Vec<f32> = (0..8).flat_map(|i| [(i * i) as f32, -(i as f32)]).collect();
-        let audio = TrackAudio { sample_rate: 1, samples };
+        let audio = TrackAudio::new(1, samples);
         for cubic in [false, true] {
             assert_eq!(audio.sample_at(3.0, cubic), [9.0, -3.0]);
             assert_eq!(audio.sample_at(2.5, cubic)[1], -2.5);
@@ -230,7 +505,7 @@ mod tests {
                 [s, s]
             })
             .collect();
-        TrackAudio { sample_rate: rate, samples }
+        TrackAudio::new(rate, samples)
     }
 
     fn loudest_band(audio: &TrackAudio) -> usize {

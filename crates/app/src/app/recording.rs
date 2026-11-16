@@ -267,8 +267,7 @@ impl DeckhandApp {
             if ui.button("Open folder").clicked() {
                 let dir = self.recordings_dir();
                 let _ = std::fs::create_dir_all(&dir);
-                let opener = if cfg!(windows) { "explorer" } else { "open" };
-                let _ = std::process::Command::new(opener).arg(&dir).spawn();
+                crate::app::collection_view::open_folder(&dir);
             }
             if self.config.recordings_dir.is_some() && ui.button("Default").clicked() {
                 self.config.recordings_dir = None;

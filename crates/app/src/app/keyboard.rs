@@ -661,7 +661,8 @@ impl DeckhandApp {
             self.keyboard.capturing = None;
         }
         let live = performing && self.config.prefs.keyboard_mixing && !ctx.wants_keyboard_input();
-        let decks = if self.config.four_decks { self.active_decks } else { [0, 1] };
+        // The active deck on each side (the one shown, with two decks).
+        let decks = self.active_decks;
         let steps = ctx.input_mut(|i| self.keyboard.read(&mut i.events, live, decks));
         for step in steps {
             match step {

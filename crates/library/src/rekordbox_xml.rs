@@ -224,7 +224,7 @@ fn parse_cue<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Option<Cue> {
         (Some(r), Some(g), Some(b)) => Some([r as u8, g as u8, b as u8]),
         _ => None,
     };
-    Some(Cue { kind, start, end, color, name: get("Name").unwrap_or_default().to_owned() })
+    Some(Cue { kind, start, end, color, name: get("Name").unwrap_or_default().to_owned(), active: false })
 }
 
 /// `file://localhost/Users/me/a%20b.mp3` → `/Users/me/a b.mp3`;

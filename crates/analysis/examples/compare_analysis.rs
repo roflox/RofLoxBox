@@ -35,8 +35,8 @@ fn main() -> Result<()> {
                     };
                     let Some(track) = tracks.get(i) else { break };
                     let Ok(audio) = deckhand_audio::decode_file(&track.path) else { continue };
-                    let grid = beat_grid(&audio.samples, audio.sample_rate, DEFAULT_RANGE);
-                    let key = detect_key(&audio.samples, audio.sample_rate);
+                    let grid = beat_grid(&audio.to_f32(), audio.sample_rate, DEFAULT_RANGE);
+                    let key = detect_key(&audio.to_f32(), audio.sample_rate);
                     rows.lock().expect("a worker panicked").push((track, grid, key));
                 }
             });

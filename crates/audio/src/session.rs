@@ -293,7 +293,7 @@ impl Outline {
     fn of(audio: &TrackAudio, step: usize) -> Self {
         let step = step.max(1);
         let fine: Vec<f32> = audio
-            .samples
+            .to_f32()
             .chunks(step * 2)
             .map(|c| c.iter().fold(0f32, |m, s| m.max(s.abs())))
             .collect();
@@ -391,6 +391,29 @@ fn copy_dir(from: &Path, to: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// Stems kept with a recording whose folder was renamed or moved since (or
+/// made on another computer: the path may be Windows' or not): its
+/// `stems/` folder beside the session, `folder`.
+pub(crate) fn moved_stems(folder: &Path, source: &StemsSource) -> Option<PathBuf> {
+    if source.dir.exists() {
+        return None;
+    }
+    let text = source.dir.to_string_lossy();
+    let mut parts = text.rsplit(['/', '\\']).filter(|p| !p.is_empty());
+    let (name, parent) = (parts.next()?, parts.next()?);
+    let here = folder.join("stems").join(name);
+    (parent == "stems" && StemLayers::saved_in(&here)).then_some(here)
+}
+
+/// Where a track's stems are on disk, kept with a recording (not in the
+/// app's stem cache): to load them when they are first needed.
+pub(crate) fn stems_on_disk(folder: Option<&Path>, source: &StemsSource) -> Option<PathBuf> {
+    if StemLayers::saved_in(&source.dir) {
+        return Some(source.dir.clone());
+    }
+    folder.and_then(|f| moved_stems(f, source))
+}
+
 /// A track's stems. Stems that are gone become stems not separated yet,
 /// with a warning: the whole track plays where its parts were turned up or
 /// down, and the deck limits its peaks as with stems (as it did live while
@@ -402,15 +425,11 @@ fn open_stems(source: &StemsSource) -> Result<Option<Arc<StemLayers>>> {
         if let Some(stems) = opened.stems.get(source) {
             return Ok(Some(stems.clone()));
         }
-        // Kept with a recording whose folder was renamed or moved since:
-        // its stems/ folder beside the session.
-        let moved = opened.folder.as_ref().and_then(|folder| {
-            let name = source.dir.file_name()?;
-            let kept_here = source.dir.parent()?.file_name()? == "stems";
-            let here = folder.join("stems").join(name);
-            (kept_here && !source.dir.exists() && StemLayers::saved_in(&here))
-                .then(|| StemsSource { dir: here, ..source.clone() })
-        });
+        let moved = opened
+            .folder
+            .as_deref()
+            .and_then(|folder| moved_stems(folder, source))
+            .map(|dir| StemsSource { dir, ..source.clone() });
         match opened.sources.stems(moved.as_ref().unwrap_or(source), &track) {
             Ok(stems) => {
                 remember_stems(&stems, source.clone());
@@ -1270,6 +1289,9 @@ pub struct TrackSpan {
     pub playing: Vec<(u64, u64)>,
     /// Scratched (see [`Clip::scratch`]).
     pub scratch: bool,
+    /// An edit's clip played straight on (not looped): where in its track
+    /// it starts, seconds.
+    pub source: Option<f64>,
 }
 
 /// A recorded session, read back with its tracks.
@@ -1390,6 +1412,10 @@ impl Session {
         }
         let mut edit = Edit::from_session(self)?;
         edit.recording = Some(orig_path(recording));
+        // Stems no clip turns parts of up or down: left on disk.
+        edit.leave_unused_stems(recording.parent());
+        let used: Vec<StemsSource> = edit.stems.keys().cloned().collect();
+        self.stems.retain(|s, _| used.contains(s));
         self.edit = Some(Box::new(edit));
         self.recompile();
         Ok(())
@@ -1525,7 +1551,15 @@ impl Session {
         let start = self.snapshot.clock;
         let length = self.length();
         let path = |audio: &Arc<TrackAudio>| source_of(&TRACKS, audio).unwrap_or_default();
-        let span = |deck, path, from| TrackSpan { deck, path, from, to: from, playing: Vec::new(), scratch: false };
+        let span = |deck, path, from| TrackSpan {
+            deck,
+            path,
+            from,
+            to: from,
+            playing: Vec::new(),
+            scratch: false,
+            source: None,
+        };
         let jump_split = (JUMP_SPLIT_SECS * f64::from(self.rate)) as u64;
         // Per deck: the track on it, and since when it plays.
         let mut open: Vec<Option<(TrackSpan, Option<u64>)>> = (0..crate::engine::DECKS)
@@ -3246,6 +3280,37 @@ impl Session {
         self.run(self.events.iter(), &mut Out(out))
     }
 
+    /// [`Session::render`] for listening from `from` (frames from the
+    /// start): up to [`LEAD_IN_SECS`] before it the mixer only moves the
+    /// decks along, many times quicker, so playing late in a long set
+    /// starts at once; from there it sounds (echo and reverb tails, a
+    /// stretcher settled), so what is heard from `from` is as rendered.
+    pub fn render_from(&self, from: u64, out: impl FnMut(&[f32]) -> Result<()>) -> Result<u64> {
+        struct Out<F> {
+            out: F,
+            sound_at: u64,
+            quiet: bool,
+        }
+        impl<F: FnMut(&[f32]) -> Result<()>> Run for Out<F> {
+            fn positions_only(&self) -> bool {
+                self.quiet
+            }
+            fn before(&mut self, clock: u64, mixer: &mut Offline) -> Result<()> {
+                if self.quiet && clock >= self.sound_at {
+                    self.quiet = false;
+                    mixer.sounding();
+                }
+                Ok(())
+            }
+            fn after(&mut self, _: u64, buffer: &[f32], _: &mut Offline) -> Result<()> {
+                (self.out)(buffer)
+            }
+        }
+        let lead = (LEAD_IN_SECS * f64::from(self.rate)) as u64;
+        let sound_at = self.snapshot.clock + from.saturating_sub(lead);
+        self.run(self.events.iter(), &mut Out { out, sound_at, quiet: from > lead })
+    }
+
     /// Plays `events` through the mixer from the snapshot, with `run`
     /// along; returns the frames played.
     fn run<'a>(
@@ -3300,6 +3365,84 @@ impl Session {
     }
 
     /// When each deck was synced, and to which master.
+    /// Makes `master` the sync master from `from` to `to` (frames from the
+    /// start; `None`: sync off there), in an edit. Sync is to be done again
+    /// ([`Session::resync`]) for the decks to follow it.
+    pub fn set_master(&mut self, from: u64, to: u64, master: Option<usize>) -> Result<()> {
+        if self.edit.is_none() {
+            bail!("only an edit's master can change");
+        }
+        self.with_edit(|e| e.set_master(from, to, master));
+        Ok(())
+    }
+
+    /// Adds a point to the master's lane at `at` (an edit's): the master
+    /// can change from there. False if one is there already.
+    pub fn add_master_point(&mut self, at: u64) -> bool {
+        self.edit.is_some() && self.with_edit(|e| e.add_master_point(at))
+    }
+
+    /// Moves the master's point at `from` to `to` (between its
+    /// neighbours); returns where it went.
+    pub fn move_master_point(&mut self, from: u64, to: u64) -> u64 {
+        if self.edit.is_none() {
+            return from;
+        }
+        self.with_edit(|e| e.move_master_point(from, to))
+    }
+
+    /// Takes the master's point at `at` away.
+    pub fn remove_master_point(&mut self, at: u64) {
+        if self.edit.is_some() {
+            self.with_edit(|e| e.remove_master_point(at));
+        }
+    }
+
+    /// The memory its audio takes, in bytes: the tracks (each once, however
+    /// many clips play it) and their stems.
+    pub fn audio_bytes(&self) -> (usize, usize) {
+        let mut seen = std::collections::HashSet::new();
+        let mut tracks = 0;
+        let mut stems = 0;
+        let edit_tracks = self.edit.iter().flat_map(|e| e.tracks.values());
+        for t in self.tracks.values().chain(edit_tracks) {
+            if seen.insert(Arc::as_ptr(t) as usize) {
+                tracks += t.bytes();
+            }
+        }
+        let edit_stems = self.edit.iter().flat_map(|e| e.stems.values());
+        for s in self.stems.values().chain(edit_stems) {
+            if seen.insert(Arc::as_ptr(s) as usize) {
+                stems += s.bytes();
+            }
+        }
+        (tracks, stems)
+    }
+
+    /// Which deck was the sync master over the whole set (frames from the
+    /// start; `None` while none was or no deck had BEAT SYNC on), from
+    /// point to point: a stretch for each time sync's state was set, even
+    /// if the master stayed (so a point added splits it).
+    pub fn master_spans(&self) -> Vec<(u64, u64, Option<usize>)> {
+        let start = self.snapshot.clock;
+        let length = self.length();
+        let mut spans: Vec<(u64, u64, Option<usize>)> = Vec::new();
+        let (mut from, mut now) = (0u64, None);
+        for (at, event) in &self.events {
+            let Logged::Command(Command::SyncState { master, synced }) = event else { continue };
+            let master = master.filter(|_| synced.iter().any(|&s| s));
+            let at = at.saturating_sub(start).min(length);
+            if at > from {
+                spans.push((from, at, now));
+            }
+            (from, now) = (at, master);
+        }
+        if length > from {
+            spans.push((from, length, now));
+        }
+        spans
+    }
+
     pub fn sync_spans(&self) -> Vec<SyncSpan> {
         let start = self.snapshot.clock;
         let length = self.length();
@@ -3330,7 +3473,32 @@ impl Session {
     /// [`Session::played`], and the mix's level after every buffer: where
     /// it starts, its peak and its RMS (1.0 = full scale).
     pub fn played_and_mix(&self) -> Result<(Vec<Played>, Vec<(u64, f32, f32)>)> {
+        self.replay(false, None)
+    }
+
+    /// [`Session::played_and_mix`], stopping (with an error) once `cancel`
+    /// is set.
+    pub fn played_and_mix_until(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Vec<Played>, Vec<(u64, f32, f32)>)> {
+        self.replay(false, Some(cancel))
+    }
+
+    /// [`Session::played`] without sound: where each deck was in its track
+    /// and its beats (its levels all 0), many times quicker.
+    pub fn played_positions(&self) -> Result<Vec<Played>> {
+        Ok(self.replay(true, None)?.0)
+    }
+
+    fn replay(
+        &self,
+        quiet: bool,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(Vec<Played>, Vec<(u64, f32, f32)>)> {
         let mut playing = Playing {
+            quiet,
+            cancel,
             grids: &self.grids,
             tracks: std::array::from_fn(|d| {
                 self.snapshot.deck(d).0.and_then(|audio| source_of(&TRACKS, audio))
@@ -3356,7 +3524,8 @@ impl Session {
                     *at,
                     match event {
                         Logged::Block(frames) => Logged::Block(*frames),
-                        Logged::Command(command) => Logged::Command(self.copy(command)?),
+                        // Its audio shared, as copying it by name would.
+                        Logged::Command(command) => Logged::Command(command.clone()),
                         Logged::Jog(deck, steps) => Logged::Jog(*deck, *steps),
                         Logged::End => Logged::End,
                     },
@@ -3586,9 +3755,18 @@ struct Playing<'a> {
     decks: Vec<Played>,
     /// The mix's level after each buffer: start, peak, RMS.
     mix: Vec<(u64, f32, f32)>,
+    /// Where the decks were only, no sound (levels all 0): many times
+    /// quicker.
+    quiet: bool,
+    /// Set from elsewhere: stop (the result is no longer wanted).
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl Run for Playing<'_> {
+    fn positions_only(&self) -> bool {
+        self.quiet
+    }
+
     fn event(&mut self, event: &Logged) {
         if let Logged::Command(Command::Load { deck, audio }) = event
             && *deck < self.tracks.len()
@@ -3608,6 +3786,9 @@ impl Run for Playing<'_> {
     }
 
     fn after(&mut self, clock: u64, buffer: &[f32], mixer: &mut Offline) -> Result<()> {
+        if self.cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            anyhow::bail!("no longer wanted");
+        }
         let at = clock - self.start;
         let from = at - (buffer.len() / 2) as u64;
         let peak = buffer.iter().fold(0f32, |m, s| m.max(s.abs()));
@@ -3688,6 +3869,10 @@ const OPEN_END: u64 = u64::MAX / 4;
 /// A jump while a deck plays makes a play (a clip) of its own from there,
 /// once the play before it is this long (seconds).
 pub const JUMP_SPLIT_SECS: f64 = 0.2;
+
+/// How long before where listening starts the mixer plays with sound
+/// ([`Session::render_from`]): longer than an echo or reverb rings.
+pub const LEAD_IN_SECS: f64 = 10.0;
 
 /// What runs along with a session through the mixer.
 trait Run {
@@ -3839,6 +4024,11 @@ impl<'a> Resync<'a> {
 }
 
 impl Run for Resync<'_> {
+    /// Sync needs where the decks are, not how they sound.
+    fn positions_only(&self) -> bool {
+        true
+    }
+
     fn event(&mut self, event: &Logged) {
         match event {
             Logged::Command(Command::SyncState { master, synced }) => {
@@ -4032,7 +4222,7 @@ mod tests {
                 [tone + n, tone - n]
             })
             .collect();
-        Arc::new(TrackAudio { sample_rate: rate, samples })
+        Arc::new(TrackAudio::new(rate, samples))
     }
 
     #[test]
@@ -4080,7 +4270,7 @@ mod tests {
 
         let wav = dir.join("set.wav");
         let (recording, tap) = crate::record::Recording::start(&wav, rate).unwrap();
-        send(&mut live, vec![Command::Record(Some(tap))]);
+        send(&mut live, vec![Command::Record(crate::engine::Handoff(Some(tap)))]);
         play(&mut live, 512, 10);
         // A second deck comes in scratched, then loops, with a sampler hit
         // and an echo; the buffer size changes on the way.
@@ -4152,7 +4342,7 @@ mod tests {
             ],
         );
         play(&mut live, 512, 20);
-        send(&mut live, vec![Command::Record(None)]);
+        send(&mut live, vec![Command::Record(crate::engine::Handoff(None))]);
         play(&mut live, 512, 1);
         recording.finish().unwrap();
 
@@ -4545,7 +4735,7 @@ mod tests {
         for command in before {
             live.command(command).unwrap();
         }
-        live.command(Command::Record(Some(tap))).unwrap();
+        live.command(Command::Record(crate::engine::Handoff(Some(tap)))).unwrap();
         for command in commands {
             live.command(command).unwrap();
         }
@@ -4553,7 +4743,7 @@ mod tests {
         for _ in 0..(secs * f64::from(rate) / 512.0) as usize {
             live.render(&mut buffer);
         }
-        live.command(Command::Record(None)).unwrap();
+        live.command(Command::Record(crate::engine::Handoff(None))).unwrap();
         live.render(&mut buffer);
         recording.finish().unwrap();
         session_path(&wav)
@@ -4752,7 +4942,7 @@ mod tests {
                 live.render(&mut buffer);
             }
         };
-        live.command(Command::Record(Some(tap))).unwrap();
+        live.command(Command::Record(crate::engine::Handoff(Some(tap)))).unwrap();
         live.command(Command::Load { deck: 0, audio: a.clone() }).unwrap();
         live.command(Command::SetPlaying { deck: 0, playing: true }).unwrap();
         play(&mut live, 94);
@@ -4761,7 +4951,7 @@ mod tests {
         play(&mut live, 47);
         live.command(Command::SetVolume { deck: 0, level: 0.3 }).unwrap();
         play(&mut live, 100);
-        live.command(Command::Record(None)).unwrap();
+        live.command(Command::Record(crate::engine::Handoff(None))).unwrap();
         live.render(&mut vec![0.0; 1024]);
         recording.finish().unwrap();
 
@@ -4837,10 +5027,7 @@ mod tests {
         let path = PathBuf::from("/music/stemmed.wav");
         remember_track(&a, &path);
         let vocals = track(rate, 3.0, 14);
-        let vocals = TrackAudio {
-            sample_rate: rate,
-            samples: vocals.samples.iter().map(|s| s * 0.5).collect(),
-        };
+        let vocals = TrackAudio::new(rate, vocals.to_f32().iter().map(|s| s * 0.5).collect());
         let stems = Arc::new(StemLayers::new(Some(&vocals), None, None, rate, a.frames()));
         let cache = StemsSource {
             track: path.clone(),
@@ -5147,8 +5334,8 @@ mod tests {
         assert_eq!(written, to - from);
         let part = crate::decode::decode_file(&out).unwrap();
         assert_eq!(part.frames() as u64, to - from);
-        let worst = (0..part.samples.len())
-            .map(|i| (part.samples[i] - whole[from as usize * 2 + i]).abs())
+        let worst = (0..part.len())
+            .map(|i| (part.sample(i) - whole[from as usize * 2 + i]).abs())
             .fold(0.0f32, f32::max);
         // 24-bit rounding.
         assert!(worst < 1e-5, "{worst}");
@@ -5473,6 +5660,156 @@ mod tests {
         assert_eq!(after.playing[0], (30 * block, 75 * block));
         assert_eq!(&after.playing[1..], &before.playing[1..], "the rest as it was");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// Listening late in a set: what is heard from there is what the whole
+    /// render has there, though the mixer was quiet (only moving the deck)
+    /// until shortly before; and it gets there much quicker.
+    #[test]
+    fn listening_from_late_in_a_set_sounds_the_same() {
+        let a = track(48_000, 60.0, 41);
+        let path = PathBuf::from("/music/late.wav");
+        remember_track(&a, &path);
+        let file = record("late", vec![Command::Load { deck: 0, audio: a.clone() }], 40.0);
+        let mut session = Session::read(&file, Tracks([(path, a)].into_iter().collect())).unwrap();
+        let start = session.snapshot.clock;
+        let block = 512u64;
+        for (at, command) in [
+            (5, Command::Seek { deck: 0, seconds: 1.0 }),
+            (10, Command::SetPlaying { deck: 0, playing: true }),
+            (400, Command::SetTempo { deck: 0, ratio: 1.04 }),
+            (900, Command::SetNudge { deck: 0, amount: 0.05 }),
+            (910, Command::SetNudge { deck: 0, amount: 0.0 }),
+            (1500, Command::Seek { deck: 0, seconds: 20.0 }),
+        ] {
+            session.events.push((start + at * block, Logged::Command(command)));
+        }
+        session.events.sort_by_key(|(at, event)| (*at, matches!(event, Logged::End)));
+        let t = std::time::Instant::now();
+        let whole = rendered(&session);
+        let full = t.elapsed();
+        let from = 48_000 * 30u64;
+        let t = std::time::Instant::now();
+        let mut quick = Vec::new();
+        let mut first = None;
+        session
+            .render_from(from, |b| {
+                if first.is_none() && quick.len() as u64 / 2 + b.len() as u64 / 2 > from {
+                    first = Some(t.elapsed());
+                }
+                quick.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+        let (i, n) = (from as usize * 2, 48_000 * 2 * 5);
+        let (a, b) = (&whole[i..i + n], &quick[i..i + n]);
+        assert!(a.iter().map(|s| s.abs()).fold(0.0, f32::max) > 0.1, "silent");
+        assert!(worst(a, b) < 1e-3, "{}", worst(a, b));
+        println!("whole render {full:?}; from 30 s, first heard after {:?}", first.unwrap());
+    }
+
+    /// The sync master over the set: off until sync goes on, the deck that
+    /// led, off again when no deck syncs (though one is still master).
+    #[test]
+    fn master_over_the_set() {
+        let state = |at: u64, master, synced: [bool; crate::engine::DECKS]| {
+            (at * 512, Command::SyncState { master, synced })
+        };
+        let none = [false; crate::engine::DECKS];
+        let mut both = none;
+        (both[0], both[1]) = (true, true);
+        let (session, _) = deck_session(
+            "masters",
+            vec![state(10, Some(0), both), state(100, Some(1), both), state(200, Some(1), none)],
+        );
+        let spans = session.master_spans();
+        let length = session.length();
+        assert_eq!(
+            spans,
+            vec![(0, 10 * 512, None), (10 * 512, 100 * 512, Some(0)), (100 * 512, 200 * 512, Some(1)), (200 * 512, length, None)]
+        );
+    }
+
+    /// The master changed in an edit for a stretch: before and after stay
+    /// as they were; undone, it is back.
+    #[test]
+    fn changing_the_master() {
+        let state = |at: u64, master, synced: [bool; crate::engine::DECKS]| {
+            (at * 512, Command::SyncState { master, synced })
+        };
+        let mut both = [false; crate::engine::DECKS];
+        (both[0], both[1]) = (true, true);
+        let (mut session, file) = deck_session("set-master", vec![state(10, Some(0), both)]);
+        session.make_editable(&file).unwrap();
+        let length = session.length();
+        let before = session.backup().unwrap();
+        session.set_master(100 * 512, 200 * 512, Some(1)).unwrap();
+        assert_eq!(
+            session.master_spans(),
+            vec![(0, 10 * 512, None), (10 * 512, 100 * 512, Some(0)), (100 * 512, 200 * 512, Some(1)), (200 * 512, length, Some(0))]
+        );
+        session.set_master(200 * 512, 250 * 512, None).unwrap();
+        assert_eq!(session.master_spans()[3], (200 * 512, 250 * 512, None));
+        assert_eq!(session.master_spans()[4], (250 * 512, length, Some(0)));
+        session.restore(&before).unwrap();
+        assert_eq!(session.master_spans(), vec![(0, 10 * 512, None), (10 * 512, length, Some(0))]);
+    }
+
+    /// Points on the master's lane: one added splits a stretch (the
+    /// master the same on both sides, either can change), moves between
+    /// its neighbours, and taken away joins the stretches again.
+    #[test]
+    fn master_points() {
+        let mut both = [false; crate::engine::DECKS];
+        (both[0], both[1]) = (true, true);
+        let (mut session, file) =
+            deck_session("master-points", vec![(10 * 512, Command::SyncState { master: Some(0), synced: both })]);
+        session.make_editable(&file).unwrap();
+        let length = session.length();
+        assert!(session.add_master_point(100 * 512));
+        assert!(!session.add_master_point(100 * 512), "one there already");
+        assert_eq!(session.master_spans(), vec![(0, 5120, None), (5120, 51200, Some(0)), (51200, length, Some(0))]);
+        // The second half led by deck 2.
+        session.set_master(100 * 512, length, Some(1)).unwrap();
+        assert_eq!(session.master_spans()[2], (51200, length, Some(1)));
+        // Moved earlier, not past the point before it.
+        assert_eq!(session.move_master_point(100 * 512, 50 * 512), 50 * 512);
+        assert_eq!(session.move_master_point(50 * 512, 0), 11 * 512);
+        assert_eq!(session.master_spans()[2], (11 * 512, length, Some(1)));
+        session.remove_master_point(11 * 512);
+        assert_eq!(session.master_spans(), vec![(0, 5120, None), (5120, length, Some(0))]);
+    }
+
+    /// Where the decks were, replayed without sound, is where they were
+    /// with it: the same places and beats, buffer for buffer.
+    #[test]
+    fn positions_without_sound_are_the_same() {
+        let block = 512u64;
+        let (session, _) = deck_session(
+            "positions",
+            vec![
+                (5 * block, Command::Seek { deck: 0, seconds: 1.0 }),
+                (10 * block, Command::SetPlaying { deck: 0, playing: true }),
+                (100 * block, Command::SetTempo { deck: 0, ratio: 1.06 }),
+                (150 * block, Command::SetNudge { deck: 0, amount: 0.05 }),
+                (160 * block, Command::SetNudge { deck: 0, amount: 0.0 }),
+                (200 * block, Command::Seek { deck: 0, seconds: 0.5 }),
+                (300 * block, Command::SetPlaying { deck: 0, playing: false }),
+            ],
+        );
+        let (full, _) = session.played_and_mix().unwrap();
+        let quick = session.played_positions().unwrap();
+        let at = |p: &Played| p.levels.iter().map(|l| l.0).collect::<Vec<_>>();
+        assert_eq!(at(&quick[0]), at(&full[0]));
+        assert_eq!(quick[0].beats, full[0].beats);
+        let off = quick[0]
+            .places
+            .iter()
+            .zip(&full[0].places)
+            .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()))
+            .fold(0.0, f64::max);
+        assert!(off < 1e-6, "{off}");
+        assert!(full[0].places.iter().any(|p| p.1 > 2.0), "it played");
     }
 
     pub(super) fn rendered(s: &Session) -> Vec<f32> {

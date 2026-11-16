@@ -157,14 +157,16 @@ fn overview(detail: &[Column], columns: usize) -> Vec<Column> {
 /// The colour of a column from its low, mid and high levels: the loudest
 /// band at full brightness, the others in proportion.
 fn band_color([low, mid, high]: [f32; 3]) -> Color32 {
-    // Highs measure smaller than lows for the same loudness; lift them.
-    let [r, g, b] = [low, mid * 1.3, high * 2.0];
+    // Highs measure smaller than the rest for the same loudness; lift
+    // them as much.
+    let [r, g, b] = [low, mid, high * 1.35];
     let peak = r.max(g).max(b);
     if peak <= 1e-6 {
         return Color32::from_gray(60);
     }
-    // A steep curve keeps colours saturated, as in rekordbox.
-    let channel = |v: f32| (255.0 * (v / peak).powf(2.2)) as u8;
+    // A curve keeps the colours saturated while the other bands still
+    // tint it (a kick red with some of its click, hats blue).
+    let channel = |v: f32| (255.0 * (v / peak).powf(1.6)) as u8;
     Color32::from_rgb(channel(r), channel(g), channel(b))
 }
 
@@ -618,6 +620,59 @@ pub fn overview_time(rect: Rect, pointer: Pos2, duration: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// How colourful a track's High detail waveform is (`DECKHAND_TRACK`):
+    /// the share of columns that are one band alone (a channel over 90 % of
+    /// the colour), and the average of each channel.
+    /// `cargo test -p deckhand-app --release waveform_colours -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn waveform_colours() {
+        let path = std::env::var("DECKHAND_TRACK").unwrap();
+        let audio = deckhand_audio::decode_file(std::path::Path::new(&path)).unwrap();
+        let data = WaveformData::high_detail(
+            &deckhand_audio::peak_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
+            deckhand_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
+            HIGH_COLUMNS_PER_SECOND,
+        );
+        let raw = deckhand_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND);
+        let n = raw.len() as f32;
+        let avg = |k: usize| raw.iter().map(|b| b[k]).sum::<f32>() / n;
+        println!("bands mean low {:.2} mid {:.2} high {:.2}", avg(0), avg(1), avg(2));
+        // A picture of 8 s from a minute in (`DECKHAND_STRIP`: where, .ppm).
+        if let Ok(out) = std::env::var("DECKHAND_STRIP") {
+            let (w, h) = (1600usize, 120usize);
+            let from = 60 * HIGH_COLUMNS_PER_SECOND as usize;
+            let mut img = vec![20u8; w * h * 3];
+            for x in 0..w {
+                let Some(c) = data.detail.get(from + x * 3) else { break };
+                let half = (c.height * (h / 2) as f32) as usize;
+                for y in h / 2 - half..h / 2 + half {
+                    img[(y * w + x) * 3..][..3].copy_from_slice(&[c.color.r(), c.color.g(), c.color.b()]);
+                }
+            }
+            let mut file = format!("P6 {w} {h} 255\n").into_bytes();
+            file.extend(img);
+            std::fs::write(out, file).unwrap();
+        }
+        let loud: Vec<_> = data.detail.iter().filter(|c| c.height > 0.3).collect();
+        let one = loud
+            .iter()
+            .filter(|c| {
+                let [r, g, b] = [c.color.r(), c.color.g(), c.color.b()].map(f32::from);
+                r.max(g).max(b) > 0.9 * (r + g + b)
+            })
+            .count();
+        let mean = |f: fn(&Column) -> u8| loud.iter().map(|c| f32::from(f(c))).sum::<f32>() / loud.len() as f32;
+        println!(
+            "one band alone: {:.0} %, mean r {:.0} g {:.0} b {:.0}",
+            100.0 * one as f32 / loud.len() as f32,
+            mean(|c| c.color.r()),
+            mean(|c| c.color.g()),
+            mean(|c| c.color.b())
+        );
+    }
+
     use super::*;
 
     #[test]

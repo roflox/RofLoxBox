@@ -67,7 +67,7 @@ fn main() -> Result<()> {
             };
             let Ok(audio) = deckhand_audio::decode_file(&below(&file_path)) else { continue };
             let (ours, dots) =
-                deckhand_analysis::preview::preview(&audio.samples, audio.sample_rate);
+                deckhand_analysis::preview::preview(&audio.to_f32(), audio.sample_rate);
             let count = |a: &[u8], b: &[u8], f: &dyn Fn(u8) -> u8| {
                 a.iter().zip(b).filter(|(x, y)| f(**x) == f(**y)).count()
             };
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
         if std::env::var_os("DECKHAND_MONO").is_some() {
             let Some(theirs) = ext.waveform(WaveformKind::Detail) else { continue };
             let Ok(audio) = deckhand_audio::decode_file(&below(&file_path)) else { continue };
-            let ours = deckhand_analysis::waveform::mono_detail(&audio.samples, audio.sample_rate);
+            let ours = deckhand_analysis::waveform::mono_detail(&audio.to_f32(), audio.sample_rate);
             let theirs: Vec<u8> = theirs.data.clone();
             let n = ours.len().min(theirs.len());
             let same = (0..n).filter(|&i| ours[i] == theirs[i]).count();
@@ -155,7 +155,7 @@ fn main() -> Result<()> {
             let Some(theirs) = ext.waveform(WaveformKind::ColorPreview) else { continue };
             let Ok(audio) = deckhand_audio::decode_file(&below(&file_path)) else { continue };
             let ours =
-                deckhand_analysis::waveform::color_overview(&audio.samples, audio.sample_rate);
+                deckhand_analysis::waveform::color_overview(&audio.to_f32(), audio.sample_rate);
             let theirs: Vec<[i8; 6]> =
                 theirs.columns().map(|c| std::array::from_fn(|i| c[i] as i8)).collect();
             let n = ours.len().min(theirs.len());
@@ -197,10 +197,10 @@ fn main() -> Result<()> {
             std::env::var("DECKHAND_OFFSET").ok().and_then(|o| o.parse().ok()).unwrap_or(0);
         let samples: Vec<f32> = if offset >= 0 {
             std::iter::repeat_n(0.0, 2 * offset as usize)
-                .chain(audio.samples.iter().copied())
+                .chain(audio.to_f32().iter().copied())
                 .collect()
         } else {
-            audio.samples.iter().copied().skip(2 * (-offset) as usize).collect()
+            audio.to_f32().iter().copied().skip(2 * (-offset) as usize).collect()
         };
         // DECKHAND_TAIL frames of silence at the end (experiment).
         let tail: usize =

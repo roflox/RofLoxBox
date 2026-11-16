@@ -193,6 +193,12 @@ pub struct LoadedTrack {
 }
 
 impl LoadedTrack {
+    /// Whether `range` is the track's active loop.
+    pub fn is_active_loop(&self, range: (f64, f64)) -> bool {
+        self.active_loop
+            .is_some_and(|(s, e)| (s - range.0).abs() < 0.001 && (e - range.1).abs() < 0.001)
+    }
+
     fn beat_length(&self) -> f64 {
         if self.bpm > 0.0 { 60.0 / self.bpm } else { 0.5 }
     }
@@ -370,11 +376,15 @@ pub struct Deck {
     /// A nudge or scratch just ended: take the current phase as the offset.
     pub rephase: bool,
     /// Let go of after dragging its waveform while synced: onto the
-    /// master's nearest beat once the record has settled, not before this
-    /// (the engine takes the release with its next buffers).
+    /// nearest beat (the master's, or for the master a synced deck's) once
+    /// the record has settled, not before this (the engine takes the
+    /// release with its next buffers).
     pub snap_at: Option<std::time::Instant>,
     /// The waveform is held by the mouse, stopping the deck.
     grabbed: bool,
+    /// The waveform was dragged (grabbed or, paused, just moved) since the
+    /// pointer went down.
+    waveform_moved: bool,
     pub volume: f32,
     pub trim: f32,
     /// Knob positions, 0.5 = flat.
@@ -413,6 +423,8 @@ pub struct Deck {
     pub grid_edited: bool,
     /// The beat-grid edit controls are open.
     pub grid_edit: bool,
+    /// The memory list shows in the pads' place.
+    pub memory_list: bool,
     pub prefs: DeckPrefs,
     /// Jog steps the controller sends per turn of a wheel.
     pub jog_steps_per_turn: f64,
@@ -468,6 +480,7 @@ impl Deck {
             rephase: false,
             snap_at: None,
             grabbed: false,
+            waveform_moved: false,
             volume: 1.0,
             trim: 0.5,
             eq: [0.5; 3],
@@ -490,6 +503,7 @@ impl Deck {
             edited: false,
             grid_edited: false,
             grid_edit: false,
+            memory_list: false,
             prefs: DeckPrefs::default(),
             jog_steps_per_turn: 720.0,
             double_of: None,
@@ -821,8 +835,8 @@ impl Deck {
 
     // Memory cues
 
-    /// Memory cues and loops by start time.
-    fn memory_points(&self) -> Vec<(f64, Option<f64>)> {
+    /// Memory cues and loops by start time (the memory list).
+    pub fn memory_points(&self) -> Vec<(f64, Option<f64>)> {
         let Some(track) = &self.track else { return Vec::new() };
         let mut points: Vec<(f64, Option<f64>)> = track
             .memory_cues
@@ -898,6 +912,58 @@ impl Deck {
         }
     }
 
+    /// Calls one memory cue or loop from the list (the memory call lock
+    /// keeps it from a playing deck).
+    pub fn memory_go(&mut self, start: f64, end: Option<f64>, engine: &mut Engine) {
+        if self.prefs.memory_call_lock && engine.is_playing(self.index) {
+            return;
+        }
+        self.cue_point = start;
+        engine.send(Command::Seek { deck: self.index, seconds: start });
+        match end {
+            Some(end) => {
+                self.loop_in = Some(start);
+                self.set_loop(start, end, engine);
+            }
+            None if self.loop_active => {
+                self.loop_active = false;
+                engine.send(Command::ClearLoop { deck: self.index });
+            }
+            None => {}
+        }
+    }
+
+    /// Makes the memory loop `range` the track's active loop, or not (one
+    /// per track, as in rekordbox: it loops by itself when playback gets
+    /// there, from the next load on).
+    pub fn set_active_loop(&mut self, range: (f64, f64), active: bool) {
+        let Some(track) = self.track.as_mut() else { return };
+        if track.is_active_loop(range) == active {
+            return;
+        }
+        track.active_loop = if active {
+            Some(range)
+        } else {
+            None
+        };
+        self.edited = true;
+    }
+
+    /// Deletes one memory cue (`end` `None`) or loop from the list.
+    pub fn memory_remove(&mut self, start: f64, end: Option<f64>) {
+        let Some(track) = self.track.as_mut() else { return };
+        match end {
+            Some(end) => {
+                track.memory_loops.retain(|l| (l.0 - start).abs() >= 0.001 || (l.1 - end).abs() >= 0.001);
+                if track.is_active_loop((start, end)) {
+                    track.active_loop = None;
+                }
+            }
+            None => track.memory_cues.retain(|m| (m - start).abs() >= 0.001),
+        }
+        self.edited = true;
+    }
+
     /// Deletes the memory cue or loop at the cue point.
     pub fn memory_delete(&mut self) {
         let t = self.cue_point;
@@ -905,6 +971,9 @@ impl Deck {
             track.memory_cues.retain(|m| (m - t).abs() >= AT_CUE);
             self.edited = true;
             track.memory_loops.retain(|l| (l.0 - t).abs() >= AT_CUE);
+            if track.active_loop.is_some_and(|l| (l.0 - t).abs() < AT_CUE) {
+                track.active_loop = None;
+            }
         }
     }
 
@@ -1148,6 +1217,7 @@ impl Deck {
     /// The waveform dragged by this many seconds of music.
     pub fn drag_waveform(&mut self, seconds: f64, engine: &mut Engine) {
         let deck = self.index;
+        self.waveform_moved = true;
         engine.send(if self.grabbed {
             Command::JogMove { deck, seconds }
         } else {
@@ -1155,22 +1225,26 @@ impl Deck {
         });
     }
 
-    /// Lets go of a grabbed waveform: the deck plays on from exactly where
-    /// it was dragged to. A synced deck then snaps onto the master's
-    /// nearest beat (its offset goes, see [`Deck::snap_at`]) instead of
-    /// keeping where it was let go, as a nudge does.
+    /// Lets go of a dragged waveform: a grabbed deck plays on from exactly
+    /// where it was dragged to. A synced deck then snaps onto the nearest
+    /// beat (its offset goes, see [`Deck::snap_at`]), playing or paused,
+    /// instead of keeping where it was let go, as a nudge does.
     pub fn release_waveform(&mut self, engine: &mut Engine) {
-        if !std::mem::take(&mut self.grabbed) {
+        let grabbed = std::mem::take(&mut self.grabbed);
+        let moved = std::mem::take(&mut self.waveform_moved);
+        if !grabbed && !moved {
             return;
         }
         if self.sync {
             (self.phase_offset, self.rephase) = (0.0, false);
             self.snap_at = Some(std::time::Instant::now() + SNAP_AFTER);
-        } else {
+        } else if grabbed {
             self.rephase = true;
         }
-        engine.send(Command::Settle { deck: self.index });
-        engine.send(Command::Hold { deck: self.index, held: false });
+        if grabbed {
+            engine.send(Command::Settle { deck: self.index });
+            engine.send(Command::Hold { deck: self.index, held: false });
+        }
     }
 
     pub fn jog_touch(&mut self, touched: bool, engine: &mut Engine) {
@@ -1231,6 +1305,7 @@ impl Deck {
             self.keyboard_cue = None;
         }
         self.pad_mode = mode;
+        self.memory_list = false;
     }
 
     /// Key Shift pads set the key to ±0 … +7 semitones from the page.
@@ -1781,13 +1856,10 @@ fn detect_missing(track: &LoadedTrack, audio: Arc<TrackAudio>) -> Option<Receive
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         use deckhand_analysis::beats::{DEFAULT_RANGE, beat_grid};
+        let samples = audio.to_f32();
         let found = Detected {
-            grid: grid
-                .then(|| beat_grid(&audio.samples, audio.sample_rate, DEFAULT_RANGE))
-                .flatten(),
-            key: key
-                .then(|| deckhand_analysis::key::detect_key(&audio.samples, audio.sample_rate))
-                .flatten(),
+            grid: grid.then(|| beat_grid(&samples, audio.sample_rate, DEFAULT_RANGE)).flatten(),
+            key: key.then(|| deckhand_analysis::key::detect_key(&samples, audio.sample_rate)).flatten(),
         };
         let _ = tx.send(found);
     });
@@ -1797,7 +1869,7 @@ fn detect_missing(track: &LoadedTrack, audio: Arc<TrackAudio>) -> Option<Receive
 /// When the first sound louder than `db` starts, in seconds.
 fn first_sound(audio: &TrackAudio, db: f32) -> Option<f64> {
     let threshold = 10f32.powf(db / 20.0);
-    let index = audio.samples.iter().position(|s| s.abs() > threshold)?;
+    let index = (0..audio.len()).position(|i| audio.sample(i).abs() > threshold)?;
     Some((index / 2) as f64 / f64::from(audio.sample_rate))
 }
 
@@ -1813,7 +1885,7 @@ pub const TRACK_GAIN_DB: std::ops::RangeInclusive<f32> = -12.0..=12.0;
 pub fn auto_gain_db(audio: &TrackAudio) -> f32 {
     let block = (audio.sample_rate as usize * 2 * 2 / 5).max(2);
     let powers: Vec<f64> = audio
-        .samples
+        .to_f32()
         .chunks(block)
         .filter(|c| c.len() == block)
         .map(|c| c.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / c.len() as f64)
@@ -1837,6 +1909,7 @@ struct Known {
     hot_cues: [Option<HotCue>; HOT_CUES],
     memory_cues: Vec<f64>,
     memory_loops: Vec<(f64, f64)>,
+    active_loop: Option<(f64, f64)>,
 }
 
 impl Known {
@@ -1847,6 +1920,7 @@ impl Known {
             hot_cues: [None; HOT_CUES],
             memory_cues: Vec::new(),
             memory_loops: Vec::new(),
+            active_loop: None,
         };
         for cue in &track.cues {
             match (cue.kind, cue.end) {
@@ -1856,7 +1930,10 @@ impl Known {
                     known.hot_cues[usize::from(n)] = Some(HotCue { seconds: cue.start, color });
                 }
                 (deckhand_library::CueKind::Memory, Some(end)) => {
-                    known.memory_loops.push((cue.start, end))
+                    known.memory_loops.push((cue.start, end));
+                    if cue.active {
+                        known.active_loop = Some((cue.start, end));
+                    }
                 }
                 (deckhand_library::CueKind::Memory, None) => known.memory_cues.push(cue.start),
                 _ => {}
@@ -1905,7 +1982,7 @@ impl LoadRequest {
         let worked_out = || match self.analysis {
             AnalysisMethod::Rekordbox => {
                 let columns =
-                    deckhand_analysis::waveform::color_detail(&audio.samples, audio.sample_rate);
+                    deckhand_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
                 let data = columns.iter().flat_map(|c| c.to_be_bytes()).collect();
                 let waveform = Waveform { kind: WaveformKind::ColorDetail, entry_len: 2, data };
                 let ext = AnlzFile { sections: vec![Section::Waveform(waveform)] };
@@ -1989,6 +2066,7 @@ impl LoadRequest {
                 c.loop_end_ms.map(|end| (f64::from(c.time_ms) / 1000.0, f64::from(end) / 1000.0))
             })
             .filter(|(start, end)| end > start);
+        let mut active_loop = active_loop;
         let stored_gain = self.known.as_ref().and_then(|k| k.gain_db);
         if let Some(known) = self.known {
             // Collection tracks: the collection's grid and cues (edited in
@@ -2004,8 +2082,8 @@ impl LoadRequest {
                 beats = known.beats;
             }
             if no_cues || (self.from_collection && known_cues) {
-                (hot_cues, memory_cues, memory_loops) =
-                    (known.hot_cues, known.memory_cues, known.memory_loops);
+                (hot_cues, memory_cues, memory_loops, active_loop) =
+                    (known.hot_cues, known.memory_cues, known.memory_loops, known.active_loop);
             }
         }
 
@@ -2051,7 +2129,7 @@ mod tests {
         let audio = decode_file(&path).unwrap();
         time("decode", started);
         let started = std::time::Instant::now();
-        let _ = deckhand_analysis::waveform::color_detail(&audio.samples, audio.sample_rate);
+        let _ = deckhand_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
         time("color waveform", started);
         let started = std::time::Instant::now();
         let _ = band_waveform(&audio);
@@ -2100,7 +2178,7 @@ mod tests {
                 })
                 .collect()
         };
-        let audio = TrackAudio { sample_rate: 44_100, samples: sine(1.0) };
+        let audio = TrackAudio::new(44_100, sine(1.0));
         assert!(
             (auto_gain_db(&audio) - AUTO_GAIN_TARGET_DB).abs() < 0.1,
             "{}",
@@ -2109,10 +2187,10 @@ mod tests {
         let mut samples = vec![0.0; 44_100 * 4];
         samples.extend(sine(0.01));
         samples.extend(sine(0.5));
-        let half = auto_gain_db(&TrackAudio { sample_rate: 44_100, samples });
+        let half = auto_gain_db(&TrackAudio::new(44_100, samples));
         assert!((half - (AUTO_GAIN_TARGET_DB + 6.0)).abs() < 0.2, "{half}");
         assert_eq!(
-            auto_gain_db(&TrackAudio { sample_rate: 44_100, samples: vec![0.0; 1000] }),
+            auto_gain_db(&TrackAudio::new(44_100, vec![0.0; 1000])),
             0.0
         );
     }
@@ -2187,6 +2265,42 @@ mod tests {
         let mut deck = Deck::new(0);
         deck.track = Some(track(grid, 120.0));
         deck
+    }
+
+    /// One active loop per track: making another active moves it, deleting
+    /// the active one clears it, and a plain cue never is.
+    #[test]
+    fn one_active_loop_per_track() {
+        let mut deck = grid_deck();
+        let track = deck.track.as_mut().unwrap();
+        track.memory_loops = vec![(10.0, 12.0), (20.0, 24.0)];
+        track.memory_cues = vec![5.0];
+        deck.set_active_loop((10.0, 12.0), true);
+        assert!(deck.edited);
+        deck.set_active_loop((20.0, 24.0), true);
+        assert_eq!(deck.track.as_ref().unwrap().active_loop, Some((20.0, 24.0)));
+        deck.memory_remove(10.0, Some(12.0));
+        assert_eq!(deck.track.as_ref().unwrap().active_loop, Some((20.0, 24.0)));
+        deck.memory_remove(20.0, Some(24.0));
+        deck.memory_remove(5.0, None);
+        let track = deck.track.as_ref().unwrap();
+        assert_eq!((track.active_loop, track.memory_loops.len(), track.memory_cues.len()), (None, 0, 0));
+        // From the collection: the flagged loop is the active one.
+        let mut collection = deckhand_library::Collection::default();
+        collection.merge(vec![deckhand_library::ScannedFile {
+            path: "/a.wav".into(),
+            ..Default::default()
+        }]);
+        let mut stored = collection.tracks[0].clone();
+        stored.cues = vec![deckhand_library::Cue {
+            kind: deckhand_library::CueKind::Memory,
+            start: 30.0,
+            end: Some(32.0),
+            color: None,
+            name: String::new(),
+            active: true,
+        }];
+        assert_eq!(Known::from_track(&stored).active_loop, Some((30.0, 32.0)));
     }
 
     fn first_beats(deck: &Deck) -> Vec<(f64, u16)> {
@@ -2338,7 +2452,7 @@ mod tests {
     fn auto_cue_finds_the_first_sound() {
         let mut samples = vec![0.0001f32; 2000];
         samples.extend([0.5, 0.5]);
-        let audio = TrackAudio { sample_rate: 1000, samples };
+        let audio = TrackAudio::new(1000, samples);
         assert_eq!(first_sound(&audio, -60.0), Some(1.0));
         assert_eq!(first_sound(&audio, -90.0), Some(0.0), "the noise counts at −90 dB");
     }

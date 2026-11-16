@@ -346,7 +346,7 @@ impl DeckhandApp {
             let write = ui
                 .checkbox(&mut writable, "Write changes back to rekordbox")
                 .tour(crate::tour::Target::RekordboxWrite);
-            crate::widgets::help(ui, "On: saving writes your tags, cues, grids and rekordbox-folder playlists into rekordbox's library. rekordbox must be closed; a copy is kept before each save.");
+            crate::widgets::help(ui, "On: saving writes your tags, cues, grids and rekordbox-folder playlists into rekordbox's library. A copy is kept before each save.");
             write
         });
         if write.inner.changed() {
@@ -359,9 +359,11 @@ impl DeckhandApp {
         if self.config.prefs.rekordbox_write {
             ui.indent("rekordbox autosave", |ui| {
                 ui.checkbox(&mut self.config.prefs.rekordbox_autosave, "Save automatically")
-                    .on_hover_text(
-                        "Shortly after each change, once rekordbox is closed",
-                    );
+                    .on_hover_text("Shortly after each change");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.config.prefs.rekordbox_wait_closed, "Wait for rekordbox to close");
+                    crate::widgets::help(ui, "On: deckhand looks for rekordbox before each save and saves only once it's closed (quitting waits for it too). Off: saves go in whether rekordbox runs or not; rekordbox may not show them until it's restarted, and changes it makes meanwhile stop the save until the library is read again.");
+                });
             });
         }
         if self.collection_view.confirm_rekordbox_write {
@@ -436,7 +438,7 @@ impl DeckhandApp {
                 egui::Button::new("Save changes to rekordbox"),
             )
             .on_hover_text(
-                "Write changes to rekordbox's library. Close rekordbox first.",
+                "Write changes to rekordbox's library",
             )
             .clicked()
             && let Some(path) = path
@@ -524,6 +526,7 @@ impl DeckhandApp {
         let view = &self.collection_view;
         prefs.rekordbox_write
             && prefs.rekordbox_autosave
+            && prefs.rekordbox_wait_closed
             && !view.rekordbox_paused
             && (self.collection.rekordbox_unsaved
                 || view.rekordbox_due.is_some()
@@ -594,14 +597,15 @@ impl DeckhandApp {
         if self.collection_view.rekordbox_due.is_some()
             && !self.collection_view.rekordbox_paused
             && self.collection.rekordbox_count.is_some()
-            && !crate::rekordbox_db::rekordbox_running()
+            && !(self.config.prefs.rekordbox_wait_closed && crate::rekordbox_db::rekordbox_running())
             && let Some(path) = self.rekordbox_db().filter(|p| p.is_file())
             && let Some(snapshot) = self.rekordbox_snapshot()
         {
             self.collection_view.rekordbox_due = None;
             let print = self.rekordbox_fingerprint();
+            let prefs = &self.config.prefs;
             let result =
-                save_into_rekordbox(&path, &self.config.prefs.rekordbox_key, &snapshot);
+                save_into_rekordbox(&path, &prefs.rekordbox_key, &snapshot, prefs.rekordbox_wait_closed);
             self.rekordbox_saved(result, print, true);
         }
         let _ = self.collection.save();
@@ -617,9 +621,10 @@ impl DeckhandApp {
             return;
         };
         let key = self.config.prefs.rekordbox_key.clone();
+        let wait_closed = self.config.prefs.rekordbox_wait_closed;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(save_into_rekordbox(&path, &key, &snapshot));
+            let _ = tx.send(save_into_rekordbox(&path, &key, &snapshot, wait_closed));
         });
         self.collection_view.rekordbox_save = Some((rx, print, auto));
         if !auto {
@@ -1000,6 +1005,7 @@ impl DeckhandApp {
                     end: old.as_ref().and_then(|c| c.end),
                     color: Some([hot.color.r(), hot.color.g(), hot.color.b()]),
                     name: old.map(|c| c.name).unwrap_or_default(),
+                    active: false,
                 });
             }
             let memory = loaded.memory_cues.iter().map(|&s| (s, None));
@@ -1012,6 +1018,7 @@ impl DeckhandApp {
                     end,
                     color: old.as_ref().and_then(|c| c.color),
                     name: old.map(|c| c.name).unwrap_or_default(),
+                    active: end.is_some_and(|end| loaded.is_active_loop((start, end))),
                 });
             }
             // Grid edits always leave one straight grid: one marker.
@@ -1363,7 +1370,7 @@ impl DeckhandApp {
         stroke: Stroke,
     ) -> Option<(u32, usize)> {
         let mut load = None;
-        let deck_count = self.deck_count();
+        let shown = self.shown_decks();
         ui.horizontal(|ui| {
             ui.label("🔍");
             ui.add(
@@ -1374,7 +1381,7 @@ impl DeckhandApp {
             .tour(crate::tour::Target::LibrarySearch);
             if let Some(id) = self.selected {
                 ui.separator();
-                for deck in 0..deck_count {
+                for &deck in &shown {
                     if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                         load = Some((id, deck));
                     }
@@ -1451,7 +1458,7 @@ impl DeckhandApp {
                     &options,
                     &mut |ui, row| {
                         let id = row.id;
-                        for deck in 0..deck_count {
+                        for &deck in &shown {
                             if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                                 actions.push(TrackAction::Load(id, deck));
                                 ui.close();
@@ -1675,13 +1682,47 @@ pub(super) fn reveal_label() -> &'static str {
 /// Opens the file manager with the file (or folder) selected; elsewhere
 /// than macOS and Windows, opens the folder it is in.
 pub(super) fn reveal(path: &std::path::Path) {
-    let _ = if cfg!(windows) {
-        std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
-    } else if cfg!(target_os = "macos") {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Explorer wants `/select,"C:\a b\c"`: quoted the usual way (the
+        // whole argument) it doesn't understand it and opens Documents.
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", windows_path(path)))
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg("-R").arg(path).spawn()
     } else {
         std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()
     };
+}
+
+/// Opens a folder in the file manager.
+pub(crate) fn open_folder(dir: &std::path::Path) {
+    let _ = if cfg!(windows) {
+        std::process::Command::new("explorer").arg(windows_path(dir)).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(dir).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(dir).spawn()
+    };
+}
+
+/// `path` as Explorer reads it: backslashes only (a path saved as
+/// `C:/Users/…` opens Documents instead).
+fn windows_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('/', "\\")
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    #[test]
+    fn explorer_gets_backslashes() {
+        let path = std::path::Path::new("C:/Users/someone/Music/RofLoxBox Recordings/Set 1/Set 1.session");
+        assert_eq!(super::windows_path(path), "C:\\Users\\someone\\Music\\RofLoxBox Recordings\\Set 1\\Set 1.session");
+    }
 }
 
 /// Where copies of rekordbox's library are kept before deckhand changes it.
@@ -1698,10 +1739,11 @@ fn save_into_rekordbox(
     path: &std::path::Path,
     saved: &str,
     snapshot: &crate::rekordbox_save::Snapshot,
+    wait_closed: bool,
 ) -> anyhow::Result<crate::rekordbox_save::Saved> {
     let key = match saved.trim() {
         "" => crate::rekordbox_db::fetch_key()?,
         key => key.to_owned(),
     };
-    crate::rekordbox_save::save(path, &key, snapshot, &rekordbox_backups())
+    crate::rekordbox_save::save(path, &key, snapshot, &rekordbox_backups(), wait_closed)
 }

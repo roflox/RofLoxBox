@@ -236,7 +236,7 @@ mod tests {
         write_float_wav_file(&path, 44_100, &samples).unwrap();
         let read = crate::decode_file(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!((read.sample_rate, read.samples), (44_100, samples));
+        assert_eq!((read.sample_rate, read.to_f32().to_vec()), (44_100, samples));
     }
 
     #[test]
@@ -258,7 +258,7 @@ mod tests {
         // Decodes back with the app's own decoder.
         let audio = crate::decode_file(&path).unwrap();
         assert_eq!(audio.frames(), 4_800);
-        assert!((audio.samples[2] + audio.samples[3]).abs() < 1e-3, "left and right mirror");
+        assert!((audio.sample(2) + audio.sample(3)).abs() < 1e-3, "left and right mirror");
         let _ = std::fs::remove_file(path);
     }
 }

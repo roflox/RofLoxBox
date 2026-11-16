@@ -1,8 +1,8 @@
 //! Reading rekordbox's own library (`master.db`): tracks with their tags,
 //! hot cues, memory cues and loops, the playlist tree, and the beat grids
 //! from rekordbox's analysis files beside it. With Preferences allowing it,
-//! deckhand's changes are written back (`rekordbox_save`), with rekordbox
-//! closed and a copy of the library kept first.
+//! deckhand's changes are written back (`rekordbox_save`), with a copy of
+//! the library kept first (and rekordbox closed, if Preferences say so).
 //!
 //! The database is SQLCipher (encrypted SQLite), opened like rekordbox opens
 //! it: SQLCipher decrypts the pages it reads and encrypts the ones it
@@ -73,7 +73,7 @@ const PYREKORDBOX: [&str; 2] = [
 pub fn fetch_key() -> Result<String> {
     let download = |url: &str| -> Result<String> {
         // curl comes with macOS, Windows 10 and later, and Linux.
-        let output = std::process::Command::new("curl")
+        let output = crate::stems::no_window(&mut std::process::Command::new("curl"))
             .args(["-fsSL", "--max-time", "15", url])
             .stdin(std::process::Stdio::null())
             .output()
@@ -170,20 +170,21 @@ fn change_count(db: &rusqlite::Connection) -> Result<i64> {
     Ok(count.flatten().unwrap_or(0))
 }
 
-/// rekordbox was found closed: [`write`] takes this, so nothing writes its
-/// library without asking first. (It could start right after; the change
-/// count checked inside the write catches what it changed.)
+/// rekordbox was found closed, or wasn't looked for (`check` off):
+/// [`write`] takes this, so nothing writes its library without asking
+/// first. (Either way, the change count checked inside the write catches
+/// what rekordbox changed since it was read.)
 pub(crate) struct Closed(());
 
-/// [`Closed`] if rekordbox isn't running.
-pub(crate) fn rekordbox_closed() -> Option<Closed> {
-    (!rekordbox_running()).then_some(Closed(()))
+/// [`Closed`] if rekordbox isn't running, or without `check`.
+pub(crate) fn rekordbox_closed(check: bool) -> Option<Closed> {
+    (!check || !rekordbox_running()).then_some(Closed(()))
 }
 
 /// Whether rekordbox is running: its library must not be written then.
 pub fn rekordbox_running() -> bool {
     let output = if cfg!(windows) {
-        std::process::Command::new("tasklist")
+        crate::stems::no_window(&mut std::process::Command::new("tasklist"))
             .args(["/FI", "IMAGENAME eq rekordbox.exe", "/NH"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("rekordbox.exe"))
@@ -347,8 +348,8 @@ fn hot_cue_color(index: i64) -> Option<[u8; 3]> {
 fn read(db: &rusqlite::Connection, share: &Path) -> Result<XmlLibrary> {
     let mut cues: HashMap<String, Vec<Cue>> = HashMap::new();
     let mut statement = db.prepare(
-        "SELECT ContentID, InMsec, OutMsec, Kind, ColorTableIndex, Comment FROM djmdCue
-         WHERE rb_local_deleted = 0 ORDER BY ContentID, InMsec",
+        "SELECT ContentID, InMsec, OutMsec, Kind, ColorTableIndex, Comment, ActiveLoop
+         FROM djmdCue WHERE rb_local_deleted = 0 ORDER BY ContentID, InMsec",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -365,12 +366,14 @@ fn read(db: &rusqlite::Connection, share: &Path) -> Result<XmlLibrary> {
             CueKind::Hot(_) => hot_cue_color(integer(row, 4)?),
             _ => None,
         };
+        let end = end.filter(|e| *e > start);
         cues.entry(row.get(0)?).or_default().push(Cue {
             kind,
             start,
-            end: end.filter(|e| *e > start),
+            end,
             color,
             name: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            active: kind == CueKind::Memory && end.is_some() && integer(row, 6)? != 0,
         });
     }
 
