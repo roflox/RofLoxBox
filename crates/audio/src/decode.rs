@@ -445,12 +445,12 @@ mod tests {
     }
 
 
-    /// Files kept as they are (`DECKHAND_DEPTH_FILES`: paths, `:`-separated):
+    /// Files kept as they are (`ROFLOXBOX_DEPTH_FILES`: paths, `:`-separated):
     /// prints each one's depth, memory and largest difference from floats.
     #[test]
     #[ignore]
     fn files_keep_their_depth() {
-        for path in std::env::var("DECKHAND_DEPTH_FILES").unwrap().split(':') {
+        for path in std::env::var("ROFLOXBOX_DEPTH_FILES").unwrap().split(':') {
             let audio = decode_file(Path::new(path)).unwrap();
             println!("{path}: {:?}, {} bytes for {} samples", audio.depth(), audio.bytes(), audio.len());
         }

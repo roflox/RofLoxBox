@@ -1,14 +1,14 @@
-//! Test aid: plays a file through each Beat FX, as deckhand's mixer would,
+//! Test aid: plays a file through each Beat FX, as RofLoxBox's mixer would,
 //! into one WAV per effect, to compare with rekordbox's.
 //!
-//!     cargo run -p deckhand-audio --example fx_render -- <in.wav> <out dir> [depth 0-1] [beat secs]
+//!     cargo run -p rofloxbox-audio --example fx_render -- <in.wav> <out dir> [depth 0-1] [beat secs]
 //!
 //! The effect is on from the start (as the test switches rekordbox's on
 //! before playing); `beat secs` defaults to one beat at 120 BPM.
 
 use std::path::PathBuf;
 
-use deckhand_audio::{BeatFx, BeatFxKind, BeatFxParams, FxTarget, decode_file, write_float_wav_file};
+use rofloxbox_audio::{BeatFx, BeatFxKind, BeatFxParams, FxTarget, decode_file, write_float_wav_file};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
             samples.extend_from_slice(&y);
         }
         let name = kind.label().to_lowercase().replace(' ', "-");
-        let path = out.join(format!("deckhand-{name}.wav"));
+        let path = out.join(format!("rofloxbox-{name}.wav"));
         write_float_wav_file(&path, audio.sample_rate, &samples)?;
         println!("{}", path.display());
     }

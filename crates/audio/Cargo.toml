@@ -1,5 +1,5 @@
 [package]
-name = "deckhand-audio"
+name = "rofloxbox-audio"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,9 @@ rtrb = "0.4.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 symphonia = { version = "0.6", features = ["all"] }
+# Writing converted tracks: FLAC (pure Rust) and MP3 (LAME, LGPL), pinned.
+flacenc = { version = "=0.5.1", default-features = false, features = ["par"] }
+mp3lame-encoder = "=0.3.0"
 
 [lints]
 workspace = true

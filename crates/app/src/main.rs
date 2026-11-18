@@ -1,9 +1,9 @@
-//! deckhand: a DJ application for rekordbox USB exports.
+//! RofLoxBox: a DJ application for rekordbox USB exports.
 
 // Release builds on Windows open no console window next to the app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-/// The name shown to users (the code and settings folder keep "deckhand").
+/// The name shown to users.
 pub const APP_NAME: &str = "RofLoxBox";
 /// 0.<number of commits>.0 (see build.rs).
 pub const VERSION: &str = env!("ROFLOXBOX_VERSION");
@@ -13,11 +13,13 @@ mod app;
 mod artwork;
 mod browser;
 mod config;
+mod convert;
 mod controller;
 mod deck;
 mod effects;
 mod layout;
 mod library;
+mod os_drop;
 mod parts;
 mod prefs_view;
 mod preview;
@@ -43,11 +45,11 @@ fn main() -> eframe::Result {
         .with_title(format!("{APP_NAME} {VERSION}"))
         .with_icon(window_icon());
     // Test aid: start in full screen.
-    if std::env::var_os("DECKHAND_FULLSCREEN").is_some() {
+    if std::env::var_os("ROFLOXBOX_FULLSCREEN").is_some() {
         viewport = viewport.with_fullscreen(true);
     }
     // Test aid: open the window at "x,y" (for example on another monitor).
-    if let Some((x, y)) = std::env::var("DECKHAND_WINDOW_POS")
+    if let Some((x, y)) = std::env::var("ROFLOXBOX_WINDOW_POS")
         .ok()
         .and_then(|p| {
             p.split_once(',').map(|(x, y)| (x.trim().parse::<f32>(), y.trim().parse::<f32>()))
@@ -62,5 +64,5 @@ fn main() -> eframe::Result {
     #[cfg(not(target_os = "macos"))]
     let renderer = eframe::Renderer::Glow;
     let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
-    eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(app::DeckhandApp::new(cc)))))
+    eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(app::RofLoxBoxApp::new(cc)))))
 }

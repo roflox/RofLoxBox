@@ -2,7 +2,7 @@
 //! computed from the audio, and drawn into egui with cue markers and the
 //! deck's EQ applied.
 
-use deckhand_formats::anlz::{AnlzFile, Waveform as AnlzWaveform, WaveformKind};
+use rofloxbox_formats::anlz::{AnlzFile, Waveform as AnlzWaveform, WaveformKind};
 use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, Vec2, pos2, vec2};
 
 /// Columns per second in rekordbox's detail waveforms.
@@ -123,7 +123,7 @@ impl WaveformData {
         };
     }
 
-    /// From peak levels at 150 per second (see `deckhand_audio::peak_waveform`).
+    /// From peak levels at 150 per second (see `rofloxbox_audio::peak_waveform`).
     pub fn from_peaks(peaks: &[f32], bands: Vec<[f32; 3]>) -> Self {
         let max = peaks.iter().copied().fold(0.0f32, f32::max).max(1e-6);
         Self::with_detail(
@@ -250,7 +250,13 @@ pub struct Markers<'a> {
     pub active_loop: Option<((f64, f64), bool)>,
     /// Beat grid brightness, 0.0 (off) … 1.5.
     pub grid_strength: f32,
+    /// Slip: where the track would be, running on while the record is
+    /// scratched, held or looping.
+    pub slip: Option<f64>,
 }
+
+/// The slip needle: where playback returns to when slipping ends.
+const SLIP_NEEDLE: Color32 = Color32::from_rgb(120, 200, 255);
 
 /// Places time (`along`, later = larger) and amplitude (`across`) on the
 /// screen, horizontally (time left to right) or vertically (time bottom to
@@ -515,6 +521,15 @@ pub fn draw_detail(
             flag(painter, corner, letter, color, 13.0);
         }
     }
+    if let Some(t) = markers.slip {
+        let a = along_of(t);
+        if (0.0..=length).contains(&a) {
+            axes.line(painter, a, 0.0, breadth, Stroke::new(2.0_f32, SLIP_NEEDLE));
+            let pos = axes.at(a + 3.0, 2.0);
+            let font = FontId::proportional(10.0);
+            painter.text(pos, Align2::LEFT_TOP, "SLIP", font, SLIP_NEEDLE);
+        }
+    }
     axes.line(painter, center, 0.0, breadth, Stroke::new(2.0_f32, Color32::from_rgb(255, 60, 60)));
 }
 
@@ -576,6 +591,13 @@ pub fn draw_overview(
         );
         flag(painter, pos2(x, rect.top()), letter, color, 10.0);
     }
+    if let Some(t) = markers.slip {
+        let x = x_of(t);
+        painter.line_segment(
+            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(1.5_f32, SLIP_NEEDLE),
+        );
+    }
     let x = rect.left() + played * rect.width();
     painter.line_segment(
         [pos2(x, rect.top()), pos2(x, rect.bottom())],
@@ -621,26 +643,26 @@ pub fn overview_time(rect: Rect, pointer: Pos2, duration: f64) -> f64 {
 #[cfg(test)]
 mod tests {
 
-    /// How colourful a track's High detail waveform is (`DECKHAND_TRACK`):
+    /// How colourful a track's High detail waveform is (`ROFLOXBOX_TRACK`):
     /// the share of columns that are one band alone (a channel over 90 % of
     /// the colour), and the average of each channel.
-    /// `cargo test -p deckhand-app --release waveform_colours -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app --release waveform_colours -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn waveform_colours() {
-        let path = std::env::var("DECKHAND_TRACK").unwrap();
-        let audio = deckhand_audio::decode_file(std::path::Path::new(&path)).unwrap();
+        let path = std::env::var("ROFLOXBOX_TRACK").unwrap();
+        let audio = rofloxbox_audio::decode_file(std::path::Path::new(&path)).unwrap();
         let data = WaveformData::high_detail(
-            &deckhand_audio::peak_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
-            deckhand_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
+            &rofloxbox_audio::peak_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
+            rofloxbox_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
             HIGH_COLUMNS_PER_SECOND,
         );
-        let raw = deckhand_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND);
+        let raw = rofloxbox_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND);
         let n = raw.len() as f32;
         let avg = |k: usize| raw.iter().map(|b| b[k]).sum::<f32>() / n;
         println!("bands mean low {:.2} mid {:.2} high {:.2}", avg(0), avg(1), avg(2));
-        // A picture of 8 s from a minute in (`DECKHAND_STRIP`: where, .ppm).
-        if let Ok(out) = std::env::var("DECKHAND_STRIP") {
+        // A picture of 8 s from a minute in (`ROFLOXBOX_STRIP`: where, .ppm).
+        if let Ok(out) = std::env::var("ROFLOXBOX_STRIP") {
             let (w, h) = (1600usize, 120usize);
             let from = 60 * HIGH_COLUMNS_PER_SECOND as usize;
             let mut img = vec![20u8; w * h * 3];

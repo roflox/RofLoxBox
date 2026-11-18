@@ -35,7 +35,9 @@ use crate::fx::BeatFxParams;
 use crate::stems::{PARTS, StemLayers};
 
 /// What the first line of an edit's file says it is.
-const FORMAT: &str = "deckhand-edit";
+const FORMAT: &str = "rofloxbox-edit";
+/// What edits saved before the rename say they are: still read.
+const OLD_FORMAT: &str = "deckhand-edit";
 const VERSION: u32 = 1;
 /// A scratch let go of and grabbed again this soon (seconds) is one.
 const SCRATCH_GAP_SECS: f64 = 0.5;
@@ -47,7 +49,8 @@ pub fn is_edit(path: &Path) -> bool {
     let mut head = [0u8; 256];
     let Ok(mut file) = File::open(path) else { return false };
     let n = file.read(&mut head).unwrap_or(0);
-    String::from_utf8_lossy(&head[..n]).contains(FORMAT)
+    let head = String::from_utf8_lossy(&head[..n]);
+    head.contains(FORMAT) || head.contains(OLD_FORMAT)
 }
 
 /// Where a recording is kept once its file holds an edit of it.
@@ -871,7 +874,7 @@ impl Edit {
         OPENED.set(Some(opened));
         let read = (|| -> Result<(Saved, HashMap<StemsSource, PathBuf>)> {
             let saved: Saved = serde_json::from_reader(BufReader::new(file))?;
-            if saved.format != FORMAT {
+            if saved.format != FORMAT && saved.format != OLD_FORMAT {
                 bail!("not an edit");
             }
             if saved.version > VERSION {

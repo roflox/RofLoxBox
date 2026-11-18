@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use deckhand_audio::Command;
-use deckhand_control::{DeckAction, GlobalAction, Value};
+use rofloxbox_audio::Command;
+use rofloxbox_control::{DeckAction, GlobalAction, Value};
 use eframe::egui::{self, Event, Key, Modifiers, RichText};
 
-use super::DeckhandApp;
+use super::RofLoxBoxApp;
 use crate::config::Preferences;
 use crate::prefs_view::PrefsTab;
 
@@ -333,7 +333,7 @@ fn hand_bindings(side: usize, hand: &Hand, out: &mut Vec<Binding>) {
     }
     // Stems.
     section = "Stems";
-    for (part, name) in deckhand_control::STEM_PARTS.iter().enumerate() {
+    for (part, name) in rofloxbox_control::STEM_PARTS.iter().enumerate() {
         add(section, None, Deck(D::StemPart(part as u8)), format!("{name} on/off"));
     }
     add(section, None, Deck(D::PartIsolator), "Part Isolator".to_owned());
@@ -654,7 +654,7 @@ fn key_button(ui: &mut egui::Ui, binding: &Binding, capturing: &mut Option<Strin
     }
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// Mixing keys, before the library's so that Shift + arrows load tracks.
     pub(super) fn mixing_keys(&mut self, ctx: &egui::Context, performing: bool) {
         if !self.show_prefs || self.prefs_tab != PrefsTab::Keyboard {

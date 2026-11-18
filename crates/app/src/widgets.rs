@@ -518,3 +518,69 @@ pub fn command(ui: &mut Ui, command: &str) {
         }
     });
 }
+
+/// A name being typed (a playlist's, a folder's): it takes the keyboard
+/// the moment it shows, with the whole name selected (typing replaces it,
+/// Enter keeps it), and scrolls into view. Done when it `lost_focus()`.
+pub fn name_field(
+    ui: &mut eframe::egui::Ui,
+    text: &mut String,
+    width: f32,
+) -> eframe::egui::Response {
+    let output = eframe::egui::TextEdit::singleline(text).desired_width(width).show(ui);
+    let response = output.response;
+    // Asked for only while it has none: asked for again after Enter, it
+    // would never lose it, and the name never be set.
+    if !response.has_focus() && !response.lost_focus() {
+        response.request_focus();
+        let mut state = output.state;
+        let all = eframe::egui::text::CCursorRange::select_all(&output.galley);
+        state.cursor.set_char_range(Some(all));
+        state.store(ui.ctx(), response.id);
+        response.scroll_to_me(Some(eframe::egui::Align::Center));
+    }
+    response
+}
+
+/// While something is dragged (tracks, playlists, files from the file
+/// manager), the scrolling list `ui` is in scrolls under it: by the mouse
+/// wheel (which egui leaves alone during a drag) and by itself while the
+/// pointer is held near its top or bottom edge (or just past it), faster
+/// the closer it is.
+pub fn scroll_while_dragging(ui: &eframe::egui::Ui) {
+    use eframe::egui::{DragAndDrop, vec2};
+    const EDGE: f32 = 36.0;
+    const FASTEST: f32 = 1200.0; // points per second, right at the edge
+    let ctx = ui.ctx();
+    let dragging_widget = ctx.dragged_id().is_some();
+    if !dragging_widget && !DragAndDrop::has_any_payload(ctx) {
+        return;
+    }
+    let Some(pointer) = ctx.pointer_hover_pos() else { return };
+    let area = ui.clip_rect();
+    // Also just past its edges (over a header, or held above it): scrolling
+    // at full speed there.
+    if !area.expand2(vec2(0.0, EDGE)).contains(pointer) {
+        return;
+    }
+    let (wheel, dt) = ctx.input(|i| (i.smooth_scroll_delta, i.stable_dt.min(0.1)));
+    // egui scrolls by the wheel itself unless a widget is being dragged.
+    let mut delta = if dragging_widget { wheel } else { eframe::egui::Vec2::ZERO };
+    let near = |distance: f32| ((EDGE - distance) / EDGE).clamp(0.0, 1.0) * FASTEST * dt;
+    delta.y += near(pointer.y - area.top()) - near(area.bottom() - pointer.y);
+    if delta != vec2(0.0, 0.0) {
+        ui.scroll_with_delta(delta);
+        ctx.request_repaint();
+    }
+}
+
+/// What of type `P` was dropped on `response` this frame. Unlike egui's
+/// `dnd_release_payload`, it leaves a drag of another type alone (that one
+/// takes whatever is dragged, dropping what isn't a `P`).
+pub fn dropped<P: std::any::Any + Send + Sync>(
+    response: &eframe::egui::Response,
+) -> Option<std::sync::Arc<P>> {
+    eframe::egui::DragAndDrop::has_payload_of_type::<P>(&response.ctx)
+        .then(|| response.dnd_release_payload::<P>())
+        .flatten()
+}

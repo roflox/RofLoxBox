@@ -2,7 +2,7 @@
 use std::path::Path;
 
 fn summary(path: &Path) -> String {
-    match deckhand_control::rekordbox::import_file(path) {
+    match rofloxbox_control::rekordbox::import_file(path) {
         Ok(i) => format!(
             "{:>4} controls {:>3} lights",
             i.mapping.bindings.len(),

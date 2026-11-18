@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use deckhand_audio::{
+use rofloxbox_audio::{
     BeatFxKind, BeatFxParams, ColorFxKind, Command, Engine, FxTarget, SAMPLER_SLOTS, TrackAudio,
     decode_file,
 };
@@ -55,7 +55,7 @@ impl PadFxSlot {
 
 /// Effects saved by name in the settings.
 mod fx_kind {
-    use deckhand_audio::BeatFxKind;
+    use rofloxbox_audio::BeatFxKind;
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     pub fn serialize<S: Serializer>(kind: &BeatFxKind, s: S) -> Result<S::Ok, S::Error> {
@@ -352,7 +352,7 @@ impl Effects {
                 .filter_map(|&(slot, ref path)| {
                     let name = path.file_stem()?.to_string_lossy().into_owned();
                     let audio = Arc::new(decode_file(path).ok()?);
-                    deckhand_audio::remember_track(&audio, path);
+                    rofloxbox_audio::remember_track(&audio, path);
                     Some((slot, name, audio))
                 })
                 .collect();
@@ -390,7 +390,7 @@ mod tests {
     /// from one not chosen, to the nearest chosen one that way.
     #[test]
     fn stepping_through_chosen_beat_fx() {
-        use deckhand_audio::BeatFxKind as K;
+        use rofloxbox_audio::BeatFxKind as K;
         let mut fx = Effects::default();
         let chosen = [K::Echo, K::Reverb, K::Roll];
         fx.kind = K::Echo;

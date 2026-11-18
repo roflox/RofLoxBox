@@ -341,6 +341,10 @@ struct DeckMeter {
     /// The jog is bending the tempo right now.
     bending: AtomicBool,
     peak: AtomicU32,
+    /// Slip: where the track would be (seconds), NaN when not slipping,
+    /// and how fast that runs (track seconds per second).
+    slip_secs: AtomicU64,
+    slip_speed: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -582,6 +586,24 @@ impl Engine {
         let now = self.shared.epoch.elapsed().as_nanos() as u64;
         let since = now.saturating_sub(published) as f64 * 1e-9;
         self.position_secs(deck) + speed * since.min(MAX_EXTRAPOLATION_SECS)
+    }
+
+    /// Slip mode: where the track would be now if it had played on
+    /// (scratched, held, looping), glided between buffers like the
+    /// record; `None` while playback is where it would be.
+    pub fn slip_position_secs(&self, deck: usize) -> Option<f64> {
+        let meter = &self.shared.decks[deck];
+        let at = f64::from_bits(meter.slip_secs.load(Ordering::Relaxed));
+        if at.is_nan() {
+            return None;
+        }
+        // It runs at the deck's playing speed: the record's, unless that
+        // is being moved by hand; then estimated from where it was.
+        let published = meter.published_nanos.load(Ordering::Relaxed);
+        let now = self.shared.epoch.elapsed().as_nanos() as u64;
+        let since = (now.saturating_sub(published) as f64 * 1e-9).min(MAX_EXTRAPOLATION_SECS);
+        let speed = f64::from_bits(meter.slip_speed.load(Ordering::Relaxed));
+        Some(at + speed * since)
     }
 
     /// The record is moving (playing, scratched or gliding to a jog position).
@@ -1052,7 +1074,20 @@ impl Mixer {
                 {
                     let rate = f64::from(audio.sample_rate);
                     let end = audio.frames() as f64;
-                    let target = (d.target.unwrap_or(d.position) + seconds * rate).clamp(0.0, end);
+                    let from = d.target.unwrap_or(d.position);
+                    let mut target = from + seconds * rate;
+                    // Moved across an end of the loop it's in: round to its
+                    // other end, back as well as forward, like playback.
+                    if let Some((start, end)) = d.loop_frames
+                        && end > start
+                        && (start..=end).contains(&from)
+                        && !(start..=end).contains(&target)
+                    {
+                        let wrapped = start + (target - start).rem_euclid(end - start);
+                        d.position = (d.position + wrapped - target).clamp(start, end);
+                        target = wrapped;
+                    }
+                    let target = target.clamp(0.0, end);
                     let lag = MAX_SCRATCH_SPEED * MAX_JOG_LAG_SECS * rate;
                     d.position = d.position.clamp(target - lag, target + lag);
                     d.target = Some(target);
@@ -1624,6 +1659,13 @@ impl Mixer {
             store_f64(&meter.position_secs, position);
             meter.playing.store(deck.playing, Ordering::Relaxed);
             meter.bending.store(deck.jog_bend != 0.0 || deck.coasting, Ordering::Relaxed);
+            let slip = if deck.was_slipping { deck.shadow / rate } else { f64::NAN };
+            let previous = f64::from_bits(meter.slip_secs.load(Ordering::Relaxed));
+            let slip_speed = (slip - previous) / buffer_secs.max(1e-6);
+            let slip_speed =
+                if slip_speed.is_finite() && slip_speed.abs() <= 4.0 { slip_speed } else { 0.0 };
+            store_f64(&meter.slip_speed, slip_speed);
+            store_f64(&meter.slip_secs, slip);
             // Publish and decay the peak so meters fall back smoothly.
             store_f32(&meter.peak, deck.peak);
             deck.peak *= 0.9;
@@ -1929,8 +1971,10 @@ fn move_buffer(deck: &mut DeckState, frames: f64, rate: f64) -> bool {
         }
         deck.velocity = speed;
         let mut position = deck.position + speed * frames;
+        // Playback reaching the loop's end goes round.
         if let Some((start, end)) = deck.loop_frames
             && speed > 0.0
+            && deck.position < end
             && position >= end
             && end > start
         {
@@ -1951,14 +1995,19 @@ fn move_buffer(deck: &mut DeckState, frames: f64, rate: f64) -> bool {
     true
 }
 
-/// A deck's record moves on a frame: round its loop, not past its ends.
+/// A deck's record moves on a frame: round its loop at either end, going
+/// forward or (spun back) backward, not past the track's ends. A held
+/// record goes round with its target (see [`Command::JogMove`]).
 fn advance(deck: &mut DeckState, frames: f64) {
+    let before = deck.position;
     deck.position += deck.velocity;
     if let Some((start, end)) = deck.loop_frames
-        && deck.velocity > 0.0
-        && deck.position >= end
+        && deck.target.is_none()
+        && end > start
+        && (deck.velocity > 0.0 && before < end && deck.position >= end
+            || deck.velocity < 0.0 && before >= start && deck.position < start)
     {
-        deck.position = start + (deck.position - end) % (end - start);
+        deck.position = start + (deck.position - start).rem_euclid(end - start);
     }
     deck.position = deck.position.max(0.0);
     if deck.position >= frames {
@@ -2061,6 +2110,65 @@ mod tests {
         let mut out = vec![0f32; 800 * 2];
         mixer.render(&mut out, 2);
         assert!((position(&shared, 2) - 1.0).abs() < 1e-3, "{}", position(&shared, 2));
+    }
+
+    /// Slip: while the record is held, where the track would be runs on
+    /// (for the waveform's slip needle); none once playback is back there.
+    #[test]
+    fn the_slip_position_runs_on_while_held() {
+        let (mut mixer, mut tx, shared) = mixer(1_000);
+        let audio = Arc::new(TrackAudio::new(1_000, vec![0.1; 10_000 * 2]));
+        tx.push(Command::Load { deck: 0, audio }).unwrap();
+        tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
+        tx.push(Command::SetSlip { deck: 0, on: true }).unwrap();
+        tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+        let slip =
+            |shared: &Shared| f64::from_bits(shared.decks[0].slip_secs.load(Ordering::Relaxed));
+        let mut out = vec![0f32; 100 * 2];
+        mixer.render(&mut out, 2);
+        assert!(slip(&shared).is_nan(), "not slipping yet");
+        tx.push(Command::Hold { deck: 0, held: true }).unwrap();
+        for _ in 0..5 {
+            let mut out = vec![0f32; 100 * 2];
+            mixer.render(&mut out, 2);
+        }
+        // Held at 1.1 s; the track would be half a second on.
+        assert!((position(&shared, 0) - 1.1).abs() < 0.01, "{}", position(&shared, 0));
+        assert!((slip(&shared) - 1.6).abs() < 0.01, "{}", slip(&shared));
+    }
+
+    /// A record moved across an end of an active loop goes round to its
+    /// other end, back as well as forward, held or spun and let go.
+    #[test]
+    fn a_record_moved_across_a_loop_end_goes_round() {
+        // Moved from 1.2 s in a 1.0–1.5 s loop: 0.4 s on is 1.1 s (round
+        // the end), 0.3 s back is 1.4 s (round the start).
+        for (moved, wanted) in [(0.4, 1.1), (-0.3, 1.4), (-1.3, 1.4)] {
+            let (mut mixer, mut tx, shared) = mixer(1_000);
+            let audio = Arc::new(TrackAudio::new(1_000, vec![0.1; 10_000 * 2]));
+            tx.push(Command::Load { deck: 0, audio }).unwrap();
+            tx.push(Command::Seek { deck: 0, seconds: 1.0 }).unwrap();
+            tx.push(Command::SetLoop { deck: 0, start: 1.0, end: 1.5 }).unwrap();
+            tx.push(Command::SetPlaying { deck: 0, playing: true }).unwrap();
+            let mut out = vec![0f32; 1_200 * 2];
+            mixer.render(&mut out, 2);
+            assert!((position(&shared, 0) - 1.2).abs() < 1e-6, "playback goes round");
+            tx.push(Command::Hold { deck: 0, held: true }).unwrap();
+            tx.push(Command::JogMove { deck: 0, seconds: moved }).unwrap();
+            for _ in 0..10 {
+                let mut out = vec![0f32; 100 * 2];
+                mixer.render(&mut out, 2);
+            }
+            let at = position(&shared, 0);
+            assert!((at - wanted).abs() < 0.01, "held, moved {moved}: {at}");
+            tx.push(Command::Hold { deck: 0, held: false }).unwrap();
+            for _ in 0..20 {
+                let mut out = vec![0f32; 100 * 2];
+                mixer.render(&mut out, 2);
+            }
+            let at = position(&shared, 0);
+            assert!((1.0..=1.5).contains(&at), "let go, moved {moved}: still in the loop: {at}");
+        }
     }
 
     /// A waveform dragged far and let go plays on from where it was

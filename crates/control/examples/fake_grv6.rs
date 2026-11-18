@@ -2,7 +2,7 @@
 //! set of silent control changes (no play or cue) and prints the LED and
 //! meter messages it receives back.
 //!
-//!     cargo run -p deckhand-control --example fake_grv6 -- 8
+//!     cargo run -p rofloxbox-control --example fake_grv6 -- 8
 //!
 //! The argument is how many seconds to stay connected; a second argument
 //! `cues` runs the cue script (memory cue calls, gated hot cue) instead of

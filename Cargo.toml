@@ -15,10 +15,10 @@ opt-level = 3
 # Their debug symbols are most of a debug build's size, and never needed.
 debug = false
 
-[profile.dev.package.deckhand-audio]
+[profile.dev.package.rofloxbox-audio]
 opt-level = 3
 
-[profile.dev.package.deckhand-analysis]
+[profile.dev.package.rofloxbox-analysis]
 opt-level = 3
 
 # No `.unwrap()` outside tests (clippy.toml allows it in them): handle the

@@ -1,5 +1,5 @@
 [package]
-name = "deckhand"
+name = "rofloxbox"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-deckhand-formats = { version = "0.1.0", path = "../formats" }
-deckhand-library = { version = "0.1.0", path = "../library" }
+rofloxbox-formats = { version = "0.1.0", path = "../formats" }
+rofloxbox-library = { version = "0.1.0", path = "../library" }
 
 [lints]
 workspace = true

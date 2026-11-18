@@ -17,7 +17,7 @@
 //! by a pattern per stem under `[files]`. Separations are kept in a cache,
 //! per track and model.
 //!
-//! The model is given deckhand's own decoding of the track, so its stems
+//! The model is given RofLoxBox's own decoding of the track, so its stems
 //! start on the same sample as the original plays here and copied cues land
 //! where they were.
 
@@ -82,11 +82,11 @@ pub struct StemModel {
 }
 
 pub fn models_dir() -> PathBuf {
-    deckhand_library::data_dir().join("models")
+    rofloxbox_library::data_dir().join("models")
 }
 
 fn cache_dir() -> PathBuf {
-    deckhand_library::data_dir().join("stem-cache")
+    rofloxbox_library::data_dir().join("stem-cache")
 }
 
 /// The most the stem cache keeps; past it, the stems of the tracks used
@@ -161,7 +161,7 @@ pub fn cache_size() -> u64 {
 
 /// Where made tracks go unless Preferences say otherwise.
 pub fn default_output_dir() -> PathBuf {
-    deckhand_library::data_dir().join("Stems")
+    rofloxbox_library::data_dir().join("Stems")
 }
 
 /// The models in `dir`, by name, and what could not be read.
@@ -353,7 +353,7 @@ pub struct LiveJob {
     pub input: PathBuf,
     pub model: StemModel,
     /// The track as the deck decoded it.
-    pub audio: Arc<deckhand_audio::TrackAudio>,
+    pub audio: Arc<rofloxbox_audio::TrackAudio>,
     /// The deck's position in seconds (`f64` bits), kept up to date by the
     /// app: the pieces around it go first. [`CANCELLED`] stops the job.
     pub playhead: Arc<AtomicU64>,
@@ -375,7 +375,7 @@ pub enum Event {
     Live {
         deck: usize,
         input: PathBuf,
-        stems: Arc<deckhand_audio::StemLayers>,
+        stems: Arc<rofloxbox_audio::StemLayers>,
     },
     Made {
         track: u32,
@@ -488,20 +488,20 @@ fn run(job: Job, events: &Sender<Event>, running: &Mutex<Option<Child>>, cache: 
 /// The vocal, bass and drum stems, ready to play at the track's `rate` and
 /// length. A model without one of them leaves that part in the instruments.
 /// Each stem gets the level at which all of them add up to `track` (as
-/// deckhand decodes it), whatever the model did to their levels.
+/// RofLoxBox decodes it), whatever the model did to their levels.
 fn layers(
     stems: &BTreeMap<String, PathBuf>,
-    track: &deckhand_audio::TrackAudio,
-) -> Result<deckhand_audio::StemLayers> {
+    track: &rofloxbox_audio::TrackAudio,
+) -> Result<rofloxbox_audio::StemLayers> {
     let mut decoded = stems
         .iter()
-        .map(|(name, file)| Ok((name.as_str(), deckhand_audio::decode_file(file)?)))
+        .map(|(name, file)| Ok((name.as_str(), rofloxbox_audio::decode_file(file)?)))
         .collect::<Result<Vec<_>>>()?;
-    let all: Vec<&deckhand_audio::TrackAudio> = decoded.iter().map(|(_, audio)| audio).collect();
-    let gains = deckhand_audio::fit_gains(track, &all);
+    let all: Vec<&rofloxbox_audio::TrackAudio> = decoded.iter().map(|(_, audio)| audio).collect();
+    let gains = rofloxbox_audio::fit_gains(track, &all);
     for ((_, audio), gain) in decoded.iter_mut().zip(gains) {
         let scaled = audio.to_f32().iter().map(|s| s * gain).collect();
-        *audio = deckhand_audio::TrackAudio::new(audio.sample_rate, scaled);
+        *audio = rofloxbox_audio::TrackAudio::new(audio.sample_rate, scaled);
     }
     let part =
         |is: &dyn Fn(&str) -> bool| decoded.iter().find(|(name, _)| is(name)).map(|(_, a)| a);
@@ -511,7 +511,7 @@ fn layers(
     if vocals.is_none() && bass.is_none() && drums.is_none() {
         bail!("the model has no vocal, bass or drum stem to play");
     }
-    Ok(deckhand_audio::StemLayers::new(vocals, bass, drums, track.sample_rate, track.frames()))
+    Ok(rofloxbox_audio::StemLayers::new(vocals, bass, drums, track.sample_rate, track.frames()))
 }
 
 /// Demucs turns each stem down on its own when it would clip (and saves
@@ -623,9 +623,9 @@ impl Helper {
     }
 
     fn spawn(model: &StemModel, python: &Path, name: &str) -> Result<Self> {
-        let script = deckhand_library::data_dir().join("demucs_worker.py");
+        let script = rofloxbox_library::data_dir().join("demucs_worker.py");
         if std::fs::read_to_string(&script).ok().as_deref() != Some(HELPER_SCRIPT) {
-            std::fs::create_dir_all(deckhand_library::data_dir())?;
+            std::fs::create_dir_all(rofloxbox_library::data_dir())?;
             std::fs::write(&script, HELPER_SCRIPT)?;
         }
         let mut child = no_window(&mut Command::new(python))
@@ -779,9 +779,9 @@ struct Live {
     /// The decks playing this track, with their playheads: a track loaded
     /// on a second deck while it is being separated shares the work.
     decks: Vec<(usize, Arc<AtomicU64>)>,
-    /// The track as deckhand decodes it.
-    track: Arc<deckhand_audio::TrackAudio>,
-    layers: Arc<deckhand_audio::StemLayers>,
+    /// The track as RofLoxBox decodes it.
+    track: Arc<rofloxbox_audio::TrackAudio>,
+    layers: Arc<rofloxbox_audio::StemLayers>,
     /// Every stem of the model, for the cache.
     stems: BTreeMap<String, Vec<f32>>,
     /// Blocks done.
@@ -869,9 +869,9 @@ impl Live {
         let work = self.dir.with_extension("work").join(format!("piece-{first}"));
         let _ = std::fs::remove_dir_all(&work);
         std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-        let piece = deckhand_audio::TrackAudio::new(rate, (from * 2..to * 2).map(|i| self.track.sample(i)).collect());
+        let piece = rofloxbox_audio::TrackAudio::new(rate, (from * 2..to * 2).map(|i| self.track.sample(i)).collect());
         let wav = work.join("input.wav");
-        deckhand_audio::write_wav_file(&wav, rate, &piece.to_f32())?;
+        rofloxbox_audio::write_wav_file(&wav, rate, &piece.to_f32())?;
         let output = work.join("out");
         let model = &self.job.model;
         let by_helper = match helper.as_mut().filter(|h| h.model == *model) {
@@ -891,11 +891,11 @@ impl Live {
         };
         let decoded = found
             .iter()
-            .map(|(name, file)| Ok((name.clone(), deckhand_audio::decode_file(file)?)))
+            .map(|(name, file)| Ok((name.clone(), rofloxbox_audio::decode_file(file)?)))
             .collect::<Result<Vec<_>>>()?;
         let _ = std::fs::remove_dir_all(&work);
-        let all: Vec<&deckhand_audio::TrackAudio> = decoded.iter().map(|(_, a)| a).collect();
-        let gains = deckhand_audio::fit_gains(&piece, &all);
+        let all: Vec<&rofloxbox_audio::TrackAudio> = decoded.iter().map(|(_, a)| a).collect();
+        let gains = rofloxbox_audio::fit_gains(&piece, &all);
         let join = seconds(JOIN_SECS);
         let left = first > 0 && self.done[first - 1];
         let right = end < self.done.len() && self.done[end];
@@ -938,7 +938,7 @@ impl Live {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
         for (name, samples) in &self.stems {
-            deckhand_audio::write_float_wav_file(
+            rofloxbox_audio::write_float_wav_file(
                 &self.dir.join(format!("{name}.wav")),
                 self.track.sample_rate,
                 samples,
@@ -952,11 +952,11 @@ impl Live {
 /// The live part a stem plays as (vocals, bass, drums), if any.
 fn live_part(stem: &str) -> Option<usize> {
     if is_vocals(stem) {
-        Some(deckhand_audio::VOCALS)
+        Some(rofloxbox_audio::VOCALS)
     } else if stem.eq_ignore_ascii_case("bass") {
-        Some(deckhand_audio::BASS)
+        Some(rofloxbox_audio::BASS)
     } else if stem.eq_ignore_ascii_case("drums") {
-        Some(deckhand_audio::DRUMS)
+        Some(rofloxbox_audio::DRUMS)
     } else {
         None
     }
@@ -1036,8 +1036,8 @@ fn live_loop(queue: &Receiver<LiveMessage>, events: &Sender<Event>, cache: &Path
 }
 
 /// Where a recorded session finds a live job's stems again.
-fn session_source(job: &LiveJob, dir: &Path) -> deckhand_audio::StemsSource {
-    deckhand_audio::StemsSource {
+fn session_source(job: &LiveJob, dir: &Path) -> rofloxbox_audio::StemsSource {
+    rofloxbox_audio::StemsSource {
         track: job.input.clone(),
         dir: dir.to_path_buf(),
         stems: job.model.stems.clone(),
@@ -1047,12 +1047,12 @@ fn session_source(job: &LiveJob, dir: &Path) -> deckhand_audio::StemsSource {
 /// The stems a recorded session names, from the stem cache, for `track` as
 /// decoded from their file.
 pub fn session_stems(
-    source: &deckhand_audio::StemsSource,
-    track: &deckhand_audio::TrackAudio,
-) -> Result<deckhand_audio::StemLayers> {
+    source: &rofloxbox_audio::StemsSource,
+    track: &rofloxbox_audio::TrackAudio,
+) -> Result<rofloxbox_audio::StemLayers> {
     // Kept with the recording.
-    if deckhand_audio::StemLayers::saved_in(&source.dir) {
-        return deckhand_audio::StemLayers::load(&source.dir);
+    if rofloxbox_audio::StemLayers::saved_in(&source.dir) {
+        return rofloxbox_audio::StemLayers::load(&source.dir);
     }
     let stems = find_stems(&source.dir, &source.stems, &BTreeMap::new())
         .map_err(|_| anyhow!("they are no longer in the stem cache"))?;
@@ -1092,7 +1092,7 @@ fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut V
         match layers(&stems, &job.audio) {
             Ok(layers) => {
                 let layers = Arc::new(layers);
-                deckhand_audio::remember_stems(&layers, session_source(&job, &dir));
+                rofloxbox_audio::remember_stems(&layers, session_source(&job, &dir));
                 let _ = events.send(Event::Live {
                     deck: job.deck,
                     input: job.input.clone(),
@@ -1104,13 +1104,13 @@ fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut V
         return;
     }
     let track = job.audio.clone();
-    let has = [deckhand_audio::VOCALS, deckhand_audio::BASS, deckhand_audio::DRUMS]
+    let has = [rofloxbox_audio::VOCALS, rofloxbox_audio::BASS, rofloxbox_audio::DRUMS]
         .map(|part| job.model.stems.iter().any(|s| live_part(s) == Some(part)));
     let block = (BLOCK_SECS * f64::from(track.sample_rate)) as usize;
     let frames = track.frames();
-    let layers = Arc::new(deckhand_audio::StemLayers::empty(has, frames, block));
+    let layers = Arc::new(rofloxbox_audio::StemLayers::empty(has, frames, block));
     // Kept in `dir` once separated, where a replayed session finds them.
-    deckhand_audio::remember_stems(&layers, session_source(&job, &dir));
+    rofloxbox_audio::remember_stems(&layers, session_source(&job, &dir));
     let _ = events.send(Event::Live {
         deck: job.deck,
         input: job.input.clone(),
@@ -1133,7 +1133,7 @@ fn start_live(job: LiveJob, events: &Sender<Event>, cache: &Path, active: &mut V
 fn cache_key(input: &Path) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     input.hash(&mut hasher);
-    deckhand_library::file_stamp(input).hash(&mut hasher);
+    rofloxbox_library::file_stamp(input).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -1153,9 +1153,9 @@ fn separate(
     let _ = std::fs::remove_dir_all(&work);
     let output = work.join("out");
     std::fs::create_dir_all(&output).with_context(|| format!("creating {}", output.display()))?;
-    let audio = deckhand_audio::decode_file(input)?;
+    let audio = rofloxbox_audio::decode_file(input)?;
     let wav = work.join("input.wav");
-    deckhand_audio::write_wav_file(&wav, audio.sample_rate, &audio.to_f32())?;
+    rofloxbox_audio::write_wav_file(&wav, audio.sample_rate, &audio.to_f32())?;
     drop(audio);
 
     let found = run_model(model, &wav, &output, &work, running, progress)?;
@@ -1450,7 +1450,7 @@ fn mix(files: &[&Path], out: &Path) -> Result<()> {
     let mut rate = None;
     let mut sum: Vec<f32> = Vec::new();
     for file in files {
-        let audio = deckhand_audio::decode_file(file)?;
+        let audio = rofloxbox_audio::decode_file(file)?;
         if rate.is_some_and(|r| r != audio.sample_rate) {
             bail!("the stems have different sample rates");
         }
@@ -1468,7 +1468,7 @@ fn mix(files: &[&Path], out: &Path) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let partial = out.with_extension("wav.part");
-    deckhand_audio::write_wav_file(&partial, rate, &sum)?;
+    rofloxbox_audio::write_wav_file(&partial, rate, &sum)?;
     std::fs::rename(&partial, out).with_context(|| format!("writing {}", out.display()))?;
     Ok(())
 }
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn stem_files_are_found_by_name() {
-        let dir = std::env::temp_dir().join(format!("deckhand-find-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-find-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("htdemucs")).unwrap();
         for name in [
@@ -1562,7 +1562,7 @@ mod tests {
 
     #[test]
     fn cache_keeps_the_latest_tracks() {
-        let cache = std::env::temp_dir().join(format!("deckhand-trim-{}", std::process::id()));
+        let cache = std::env::temp_dir().join(format!("rofloxbox-trim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
         for (i, name) in ["old", "new"].iter().enumerate() {
             let dir = cache.join("model").join(name);
@@ -1613,7 +1613,7 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
     #[cfg(unix)]
     #[test]
     fn live_stems_start_at_the_playhead() {
-        let root = std::env::temp_dir().join(format!("deckhand-live-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rofloxbox-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let model_dir = root.join("model");
         std::fs::create_dir_all(&model_dir).unwrap();
@@ -1629,8 +1629,8 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         let input = root.join("song.wav");
         let samples: Vec<f32> =
             (0..rate * 50 * 2).map(|i| ((i / 2) as f32 * 0.01).sin() * 0.5).collect();
-        deckhand_audio::write_wav_file(&input, rate as u32, &samples).unwrap();
-        let original = deckhand_audio::decode_file(&input).unwrap();
+        rofloxbox_audio::write_wav_file(&input, rate as u32, &samples).unwrap();
+        let original = rofloxbox_audio::decode_file(&input).unwrap();
         let (jobs, queue) = channel();
         let (events_tx, events) = channel();
         let cache = root.join("cache");
@@ -1674,7 +1674,7 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         // The stems are the track again, joins included, and kept.
         for frame in (0..original.frames()).step_by(1_999) {
             let want = original.frame(frame as i64)[0];
-            let got = layers.get(deckhand_audio::VOCALS, frame)[0];
+            let got = layers.get(rofloxbox_audio::VOCALS, frame)[0];
             assert!((got - want).abs() < 1e-3, "frame {frame}: {got} vs {want}");
         }
         let kept = find_stems(
@@ -1683,7 +1683,7 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
             &BTreeMap::new(),
         )
         .unwrap();
-        let vocals = deckhand_audio::decode_file(&kept["vocals"]).unwrap();
+        let vocals = rofloxbox_audio::decode_file(&kept["vocals"]).unwrap();
         assert_eq!(vocals.len(), original.len());
         assert!(vocals.to_f32().iter().zip(original.to_f32().iter()).all(|(v, o)| (v - o).abs() < 1e-4));
         let _ = std::fs::remove_dir_all(&root);
@@ -1740,7 +1740,7 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
 
     #[test]
     fn separates_once_and_mixes_what_is_asked() {
-        let root = std::env::temp_dir().join(format!("deckhand-stems-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rofloxbox-stems-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let model_dir = root.join("model");
         std::fs::create_dir_all(&model_dir).unwrap();
@@ -1749,7 +1749,7 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         // One second of a quiet ramp.
         let input = root.join("song.wav");
         let samples: Vec<f32> = (0..48_000 * 2).map(|i| (i % 200) as f32 / 1000.0).collect();
-        deckhand_audio::write_wav_file(&input, 48_000, &samples).unwrap();
+        rofloxbox_audio::write_wav_file(&input, 48_000, &samples).unwrap();
         let cache = root.join("cache");
         let running = Mutex::new(None);
         let seen = Mutex::new(Vec::new());
@@ -1768,8 +1768,8 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         let out = root.join("made/Song (Both).wav");
         let files: Vec<&Path> = stems.values().map(PathBuf::as_path).collect();
         mix(&files, &out).unwrap();
-        let made = deckhand_audio::decode_file(&out).unwrap();
-        let original = deckhand_audio::decode_file(&input).unwrap();
+        let made = rofloxbox_audio::decode_file(&out).unwrap();
+        let original = rofloxbox_audio::decode_file(&input).unwrap();
         assert_eq!(made.sample_rate, 48_000);
         assert_eq!(made.len(), original.len());
         for (m, o) in made.to_f32().iter().zip(original.to_f32().iter()).step_by(997) {
@@ -1781,11 +1781,11 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
     #[cfg(unix)]
     #[test]
     fn a_failing_model_reports_its_output() {
-        let root = std::env::temp_dir().join(format!("deckhand-fail-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rofloxbox-fail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let input = root.join("song.wav");
-        deckhand_audio::write_wav_file(&input, 44_100, &[0.0; 4410 * 2]).unwrap();
+        rofloxbox_audio::write_wav_file(&input, 44_100, &[0.0; 4410 * 2]).unwrap();
         let model =
             model(&["vocals"], &["/bin/sh", "-c", "echo 'CUDA out of memory' >&2; exit 3"], &root);
         let err =
@@ -1808,15 +1808,15 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
     }
 
     /// How long a deck takes to get stems separated before:
-    /// `DECKHAND_TEST_TRACK=song.wav DECKHAND_TEST_STEMS=folder cargo test -p
-    /// deckhand-app cached_stems_load -- --ignored --nocapture`
+    /// `ROFLOXBOX_TEST_TRACK=song.wav ROFLOXBOX_TEST_STEMS=folder cargo test -p
+    /// rofloxbox-app cached_stems_load -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn cached_stems_load() {
         let track =
-            deckhand_audio::decode_file(Path::new(&std::env::var("DECKHAND_TEST_TRACK").unwrap()))
+            rofloxbox_audio::decode_file(Path::new(&std::env::var("ROFLOXBOX_TEST_TRACK").unwrap()))
                 .unwrap();
-        let dir = PathBuf::from(std::env::var("DECKHAND_TEST_STEMS").unwrap());
+        let dir = PathBuf::from(std::env::var("ROFLOXBOX_TEST_STEMS").unwrap());
         let names: Vec<String> = ["drums", "bass", "other", "vocals"].map(String::from).into();
         let stems = find_stems(&dir, &names, &BTreeMap::new()).unwrap();
         let started = std::time::Instant::now();
@@ -1831,17 +1831,17 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
     #[test]
     #[ignore]
     fn real_model_live() {
-        let dir = PathBuf::from(std::env::var("DECKHAND_TEST_MODEL").unwrap());
-        let track = PathBuf::from(std::env::var("DECKHAND_TEST_TRACK").unwrap());
+        let dir = PathBuf::from(std::env::var("ROFLOXBOX_TEST_MODEL").unwrap());
+        let track = PathBuf::from(std::env::var("ROFLOXBOX_TEST_TRACK").unwrap());
         let (models, _) = load_models(dir.parent().unwrap());
         let model = models.into_iter().find(|m| m.dir == dir).unwrap();
-        let root = std::env::temp_dir().join("deckhand-real-live");
+        let root = std::env::temp_dir().join("rofloxbox-real-live");
         let _ = std::fs::remove_dir_all(&root);
         let started = std::time::Instant::now();
         let whole =
             separate(&model, &track, &root.join("whole"), &Mutex::new(None), &|_| {}).unwrap();
         eprintln!("whole track: {:.1} s", started.elapsed().as_secs_f64());
-        let original = deckhand_audio::decode_file(&track).unwrap();
+        let original = rofloxbox_audio::decode_file(&track).unwrap();
         let (jobs, queue) = channel();
         let (events_tx, events) = channel();
         let cache = root.join("live");
@@ -1879,12 +1879,12 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         worker.join().unwrap();
         eprintln!("live, all pieces: {:.1} s", started.elapsed().as_secs_f64());
         let layers = layers.unwrap();
-        let reference = deckhand_audio::decode_file(&whole["vocals"]).unwrap();
+        let reference = rofloxbox_audio::decode_file(&whole["vocals"]).unwrap();
         let piece = (BLOCK_SECS * f64::from(original.sample_rate)) as usize;
         let (mut signal, mut error, mut join_signal, mut join_error) = (0.0, 0.0, 0.0, 0.0);
         for frame in 0..original.frames() {
             let want = f64::from(reference.frame(frame as i64)[0]);
-            let got = f64::from(layers.get(deckhand_audio::VOCALS, frame)[0]);
+            let got = f64::from(layers.get(rofloxbox_audio::VOCALS, frame)[0]);
             let near_join = frame % piece < original.sample_rate as usize / 2
                 || piece - frame % piece < original.sample_rate as usize / 2;
             let (s, e) = if near_join {
@@ -1903,17 +1903,17 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         );
     }
 
-    /// With a real separation tool: `DECKHAND_TEST_MODEL=/path/to/models/x
-    /// DECKHAND_TEST_TRACK=song.mp3 cargo test -p deckhand-app real_model -- --ignored`
+    /// With a real separation tool: `ROFLOXBOX_TEST_MODEL=/path/to/models/x
+    /// ROFLOXBOX_TEST_TRACK=song.mp3 cargo test -p rofloxbox-app real_model -- --ignored`
     #[test]
     #[ignore]
     fn real_model() {
-        let dir = PathBuf::from(std::env::var("DECKHAND_TEST_MODEL").unwrap());
-        let track = PathBuf::from(std::env::var("DECKHAND_TEST_TRACK").unwrap());
+        let dir = PathBuf::from(std::env::var("ROFLOXBOX_TEST_MODEL").unwrap());
+        let track = PathBuf::from(std::env::var("ROFLOXBOX_TEST_TRACK").unwrap());
         let (models, errors) = load_models(dir.parent().unwrap());
         assert!(errors.is_empty(), "{errors:?}");
         let model = models.into_iter().find(|m| m.dir == dir).unwrap();
-        let cache = std::env::temp_dir().join("deckhand-real-model");
+        let cache = std::env::temp_dir().join("rofloxbox-real-model");
         let started = std::time::Instant::now();
         let stems = separate(&model, &track, &cache, &Mutex::new(None), &|p| {
             if let Some(p) = p {
@@ -1922,11 +1922,11 @@ mkdir -p "$2/sub" && cp "$1" "$2/sub/Song_(Drums)_fake.wav"
         })
         .unwrap();
         eprintln!("\nseparated in {:.1} s: {:?}", started.elapsed().as_secs_f64(), stems.keys());
-        let original = deckhand_audio::decode_file(&track).unwrap();
+        let original = rofloxbox_audio::decode_file(&track).unwrap();
         for (stem, file) in &stems {
-            let audio = deckhand_audio::decode_file(file).unwrap();
+            let audio = rofloxbox_audio::decode_file(file).unwrap();
             let seconds =
-                |a: &deckhand_audio::TrackAudio| a.frames() as f64 / f64::from(a.sample_rate);
+                |a: &rofloxbox_audio::TrackAudio| a.frames() as f64 / f64::from(a.sample_rate);
             eprintln!(
                 "{stem}: {} Hz, {:.3} s (original {:.3} s)",
                 audio.sample_rate,

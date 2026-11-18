@@ -6,7 +6,7 @@
 //! note or controller, in hex), the channel used by decks 1–4 (or a whole
 //! message per deck), and the message that lights the matching LED. Column
 //! positions are taken from the file's header row. The files are read at run
-//! time; deckhand does not include them.
+//! time; RofLoxBox does not include them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use crate::action::{
 };
 use crate::mapping::{Binding, Encoding, Mapping, MessageType, Output, ShiftControl};
 
-/// The result of an import: the mapping and the functions without a deckhand
+/// The result of an import: the mapping and the functions without a RofLoxBox
 /// equivalent yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Import {
@@ -448,7 +448,9 @@ fn deck_feedback(name: &str, number: u8, comment: &str) -> Option<DeckFeedback> 
         "PartIsolator" => F::PartIsolator,
         "MasterTempo" => F::KeyLock,
         "HeadphoneCue" => F::HeadphoneCue,
-        "LoopIn" | "LoopOut" | "GetLoopActive" => F::LoopActive,
+        "LoopIn" => F::LoopIn,
+        "LoopOut" => F::LoopOut,
+        "GetLoopActive" => F::LoopActive,
         "ChannelLevel" => F::Level,
         "LoadedIndicator" => F::Loaded,
         _ if name.starts_with("PAD") && name.ends_with("_HotCue") => F::HotCueSet(number & 0x07),
@@ -648,7 +650,8 @@ pub fn import(name: &str, text: &str) -> Import {
         for (feedback, code) in targets {
             let Some((status, number)) = code else { continue };
             let Some(message) = message_type(status) else { continue };
-            let out = Output { feedback, message, channel: (status & 0x0f) + 1, number };
+            let channel = (status & 0x0f) + 1;
+            let out = Output { feedback, message, channel, number, shift: false, mode: None };
             if !mapping.outputs.contains(&out) {
                 mapping.outputs.push(out);
             }
@@ -794,7 +797,7 @@ CrossfaderAssign.B,CrossfaderAssign.B,Button,9070,0,1,,,,,Crossfader assign
     #[test]
     fn extra_folder_supplies_missing_controllers() {
         let dir =
-            std::env::temp_dir().join(format!("deckhand-extra-mappings-{}", std::process::id()));
+            std::env::temp_dir().join(format!("rofloxbox-extra-mappings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("DDJ-OLDTEST6.midi.csv"), SAMPLE).unwrap();
         let found = find_for_port_with("PIONEER DDJ-OLDTEST6", std::slice::from_ref(&dir));

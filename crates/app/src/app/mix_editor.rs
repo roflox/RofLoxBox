@@ -10,13 +10,13 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use deckhand_audio::{
+use rofloxbox_audio::{
     BeatFxKind, BeatFxParams, ColorFxKind, Curve, DeleteOptions, FxTarget, Point, Session, Setting, SyncSpan,
     TrackMove, TrackSpan, fx_spans, lane_value, move_fx, remove_fx, restyle_fx,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 
-use super::{DECK_COLORS, DeckhandApp, WARN};
+use super::{DECK_COLORS, RofLoxBoxApp, WARN};
 
 mod stem_row;
 mod wave;
@@ -83,7 +83,7 @@ pub enum Mode {
 type Opening = (String, Receiver<Result<(PathBuf, Session, Outlines)>>);
 
 /// Each track's outline, to draw its clips from.
-type Outlines = HashMap<PathBuf, deckhand_audio::Outline>;
+type Outlines = HashMap<PathBuf, rofloxbox_audio::Outline>;
 
 /// Frames a track's outline takes the loudest of, drawn zoomed in.
 const OUTLINE_STEP: usize = 128;
@@ -93,12 +93,63 @@ const OUTLINE_STEP: usize = 128;
 pub(super) struct EditView {
     editor: Option<MixEditor>,
     opening: Option<Opening>,
-    /// `DECKHAND_EDIT_SESSION` was opened (a test aid).
+    /// `ROFLOXBOX_EDIT_SESSION` was opened (a test aid).
     opened_at_start: bool,
     /// Separating stems for clips without them (started when first asked
     /// for), and the number of the next job.
     separator: Option<crate::stems::LiveSeparator>,
     next_job: usize,
+    /// The sessions in the recordings folder, newest first, and when they
+    /// were last looked for.
+    projects: Option<(std::time::Instant, Vec<Project>)>,
+    /// "Close it without saving?" is being asked.
+    confirm_close: bool,
+}
+
+/// A session found in the recordings folder.
+#[derive(Clone)]
+struct Project {
+    path: PathBuf,
+    name: String,
+    changed: std::time::SystemTime,
+}
+
+/// The sessions under `dir` (and its subfolders, a few deep), last changed
+/// first.
+fn find_projects(dir: &Path) -> Vec<Project> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<Project>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Not into what a session keeps beside it.
+                let name = entry.file_name();
+                if depth < 3 && name != "stems" && name != "tracks" {
+                    walk(&path, depth + 1, out);
+                }
+            } else if path.extension().is_some_and(|e| e == "session")
+                && let Ok(changed) = entry.metadata().and_then(|m| m.modified())
+            {
+                let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                out.push(Project { path, name, changed });
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out.sort_by(|a, b| b.changed.cmp(&a.changed));
+    out
+}
+
+/// "5 min ago", "3 h ago", "yesterday", "12 days ago".
+fn ago(when: std::time::SystemTime) -> String {
+    let secs = when.elapsed().map_or(0, |d| d.as_secs());
+    match secs {
+        0..60 => "just now".into(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => format!("{} h ago", secs / 3_600),
+        86_400..172_800 => "yesterday".into(),
+        _ => format!("{} days ago", secs / 86_400),
+    }
 }
 
 impl EditView {
@@ -187,7 +238,7 @@ struct MixEditor {
     replayed: HashSet<(usize, u64, u64)>,
     /// Each nudge in the set (jog edge, pitch bend): marked on its clip,
     /// right-click one to take it out.
-    nudges: Vec<deckhand_audio::Nudge>,
+    nudges: Vec<rofloxbox_audio::Nudge>,
     /// Markers set while recording (frames from the start).
     markers: Vec<u64>,
     /// The Beat FX row and the Color FX overview are shown.
@@ -196,7 +247,7 @@ struct MixEditor {
     /// The lanes as recorded, to go back to.
     original: BTreeMap<Setting, Vec<Point>>,
     /// Listening: the player, where playing starts, and the output device.
-    player: Option<deckhand_audio::SessionPlayer>,
+    player: Option<rofloxbox_audio::SessionPlayer>,
     cursor: u64,
     device: Option<String>,
     /// Changed while playing: play again from where it is, with the change.
@@ -237,7 +288,7 @@ struct MixEditor {
     hover: Option<u64>,
     /// What each deck played (levels and beats), being worked out again
     /// after edits.
-    played: Vec<deckhand_audio::Played>,
+    played: Vec<rofloxbox_audio::Played>,
     /// How tall the decks' rows are (their waveforms), dragged at their
     /// foot; a preference.
     track_row: f32,
@@ -274,7 +325,7 @@ struct MixEditor {
     job_edits: u64,
     /// Where two decks' low end went into the mix together, and whether
     /// to show it.
-    clashes: Vec<deckhand_audio::Clash>,
+    clashes: Vec<rofloxbox_audio::Clash>,
     show_clashes: bool,
     /// The master beat grid (see [`master_grid`]) and its usual beat
     /// length in frames; shown across the rows, and snapped to.
@@ -307,8 +358,8 @@ struct MixEditor {
     /// stems, the stem clip chosen (deck, a moment in it), one being
     /// dragged, what the row's right-click menu is for, and what a new
     /// clip turns off.
-    stems: Vec<Vec<deckhand_audio::StemLevels>>,
-    stem_spans: Vec<Vec<deckhand_audio::StemSpan>>,
+    stems: Vec<Vec<rofloxbox_audio::StemLevels>>,
+    stem_spans: Vec<Vec<rofloxbox_audio::StemSpan>>,
     chosen_stem: Option<(usize, u64)>,
     stem_drag: Option<StemDrag>,
     stem_menu: Option<StemMenu>,
@@ -318,7 +369,7 @@ struct MixEditor {
     /// separations running.
     stems_wanted: Vec<usize>,
     separating: Vec<Separating>,
-    last_stems: [f32; deckhand_audio::PARTS],
+    last_stems: [f32; rofloxbox_audio::PARTS],
 }
 
 /// The Master group in [`MixEditor::collapsed`].
@@ -334,8 +385,8 @@ const EFFECTS: Option<usize> = Some(usize::MAX);
 /// without sound: the waveforms are drawn from it), then everything with
 /// the mix's levels.
 enum Replayed {
-    Positions(Result<Vec<deckhand_audio::Played>>),
-    Full(Result<(Vec<deckhand_audio::Played>, Vec<MixLevel>)>),
+    Positions(Result<Vec<rofloxbox_audio::Played>>),
+    Full(Result<(Vec<rofloxbox_audio::Played>, Vec<MixLevel>)>),
 }
 
 /// One beat of the master grid: where, whether a bar starts there, the
@@ -358,7 +409,7 @@ const LEAD_LEVEL: f32 = 0.03;
 /// Gaps (nothing leading, or a deck without a grid) go on at the last
 /// beat's pace. Also the usual beat length (frames), 0 without beats.
 fn master_grid(
-    played: &[deckhand_audio::Played],
+    played: &[rofloxbox_audio::Played],
     sync: &[SyncSpan],
     rate: f64,
     length: u64,
@@ -536,7 +587,7 @@ enum Edit {
     Move { deck: usize, at: u64, later: f64 },
     Fx(Vec<(u64, BeatFxParams)>),
     /// A deck's stem levels.
-    Stems(usize, Vec<deckhand_audio::StemLevels>),
+    Stems(usize, Vec<rofloxbox_audio::StemLevels>),
     Events(Vec<u8>),
 }
 
@@ -571,7 +622,7 @@ struct PlayEdgeDrag {
     play: (u64, u64),
     heard: (u64, u64),
     now: (u64, u64),
-    edges: deckhand_audio::PlayEdges,
+    edges: rofloxbox_audio::PlayEdges,
     right: bool,
 }
 
@@ -675,7 +726,7 @@ struct ClipCue {
 /// The cues the library has for each of `paths`: by the file, else (a copy
 /// on a USB stick, an exported session) by its name.
 fn library_cues<'a>(
-    collection: &deckhand_library::Collection,
+    collection: &rofloxbox_library::Collection,
     paths: impl Iterator<Item = &'a PathBuf>,
 ) -> HashMap<PathBuf, Vec<ClipCue>> {
     let mut found = HashMap::new();
@@ -695,14 +746,14 @@ fn library_cues<'a>(
             .iter()
             .filter(|c| c.end.is_none())
             .map(|c| match c.kind {
-                deckhand_library::CueKind::Hot(n) => ClipCue {
+                rofloxbox_library::CueKind::Hot(n) => ClipCue {
                     seconds: c.start,
                     hot: Some(n),
                     color: c.color.map_or(crate::deck::HOT_CUE_DEFAULT, |[r, g, b]| {
                         Color32::from_rgb(r, g, b)
                     }),
                 },
-                deckhand_library::CueKind::Memory => {
+                rofloxbox_library::CueKind::Memory => {
                     ClipCue { seconds: c.start, hot: None, color: Color32::from_rgb(230, 50, 50) }
                 }
             })
@@ -924,11 +975,11 @@ impl MixEditor {
         let nudges = session.nudges();
         let markers = session.markers();
         let pieces = tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
-        let key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
-        let stems = (0..deckhand_audio::DECKS).map(|d| session.stem_levels(d)).collect();
-        let stem_spans = (0..deckhand_audio::DECKS).map(|d| session.stem_spans(d)).collect();
+        let key_locks = (0..rofloxbox_audio::DECKS).map(|d| session.key_lock(d)).collect();
+        let stems = (0..rofloxbox_audio::DECKS).map(|d| session.stem_levels(d)).collect();
+        let stem_spans = (0..rofloxbox_audio::DECKS).map(|d| session.stem_spans(d)).collect();
         let decks = tracks.iter().map(|t| t.deck + 1).max().unwrap_or(0);
-        let lanes: BTreeMap<_, _> = Setting::all(deckhand_audio::DECKS)
+        let lanes: BTreeMap<_, _> = Setting::all(rofloxbox_audio::DECKS)
             .into_iter()
             .chain([Setting::BeatFxDepth])
             .map(|s| (s, session.lane(s)))
@@ -946,7 +997,7 @@ impl MixEditor {
         shown.sort_by_key(lane_order);
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         // Test aid: "from,seconds" on view.
-        let view = std::env::var("DECKHAND_EDIT_VIEW").ok().and_then(|v| {
+        let view = std::env::var("ROFLOXBOX_EDIT_VIEW").ok().and_then(|v| {
             let (from, secs) = v.split_once(',')?;
             Some((from.trim().parse().ok()?, secs.trim().parse().ok()?))
         });
@@ -1387,14 +1438,14 @@ impl MixEditor {
         self.nudges = session.nudges();
         self.markers = session.markers();
         self.tracks = session.tracks();
-        self.key_locks = (0..deckhand_audio::DECKS).map(|d| session.key_lock(d)).collect();
+        self.key_locks = (0..rofloxbox_audio::DECKS).map(|d| session.key_lock(d)).collect();
         self.pieces = self.tracks.iter().map(|t| ((t.deck, t.from), session.pieces(t))).collect();
         self.sync = session.sync_spans();
         self.masters = session.master_spans();
         self.moves = session.moves();
         self.fx = session.beat_fx();
-        self.stems = (0..deckhand_audio::DECKS).map(|d| session.stem_levels(d)).collect();
-        self.stem_spans = (0..deckhand_audio::DECKS).map(|d| session.stem_spans(d)).collect();
+        self.stems = (0..rofloxbox_audio::DECKS).map(|d| session.stem_levels(d)).collect();
+        self.stem_spans = (0..rofloxbox_audio::DECKS).map(|d| session.stem_spans(d)).collect();
         for (setting, lane) in &mut self.lanes {
             *lane = session.lane(*setting);
         }
@@ -1503,7 +1554,7 @@ impl MixEditor {
                     if let Some((played, mix)) = result.ok().filter(|_| current) {
                         self.mix = mix;
                         // Half a second of both at least.
-                        self.clashes = deckhand_audio::clashes(&played, (self.rate * 0.5) as u64);
+                        self.clashes = rofloxbox_audio::clashes(&played, (self.rate * 0.5) as u64);
                         self.played = played;
                         self.wave_gen += 1;
                         self.anchors = self.find_anchors();
@@ -1571,7 +1622,7 @@ impl MixEditor {
             return;
         };
         let started = session.duplicate().and_then(|copy| {
-            deckhand_audio::SessionPlayer::start(
+            rofloxbox_audio::SessionPlayer::start(
                 copy,
                 from.min(self.length),
                 self.device.as_deref(),
@@ -1741,7 +1792,7 @@ impl MixEditor {
 
     /// The decks whose Color FX were on somewhere.
     fn color_decks(&self) -> Vec<usize> {
-        (0..deckhand_audio::DECKS)
+        (0..rofloxbox_audio::DECKS)
             .filter(|&d| {
                 ColorFxKind::ALL
                     .iter()
@@ -1862,7 +1913,7 @@ impl MixEditor {
     /// The lanes of a group (a deck, or the mixer's with `None`) to show or
     /// hide; • marks the ones that move.
     fn lane_menu(&mut self, ui: &mut Ui, group: Option<usize>) {
-        for setting in Setting::all(deckhand_audio::DECKS) {
+        for setting in Setting::all(rofloxbox_audio::DECKS) {
             if setting.deck() != group {
                 continue;
             }
@@ -3178,10 +3229,14 @@ impl MixEditor {
                 let readout = self.play_edge.as_mut().map(|drag| {
                     let (e, (from, to)) = (drag.edges, drag.now);
                     if drag.right {
-                        drag.now.1 = at.clamp(e.end.0.max(from + 1), e.end.1.max(e.end.0));
+                        drag.now.1 = {
+                            let low = e.end.0.max(from + 1);
+                            at.clamp(low, e.end.1.max(low))
+                        };
                         drag.now.1 as i64 - drag.heard.1 as i64
                     } else {
-                        drag.now.0 = at.clamp(e.start.0, e.start.1.min(to.saturating_sub(1)));
+                        let high = e.start.1.min(to.saturating_sub(1)).max(e.start.0);
+                        drag.now.0 = at.clamp(e.start.0, high);
                         drag.now.0 as i64 - drag.play.0 as i64
                     }
                 });
@@ -3210,9 +3265,9 @@ impl MixEditor {
                 let after = drag.pieces.get(i + 1).map_or(span.to, |p| p.0);
                 let piece = &mut drag.pieces[i];
                 if drag.right {
-                    piece.1 = at.clamp(piece.0 + 1, after);
+                    piece.1 = at.clamp(piece.0 + 1, after.max(piece.0 + 1));
                 } else {
-                    piece.0 = at.clamp(before, piece.1 - 1);
+                    piece.0 = at.clamp(before, piece.1.saturating_sub(1).max(before));
                 }
             }
             if stopped
@@ -3529,7 +3584,7 @@ impl MixEditor {
     }
 
     /// The nudge on `deck` at `at` (or within a few pixels of it).
-    fn nudge_near(&self, area: Rect, deck: usize, at: u64) -> Option<deckhand_audio::Nudge> {
+    fn nudge_near(&self, area: Rect, deck: usize, at: u64) -> Option<rofloxbox_audio::Nudge> {
         let slack = (4.0 / f64::from(area.width()) * self.view_secs * self.rate) as u64;
         self.nudges
             .iter()
@@ -3703,7 +3758,7 @@ impl MixEditor {
         &self,
         area: Rect,
         block: Rect,
-        (played, span): (&deckhand_audio::Played, &TrackSpan),
+        (played, span): (&rofloxbox_audio::Played, &TrackSpan),
         peaks: &wave::TrackPeaks,
         preview: Option<Preview>,
     ) -> Vec<wave::Column> {
@@ -3775,7 +3830,7 @@ impl MixEditor {
         painter: &egui::Painter,
         area: Rect,
         block: Rect,
-        played: &deckhand_audio::Played,
+        played: &rofloxbox_audio::Played,
         preview: Option<Preview>,
         (middle, half): (f32, f32),
         color: Color32,
@@ -3825,7 +3880,7 @@ impl MixEditor {
         painter: &egui::Painter,
         area: Rect,
         block: Rect,
-        played: &deckhand_audio::Played,
+        played: &rofloxbox_audio::Played,
         preview: Option<Preview>,
     ) {
         let moved = |at: u64| match preview {
@@ -3937,7 +3992,7 @@ impl MixEditor {
             .collect();
         played.beats = played.beats.iter().filter_map(|&(at, bar)| place(at).map(|at| (at, bar))).collect();
         played.beats.sort_by_key(|b| b.0);
-        self.clashes = deckhand_audio::clashes(&self.played, (self.rate * 0.5) as u64);
+        self.clashes = rofloxbox_audio::clashes(&self.played, (self.rate * 0.5) as u64);
         (self.grid, self.grid_beat) = master_grid(&self.played, &self.sync, self.rate, self.length);
         self.tempo = grid_tempo(&self.grid, self.rate);
     }
@@ -5246,8 +5301,8 @@ impl MixEditor {
                     let from = from.min(high.saturating_sub(length));
                     (drag.from, drag.to) = (from, from + length);
                 }
-                FxGrip::Start => drag.from = at.clamp(low, span.to.saturating_sub(1)),
-                FxGrip::End => drag.to = at.clamp(span.from + 1, high),
+                FxGrip::Start => drag.from = at.clamp(low, span.to.saturating_sub(1).max(low)),
+                FxGrip::End => drag.to = at.clamp(span.from + 1, high.max(span.from + 1)),
             }
         }
         if self.fx_drag.is_some() {
@@ -5322,7 +5377,7 @@ impl MixEditor {
 
     /// Where an effect's end handle sits: at its end, or just before it
     /// when the next effect starts right there (a moment has one point).
-    fn clip_end(&self, span: &deckhand_audio::FxSpan) -> u64 {
+    fn clip_end(&self, span: &rofloxbox_audio::FxSpan) -> u64 {
         let touching = fx_spans(&self.fx, self.length).iter().any(|s| s.from == span.to);
         let end = if touching { span.to.saturating_sub(4096) } else { span.to };
         // Drawn every frame: never waits for a render holding the session.
@@ -5695,7 +5750,7 @@ impl MixEditor {
 
     /// An effect's block name: its type, beat (for the ones that have
     /// one), what it is on, and REL for Release FX.
-    fn fx_name(&self, span: &deckhand_audio::FxSpan) -> String {
+    fn fx_name(&self, span: &rofloxbox_audio::FxSpan) -> String {
         let mut name = span.kind.label().to_owned();
         if span.kind.uses_beat() {
             name.push(' ');
@@ -5876,7 +5931,7 @@ impl MixEditor {
             Setting::Tempo(_) => value.clamp(0.25, 4.0),
             Setting::Eq(..) => self.capped(
                 edit.setting,
-                value.clamp(f64::from(deckhand_audio::EQ_MIN_DB), f64::from(deckhand_audio::EQ_MAX_DB)),
+                value.clamp(f64::from(rofloxbox_audio::EQ_MIN_DB), f64::from(rofloxbox_audio::EQ_MAX_DB)),
                 ctx.input(|i| i.modifiers.alt),
             ),
             Setting::Trim(_) => value.clamp(0.0, 4.0),
@@ -5985,7 +6040,7 @@ impl MixEditor {
 
     /// An effect's menu: its type, what it is on, its depth (wet/dry)
     /// through the stretch, or off.
-    fn fx_menu(&mut self, ui: &mut Ui, span: &deckhand_audio::FxSpan) {
+    fn fx_menu(&mut self, ui: &mut Ui, span: &rofloxbox_audio::FxSpan) {
         ui.menu_button(format!("Type: {}", span.kind.label()), |ui| {
             for kind in BeatFxKind::ALL {
                 if ui.selectable_label(kind == span.kind, kind.label()).clicked() {
@@ -6139,7 +6194,7 @@ impl MixEditor {
             Setting::Crossfader if value.abs() < 0.005 => "centre".to_owned(),
             Setting::Crossfader if value < 0.0 => format!("A side {:.0}%", -value * 100.0),
             Setting::Crossfader => format!("B side {:.0}%", value * 100.0),
-            Setting::Eq(..) if value <= f64::from(deckhand_audio::EQ_MIN_DB) => "kill".to_owned(),
+            Setting::Eq(..) if value <= f64::from(rofloxbox_audio::EQ_MIN_DB) => "kill".to_owned(),
             _ => setting.display(value),
         }
     }
@@ -6683,7 +6738,7 @@ impl MixEditor {
                         session.lock().map_err(|_| anyhow::anyhow!("the session is broken"))?;
                     session.track_files().into_iter().map(|(path, _)| path).collect()
                 };
-                let done = deckhand_audio::export_files(&out, &tracks, None)?;
+                let done = rofloxbox_audio::export_files(&out, &tracks, None)?;
                 let mut note = format!(
                     "Copied {} songs ({:.0} MB) into the recording's tracks folder",
                     done.tracks,
@@ -6781,7 +6836,7 @@ impl MixEditor {
         }
         std::fs::write(dir.join("trace.txt"), self.trace.iter().map(|l| format!("{l}\n")).collect::<String>())?;
         let mut s = String::new();
-        let _ = writeln!(s, "deckhand {} ({}, {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+        let _ = writeln!(s, "RofLoxBox {} ({}, {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
         let _ = writeln!(s, "session: {}", self.path.display());
         let _ = writeln!(s, "rate {} length {} ({:.2} s)", self.rate, self.length, self.length as f64 / self.rate);
         let _ = writeln!(s, "view from {} s, {} s wide; cursor {}; range {:?}", self.view_from, self.view_secs, self.cursor, self.range);
@@ -6961,7 +7016,7 @@ fn wip(ui: &mut Ui) {
 
 /// Where a lane goes: by deck, then as [`Setting::all`] lists them.
 fn lane_order(setting: &Setting) -> usize {
-    Setting::all(deckhand_audio::DECKS).iter().position(|s| s == setting).unwrap_or(usize::MAX)
+    Setting::all(rofloxbox_audio::DECKS).iter().position(|s| s == setting).unwrap_or(usize::MAX)
 }
 
 /// "<session> <suffix>.wav" next to the session, numbered if taken.
@@ -6976,12 +7031,12 @@ pub(super) fn free_path(session: &Path, suffix: &str) -> PathBuf {
         .unwrap_or_default()
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// EDIT mode's screen.
     pub(super) fn edit_view(&mut self, ui: &mut Ui) {
         if !self.edit_view.opened_at_start {
             self.edit_view.opened_at_start = true;
-            if let Some(path) = std::env::var_os("DECKHAND_EDIT_SESSION") {
+            if let Some(path) = std::env::var_os("ROFLOXBOX_EDIT_SESSION") {
                 self.open_session(path.into(), ui.ctx());
             }
         }
@@ -6995,6 +7050,8 @@ impl DeckhandApp {
             editor.poll_player(ui.ctx());
         }
         let mut message = None;
+        // Close asked for: whether there are changes to ask about.
+        let mut close: Option<bool> = None;
         // Wraps onto more rows when the window is too narrow for it all.
         ui.horizontal_wrapped(|ui| {
             let opening = self.edit_view.opening.is_some();
@@ -7008,6 +7065,23 @@ impl DeckhandApp {
                     .add_filter("Session", &["session"])
                     .pick_file()
             {
+                self.open_session(path, ui.ctx());
+            }
+            let mut recent = None;
+            ui.add_enabled_ui(!opening, |ui| {
+                ui.menu_button("Recent", |ui| {
+                    ui.label(RichText::new("Newest first").small().weak());
+                    egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                        recent = self.project_list(ui, 40);
+                    });
+                    if recent.is_some() {
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("The sessions in the recordings folder, last changed first");
+            });
+            if let Some(path) = recent {
                 self.open_session(path, ui.ctx());
             }
             if let Some((name, _)) = &self.edit_view.opening {
@@ -7030,6 +7104,17 @@ impl DeckhandApp {
                 .clicked()
             {
                 message = editor.save_as();
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Close"))
+                .on_hover_text(
+                    "Closes the session and frees what it loaded (its audio, waveforms, stems), \
+                     before playing a set",
+                )
+                .on_disabled_hover_text("Wait until it's done")
+                .clicked()
+            {
+                close = Some(editor.edited);
             }
             if ui
                 .add_enabled(idle, egui::Button::new("Debug report"))
@@ -7095,6 +7180,12 @@ impl DeckhandApp {
         if let Some(note) = self.edit_view.editor.as_mut().and_then(|e| e.note.take()) {
             self.status = Some(note);
         }
+        match close {
+            Some(true) => self.edit_view.confirm_close = true,
+            Some(false) => self.close_session(),
+            None => {}
+        }
+        self.close_dialog(ui.ctx());
         ui.separator();
         let Some(editor) = self.edit_view.editor.as_mut() else {
             ui.add_space(40.0);
@@ -7105,6 +7196,23 @@ impl DeckhandApp {
                     "Open a recording's .session to edit it and render a new WAV.",
                 );
             });
+            ui.add_space(20.0);
+            let folder = self.recordings_dir();
+            let mut picked = None;
+            ui.vertical_centered(|ui| {
+                ui.set_max_width(520.0);
+                ui.label(RichText::new("Sessions, newest first").strong());
+                ui.label(RichText::new(folder.display().to_string()).small().weak());
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        picked = self.project_list(ui, usize::MAX);
+                    });
+                });
+            });
+            if let Some(path) = picked {
+                self.open_session(path, ui.ctx());
+            }
             return;
         };
         let typing = ui.ctx().wants_keyboard_input();
@@ -7186,6 +7294,112 @@ impl DeckhandApp {
         }
     }
 
+    /// The recordings folder's sessions, looked for again every few
+    /// seconds while they're shown.
+    fn projects(&mut self) -> Vec<Project> {
+        let stale = self
+            .edit_view
+            .projects
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > std::time::Duration::from_secs(3));
+        if stale {
+            let found = find_projects(&self.recordings_dir());
+            self.edit_view.projects = Some((std::time::Instant::now(), found));
+        }
+        self.edit_view.projects.as_ref().map(|(_, p)| p.clone()).unwrap_or_default()
+    }
+
+    /// The sessions as a list to open from; `None` or the one picked.
+    fn project_list(&mut self, ui: &mut Ui, limit: usize) -> Option<PathBuf> {
+        let projects = self.projects();
+        let open = self.edit_view.editor.as_ref().map(|e| e.path.clone());
+        let mut picked = None;
+        if projects.is_empty() {
+            ui.label(RichText::new("No sessions in the recordings folder yet").weak());
+        }
+        for project in projects.iter().take(limit) {
+            let here = open.as_ref() == Some(&project.path);
+            let text = RichText::new(&project.name);
+            let text = if here { text.strong() } else { text };
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(here, text)
+                    .on_hover_text(project.path.display().to_string())
+                    .clicked()
+                {
+                    picked = Some(project.path.clone());
+                }
+                ui.label(RichText::new(ago(project.changed)).small().weak());
+            });
+        }
+        if projects.len() > limit {
+            ui.label(RichText::new(format!("and {} more", projects.len() - limit)).small().weak());
+        }
+        picked
+    }
+
+    /// Closes the session being edited and lets go of everything it
+    /// loaded: the audio, waveforms and stems (and the separation model).
+    fn close_session(&mut self) {
+        self.edit_view.confirm_close = false;
+        let Some(mut editor) = self.edit_view.editor.take() else { return };
+        editor.player = None;
+        // A replay drawing the waveforms stops too.
+        editor.replay_cancel.store(true, Ordering::Relaxed);
+        let name = editor.name.clone();
+        drop(editor);
+        self.edit_view.separator = None;
+        self.status = Some(format!("Closed {name}; what it loaded is freed"));
+    }
+
+    /// "Close without saving?" for a session with changes.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.edit_view.confirm_close {
+            return;
+        }
+        let Some(name) = self.edit_view.editor.as_ref().map(|e| e.name.clone()) else {
+            self.edit_view.confirm_close = false;
+            return;
+        };
+        let mut answer = None;
+        egui::Window::new("Close the session")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("\"{name}\" has changes that aren't saved."));
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Save and close").strong()).clicked() {
+                        answer = Some(Some(true));
+                    }
+                    if ui.button("Close without saving").clicked() {
+                        answer = Some(Some(false));
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        answer = Some(None);
+                    }
+                });
+            });
+        match answer {
+            Some(Some(save)) => {
+                if save && let Some(editor) = self.edit_view.editor.as_mut() {
+                    let said = editor.save();
+                    // Not saved: stays open, saying why.
+                    if editor.edited {
+                        self.status = Some(said);
+                        self.edit_view.confirm_close = false;
+                        return;
+                    }
+                }
+                self.close_session();
+            }
+            Some(None) => self.edit_view.confirm_close = false,
+            None => {}
+        }
+    }
+
     fn open_session(&mut self, path: PathBuf, ctx: &egui::Context) {
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -7218,7 +7432,7 @@ impl DeckhandApp {
                             let grid = track.beats(duration);
                             let beats = grid.iter().map(|b| b.0).collect();
                             let bars = grid.iter().map(|b| b.1).collect();
-                            session.add_grid(file, deckhand_audio::Grid { bpm, beats, bars });
+                            session.add_grid(file, rofloxbox_audio::Grid { bpm, beats, bars });
                         }
                     }
                     let warnings = session.warnings().join("; ");
@@ -7240,10 +7454,10 @@ impl DeckhandApp {
                     editor.cues = library_cues(&self.collection, editor.tracks.iter().map(|t| &t.path));
                     editor.outlines = outlines;
                     // Test aid: "Separate stems" pressed for this deck (1–4).
-                    if let Some(deck) = std::env::var("DECKHAND_EDIT_SEPARATE")
+                    if let Some(deck) = std::env::var("ROFLOXBOX_EDIT_SEPARATE")
                         .ok()
                         .and_then(|d| d.trim().parse::<usize>().ok())
-                        .filter(|d| (1..=deckhand_audio::DECKS).contains(d))
+                        .filter(|d| (1..=rofloxbox_audio::DECKS).contains(d))
                     {
                         editor.stems_wanted.push(deck - 1);
                     }
@@ -7304,11 +7518,11 @@ mod tests {
 
     /// A deck heard from `from` to `to` (frames), beats every `beat`
     /// frames from `first`, a bar every 4.
-    fn deck(from: u64, to: u64, first: u64, beat: u64) -> deckhand_audio::Played {
+    fn deck(from: u64, to: u64, first: u64, beat: u64) -> rofloxbox_audio::Played {
         let levels = (from..to).step_by(512).map(|at| (at, 0.5, 0.5)).collect::<Vec<_>>();
         let lows = vec![0.0; levels.len()];
         let beats = (0..).map(|i| (first + i * beat, i % 4 == 0)).take_while(|b| b.0 < to).collect();
-        deckhand_audio::Played { levels, lows, beats, places: Vec::new() }
+        rofloxbox_audio::Played { levels, lows, beats, places: Vec::new() }
     }
 
     #[test]
@@ -7334,13 +7548,13 @@ mod tests {
         assert!(tempo.iter().all(|t| (t.1 - 175.0).abs() < 0.01), "{tempo:?}");
     }
 
-    /// A debug report of `DECKHAND_SESSION`, written beside it after a clip
+    /// A debug report of `ROFLOXBOX_SESSION`, written beside it after a clip
     /// move, has the edit, its history and the trace (writes a folder):
-    /// `cargo test -p deckhand-app debug_report -- --ignored`
+    /// `cargo test -p rofloxbox-app debug_report -- --ignored`
     #[test]
     #[ignore]
     fn debug_report_has_what_happened() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let clip = editor.tracks.iter().find(|t| t.deck == 1).or(editor.tracks.first()).unwrap().clone();
@@ -7358,12 +7572,12 @@ mod tests {
 
     /// Before any replay (a clip just made longer is the same), a clip's
     /// waveform is there already: its track straight on from where it
-    /// starts, and quick to work out (`DECKHAND_SESSION`):
-    /// `cargo test -p deckhand-app --release waveform_without_replay -- --ignored`
+    /// starts, and quick to work out (`ROFLOXBOX_SESSION`):
+    /// `cargo test -p rofloxbox-app --release waveform_without_replay -- --ignored`
     #[test]
     #[ignore]
     fn waveform_without_replay() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let editor = MixEditor::new(path, session);
         assert!(editor.replayed.is_empty());
@@ -7372,7 +7586,7 @@ mod tests {
         let started = std::time::Instant::now();
         let peaks = wave::TrackPeaks::of(&audio);
         println!("peaks of {:.0} s of audio in {:?}", audio.duration_secs(), started.elapsed());
-        let played = deckhand_audio::Played::default();
+        let played = rofloxbox_audio::Played::default();
         let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(1600.0, 100.0));
         let (a, b) = (editor.x_of(area, span.from), editor.x_of(area, span.to));
         let block = Rect::from_x_y_ranges(a.max(0.0)..=b.min(1600.0), 0.0..=100.0);
@@ -7383,12 +7597,12 @@ mod tests {
         assert!(drawn > columns.len() / 2, "{drawn} of {}", columns.len());
     }
 
-    /// After a replay, a clip draws tall, as its track (`DECKHAND_SESSION`; `DECKHAND_STRIP`: a picture, .ppm):
-    /// `cargo test -p deckhand-app --release waveform_after_replay -- --ignored`
+    /// After a replay, a clip draws tall, as its track (`ROFLOXBOX_SESSION`; `ROFLOXBOX_STRIP`: a picture, .ppm):
+    /// `cargo test -p rofloxbox-app --release waveform_after_replay -- --ignored`
     #[test]
     #[ignore]
     fn waveform_after_replay() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let played = editor.session.lock().unwrap().played().unwrap();
@@ -7405,7 +7619,7 @@ mod tests {
         let mut tall: Vec<f32> = columns.iter().map(|c| c.peak).collect();
         tall.sort_by(f32::total_cmp);
         println!("median height {:.2} over {} columns", tall[tall.len() / 2], columns.len());
-        if let Ok(out) = std::env::var("DECKHAND_STRIP") {
+        if let Ok(out) = std::env::var("ROFLOXBOX_STRIP") {
             let mesh = wave::mesh(&columns, 0.0, 45.0, 40.0, DECK_COLORS[0]);
             let (w, h) = (columns.len(), 90usize);
             let mut img = vec![30u8; w * h * 3];
@@ -7434,9 +7648,9 @@ mod tests {
         let half_way = (span.from + span.to) / 2;
         {
             let mut session = editor.session.lock().unwrap();
-            let volume = vec![deckhand_audio::Point::step(0, 1.0), deckhand_audio::Point::step(half_way, 0.1)];
+            let volume = vec![rofloxbox_audio::Point::step(0, 1.0), rofloxbox_audio::Point::step(half_way, 0.1)];
             session.set_lane(Setting::Volume(span.deck), &volume);
-            let eq = vec![deckhand_audio::Point::step(0, 0.5), deckhand_audio::Point::step(half_way, 0.0)];
+            let eq = vec![rofloxbox_audio::Point::step(0, 0.5), rofloxbox_audio::Point::step(half_way, 0.0)];
             session.set_lane(Setting::Eq(span.deck, 0), &eq);
         }
         editor.played = editor.session.lock().unwrap().played().unwrap();
@@ -7448,12 +7662,12 @@ mod tests {
     }
 
     /// A rectangle drawn with the Normal tool picks the clips it touches,
-    /// whole, on every deck it crosses (`DECKHAND_SESSION`, read only):
-    /// `cargo test -p deckhand-app --release rectangle_picks_clips -- --ignored`
+    /// whole, on every deck it crosses (`ROFLOXBOX_SESSION`, read only):
+    /// `cargo test -p rofloxbox-app --release rectangle_picks_clips -- --ignored`
     #[test]
     #[ignore]
     fn rectangle_picks_clips() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let ctx = egui::Context::default();
@@ -7488,15 +7702,15 @@ mod tests {
         assert!(editor.picked.is_empty(), "{:?}", editor.picked);
     }
 
-    /// Where the time goes on `DECKHAND_SESSION` (read only): opening, the
+    /// Where the time goes on `ROFLOXBOX_SESSION` (read only): opening, the
     /// replay, a frame of the timeline zoomed out and following the
     /// playhead, and a clip move with its undo step.
-    /// `cargo test -p deckhand-app --release editor_timings -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app --release editor_timings -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn editor_timings() {
         use std::time::Instant;
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let t = Instant::now();
         let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
         println!("read: {:?}", t.elapsed());
@@ -7586,14 +7800,14 @@ mod tests {
         println!("frame after: {:?}", frame(&mut editor));
     }
 
-    /// The master changed for a stretch of `DECKHAND_SESSION` (read only):
+    /// The master changed for a stretch of `ROFLOXBOX_SESSION` (read only):
     /// synced again, the decks follow the new master there; undone, it is
     /// as it was.
-    /// `cargo test -p deckhand-app --release changing_the_master_deck -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app --release changing_the_master_deck -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn changing_the_master_deck() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
         session.make_editable(&path).unwrap();
         let mut editor = MixEditor::new(path, session);
@@ -7657,14 +7871,14 @@ mod tests {
         assert_eq!(Unit::Percent.read("abc"), None);
     }
 
-    /// A clip's start BPM handle on `DECKHAND_SESSION` (in memory): raised,
+    /// A clip's start BPM handle on `ROFLOXBOX_SESSION` (in memory): raised,
     /// the clip ramps from it and what follows the clip keeps its tempo:
-    /// `cargo test -p deckhand-app clip_bpm_handle -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app clip_bpm_handle -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn clip_bpm_handle() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
-        let session = Session::read(&path, deckhand_audio::Files).unwrap();
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
+        let session = Session::read(&path, rofloxbox_audio::Files).unwrap();
         let mut editor = MixEditor::new(path, session);
         let span = editor.tracks.iter().find(|t| !t.playing.is_empty() && t.to < editor.length).unwrap().clone();
         let (from, to) = editor.visible(&span)[0];
@@ -7685,16 +7899,16 @@ mod tests {
         assert!((session.lane(setting).iter().find(|p| p.at >= to).map_or(after, |p| p.value) - after).abs() < 1e-6);
     }
 
-    /// How much faster than real time `DECKHAND_SESSION` plays offline:
+    /// How much faster than real time `ROFLOXBOX_SESSION` plays offline:
     /// listening from a cursor plays everything before it first (read only).
-    /// `cargo test -p deckhand-app --release render_speed -- --ignored --nocapture`
-    /// A new effect on `DECKHAND_SESSION` is flat at the depth chosen, with
+    /// `cargo test -p rofloxbox-app --release render_speed -- --ignored --nocapture`
+    /// A new effect on `ROFLOXBOX_SESSION` is flat at the depth chosen, with
     /// a handle at each edge, and its depth goes along when it moves:
-    /// `cargo test -p deckhand-app new_effect_is_flat -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app new_effect_is_flat -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn new_effect_is_flat() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
         session.split_fx_depth();
         let mut editor = MixEditor::new(path, session);
@@ -7728,7 +7942,7 @@ mod tests {
     #[test]
     #[ignore]
     fn render_speed() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let started = std::time::Instant::now();
         let frames = session.render(|_| Ok(())).unwrap();
@@ -7737,13 +7951,13 @@ mod tests {
         println!("{secs:.0} s of set in {took:.1} s: {:.0}× real time", secs / took);
     }
 
-    /// Giving `DECKHAND_SESSION` a lane per Color FX type changes nothing
+    /// Giving `ROFLOXBOX_SESSION` a lane per Color FX type changes nothing
     /// heard (read only):
-    /// `cargo test -p deckhand-app --release color_lanes_sound_the_same -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app --release color_lanes_sound_the_same -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn color_lanes_sound_the_same() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut before = Vec::new();
         session.render(|b| Ok(before.extend_from_slice(b))).unwrap();
@@ -7757,13 +7971,13 @@ mod tests {
         assert!(worst < 1e-4, "{worst}");
     }
 
-    /// Dragging a track on `DECKHAND_SESSION` 100 points moves its audio
+    /// Dragging a track on `ROFLOXBOX_SESSION` 100 points moves its audio
     /// as far as the pointer went (read only):
-    /// `cargo test -p deckhand-app --release dragging_a_track -- --ignored`
+    /// `cargo test -p rofloxbox-app --release dragging_a_track -- --ignored`
     #[test]
     #[ignore]
     fn dragging_a_track_moves_it_with_the_pointer() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let ctx = egui::Context::default();
@@ -7855,13 +8069,13 @@ mod tests {
         area_width
     }
 
-    /// Dragging the second clip on deck 1 of `DECKHAND_SESSION` by its
+    /// Dragging the second clip on deck 1 of `ROFLOXBOX_SESSION` by its
     /// title moves it whole; undo puts it back (read only):
-    /// `cargo test -p deckhand-app --release dragging_a_clip -- --ignored`
+    /// `cargo test -p rofloxbox-app --release dragging_a_clip -- --ignored`
     #[test]
     #[ignore]
     fn dragging_a_clip_by_its_title_moves_it() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let clips = |e: &MixEditor| {
@@ -7882,13 +8096,13 @@ mod tests {
         assert_eq!(clips(&editor), after);
     }
 
-    /// On `DECKHAND_SESSION`: dragging one of several plays of deck 1's
+    /// On `ROFLOXBOX_SESSION`: dragging one of several plays of deck 1's
     /// clip moves just that play; the others stay (read only):
-    /// `cargo test -p deckhand-app --release dragging_one_play -- --ignored`
+    /// `cargo test -p rofloxbox-app --release dragging_one_play -- --ignored`
     #[test]
     #[ignore]
     fn dragging_one_play_moves_just_it() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let Some(span) = editor.tracks.iter().find(|t| t.deck == 0 && t.playing.len() > 1).cloned()
@@ -7929,13 +8143,13 @@ mod tests {
         assert_eq!(others, before, "the other plays stay where they were");
     }
 
-    /// On `DECKHAND_SESSION`: two of deck 1's plays picked (as with
+    /// On `ROFLOXBOX_SESSION`: two of deck 1's plays picked (as with
     /// Cmd/Ctrl-click) move together, in one undo (read only):
-    /// `cargo test -p deckhand-app --release two_plays -- --ignored`
+    /// `cargo test -p rofloxbox-app --release two_plays -- --ignored`
     #[test]
     #[ignore]
     fn two_plays_move_together() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let room = (3.0 * editor.rate) as u64;
@@ -8013,15 +8227,15 @@ mod tests {
         }
     }
 
-    /// On `DECKHAND_SESSION` (made for the user's 2026-11-05 10-09-47 set,
+    /// On `ROFLOXBOX_SESSION` (made for the user's 2026-11-05 10-09-47 set,
     /// whose clips sit where the clicks land): deck 1's first clip shrunk
     /// by its edge, the second split by a double click and the play under a
     /// right click cut out; undone again (read only):
-    /// `cargo test -p deckhand-app --release shrinking_and_cutting -- --ignored`
+    /// `cargo test -p rofloxbox-app --release shrinking_and_cutting -- --ignored`
     #[test]
     #[ignore]
     fn shrinking_and_cutting_clips() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, super::super::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let spans: Vec<TrackSpan> = editor.tracks.iter().filter(|t| t.deck == 0).cloned().collect();
@@ -8059,7 +8273,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_session_as_edit() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
         session.split_color_fx();
         session.split_fx_depth();
@@ -8092,11 +8306,11 @@ mod tests {
     #[test]
     #[ignore]
     fn real_recording_matches_its_renders() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let wav = path.with_extension("wav");
-        let out = std::env::var("DECKHAND_RENDER_DIR").map(PathBuf::from).unwrap();
+        let out = std::env::var("ROFLOXBOX_RENDER_DIR").map(PathBuf::from).unwrap();
         let mut session = Session::read(&path, super::super::recording::Sources).unwrap();
-        let report = |what: &str, r: deckhand_audio::Rendered| {
+        let report = |what: &str, r: rofloxbox_audio::Rendered| {
             let c = r.comparison.expect("compared");
             println!(
                 "{what}: rendered {} frames, recorded {} | differing samples {} | largest {:.6} ({:.1} dB) | first at {:?}s",

@@ -1,4 +1,4 @@
-//! Track analysis for deckhand: waveforms, beat grid and key worked out
+//! Track analysis for RofLoxBox: waveforms, beat grid and key worked out
 //! from the audio, in the forms rekordbox stores in its analysis files.
 //!
 //! The waveforms match the ones in rekordbox's analysis files, checked

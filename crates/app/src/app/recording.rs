@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use eframe::egui::{self, RichText, Ui};
 
-use super::{DECKS, DeckhandApp, WARN};
+use super::{DECKS, RofLoxBoxApp, WARN};
 
 /// Default folder: `Music/RofLoxBox Recordings` in the home folder.
 pub fn default_recordings_dir() -> PathBuf {
@@ -71,7 +71,7 @@ fn rename_recording(wav: &Path, name: &str) -> Result<PathBuf> {
     Ok(renamed.join(format!("{name}.wav")))
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     pub(super) fn recordings_dir(&self) -> PathBuf {
         self.config.recordings_dir.clone().unwrap_or_else(default_recordings_dir)
     }
@@ -159,7 +159,7 @@ impl DeckhandApp {
         let sent = self
             .engine
             .as_mut()
-            .is_some_and(|e| e.send(deckhand_audio::Command::Marker));
+            .is_some_and(|e| e.send(rofloxbox_audio::Command::Marker));
         self.status = Some(if sent {
             format!("Marker at {}:{:02}", secs / 60, secs % 60)
         } else {
@@ -347,16 +347,16 @@ impl Replay {
 /// cache.
 pub(super) struct Sources;
 
-impl deckhand_audio::Sources for Sources {
-    fn track(&mut self, path: &Path) -> Result<Arc<deckhand_audio::TrackAudio>> {
-        Ok(Arc::new(deckhand_audio::decode_file(path)?))
+impl rofloxbox_audio::Sources for Sources {
+    fn track(&mut self, path: &Path) -> Result<Arc<rofloxbox_audio::TrackAudio>> {
+        Ok(Arc::new(rofloxbox_audio::decode_file(path)?))
     }
 
     fn stems(
         &mut self,
-        source: &deckhand_audio::StemsSource,
-        track: &deckhand_audio::TrackAudio,
-    ) -> Result<Arc<deckhand_audio::StemLayers>> {
+        source: &rofloxbox_audio::StemsSource,
+        track: &rofloxbox_audio::TrackAudio,
+    ) -> Result<Arc<rofloxbox_audio::StemLayers>> {
         Ok(Arc::new(crate::stems::session_stems(source, track)?))
     }
 }
@@ -364,7 +364,7 @@ impl deckhand_audio::Sources for Sources {
 /// Plays `session` into "<name> replay.wav" beside it, and says how it
 /// compares with the recording.
 fn replay(session: &Path, progress: &AtomicU64, total: &AtomicU64) -> Result<String> {
-    let loaded = deckhand_audio::Session::read(session, Sources)?;
+    let loaded = rofloxbox_audio::Session::read(session, Sources)?;
     total.store(loaded.frames().unwrap_or(0), Ordering::Relaxed);
     let (lost, warnings) = (loaded.lost_events(), loaded.warnings().to_vec());
     let recorded = session.with_extension("wav");
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(clean_name(" .. "), None);
         // A recording renamed: folder, WAV and session; a taken name
         // gets a number.
-        let root = std::env::temp_dir().join(format!("deckhand-names-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rofloxbox-names-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let old = root.join("RofLoxBox 2026-11-09 20-00-00");
         std::fs::create_dir_all(old.join("stems")).unwrap();
@@ -421,15 +421,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Replays the session `DECKHAND_SESSION` with the app's tracks and
-    /// stems into `DECKHAND_REPLAY`, comparing it with its recording:
-    /// `cargo test -p deckhand-app --release replays_a_real_session -- --ignored --nocapture`
+    /// Replays the session `ROFLOXBOX_SESSION` with the app's tracks and
+    /// stems into `ROFLOXBOX_REPLAY`, comparing it with its recording:
+    /// `cargo test -p rofloxbox-app --release replays_a_real_session -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn replays_a_real_session() {
-        let path = std::path::PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
-        let out = std::path::PathBuf::from(std::env::var("DECKHAND_REPLAY").unwrap());
-        let session = deckhand_audio::Session::read(&path, super::Sources).unwrap();
+        let path = std::path::PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
+        let out = std::path::PathBuf::from(std::env::var("ROFLOXBOX_REPLAY").unwrap());
+        let session = rofloxbox_audio::Session::read(&path, super::Sources).unwrap();
         eprintln!("warnings {:?}", session.warnings());
         let rendered =
             session.render_to_wav(&out, Some(&path.with_extension("wav")), |_| {}).unwrap();
@@ -439,16 +439,16 @@ mod tests {
 
 #[cfg(test)]
 mod played_tests {
-    /// `DECKHAND_SESSION`'s beats are in order (read only):
-    /// `cargo test -p deckhand-app --release real_played -- --ignored --nocapture`
+    /// `ROFLOXBOX_SESSION`'s beats are in order (read only):
+    /// `cargo test -p rofloxbox-app --release real_played -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_played() {
-        let path = std::path::PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
-        let mut session = deckhand_audio::Session::read(&path, super::Sources).unwrap();
+        let path = std::path::PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
+        let mut session = rofloxbox_audio::Session::read(&path, super::Sources).unwrap();
         // The grids as the editor gives them, from the (sandbox's) collection.
         let collection =
-            deckhand_library::Collection::open(&deckhand_library::collection_path()).unwrap();
+            rofloxbox_library::Collection::open(&rofloxbox_library::collection_path()).unwrap();
         for (file, duration) in session.track_files() {
             if let Some(track) = collection.tracks.iter().find(|t| t.path == file)
                 && let Some(bpm) = track.bpm
@@ -458,11 +458,11 @@ mod played_tests {
                 eprintln!("{} bpm {bpm} beats {} sorted {sorted}", file.display(), grid.len());
                 let beats = grid.iter().map(|b| b.0).collect();
                 let bars = grid.iter().map(|b| b.1).collect();
-                session.add_grid(file, deckhand_audio::Grid { bpm, beats, bars });
+                session.add_grid(file, rofloxbox_audio::Grid { bpm, beats, bars });
             }
         }
         let all = session.played().unwrap();
-        for clash in deckhand_audio::clashes(&all, 22_050) {
+        for clash in rofloxbox_audio::clashes(&all, 22_050) {
             let t = |at: u64| at as f64 / 44_100.0;
             eprintln!(
                 "clash decks {:?} {:.1}–{:.1} s levels {:?}",

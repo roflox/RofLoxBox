@@ -4,16 +4,16 @@
 use crate::tour::Tag as _;
 use std::path::PathBuf;
 
-use deckhand_library::Derived;
+use rofloxbox_library::Derived;
 use eframe::egui::{self, RichText, Ui};
 
-use super::{DeckhandApp, WARN};
+use super::{RofLoxBoxApp, WARN};
 use crate::deck::Stems;
 use crate::stems::{self, Event, Job, LiveJob, Recipe, StemModel};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// The chosen model, else the first one there is, with the Python
     /// from Preferences unless its model.toml names one.
     pub(super) fn stem_model(&self) -> Option<StemModel> {
@@ -109,7 +109,7 @@ impl DeckhandApp {
         if !on {
             self.stop_live_stems();
         } else if self.config.prefs.stems_on_load {
-            for d in 0..deckhand_audio::DECKS {
+            for d in 0..rofloxbox_audio::DECKS {
                 if matches!(self.decks[d].stems, Stems::None | Stems::Failed) {
                     self.separate_deck(d);
                 }
@@ -129,7 +129,7 @@ impl DeckhandApp {
 
     /// Newly loaded tracks get separated, when Preferences say so.
     fn separate_new_tracks(&mut self) {
-        for d in 0..deckhand_audio::DECKS {
+        for d in 0..rofloxbox_audio::DECKS {
             let path = self.decks[d].track.as_ref().map(|t| t.path.clone());
             if path == self.stems_for[d] {
                 continue;
@@ -196,7 +196,7 @@ impl DeckhandApp {
                     }
                 }
                 Event::Made { track, recipe, path, model } => {
-                    let made = deckhand_library::read_file(&path).and_then(|file| {
+                    let made = rofloxbox_library::read_file(&path).and_then(|file| {
                         let derived =
                             Derived { original: track, stems: recipe.keep.clone(), model };
                         self.collection

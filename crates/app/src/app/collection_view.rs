@@ -1,13 +1,13 @@
-//! The browser for deckhand's own collection: folders of playlists on the
+//! The browser for RofLoxBox's own collection: folders of playlists on the
 //! left, tracks on the right, adding music by folder, file or drag and drop.
 
 use crate::tour::Tag as _;
 use std::path::PathBuf;
 
-use deckhand_library::{CueKind, NodeKind, Scan};
+use rofloxbox_library::{CueKind, NodeKind, Place, Scan};
 use eframe::egui::{self, RichText, Stroke, Ui};
 
-use super::{DeckhandApp, Focus, WARN};
+use super::{RofLoxBoxApp, Focus, WARN};
 use crate::browser::{Row, Sort, TableOptions, TrackColumn, sort_rows, track_table};
 
 /// Browser state for the collection.
@@ -25,7 +25,12 @@ pub struct CollectionView {
     /// A track (and playlist) waiting for "add it again?" to be answered.
     pending_duplicate: Option<(u32, u32)>,
     /// A rekordbox XML file being read.
-    xml: Option<std::sync::mpsc::Receiver<anyhow::Result<deckhand_library::XmlLibrary>>>,
+    xml: Option<std::sync::mpsc::Receiver<anyhow::Result<rofloxbox_library::XmlLibrary>>>,
+    /// Serato's libraries found on this computer, and when they were looked
+    /// for (again every few seconds while the menu shows them).
+    serato_found: Option<(std::time::Instant, Vec<PathBuf>)>,
+    /// A Serato library being read.
+    serato: Option<std::sync::mpsc::Receiver<anyhow::Result<rofloxbox_library::XmlLibrary>>>,
     /// The key that opened rekordbox's library, to keep in the settings.
     rekordbox_key: Option<std::sync::mpsc::Receiver<(String, i64)>>,
     /// rekordbox's change count of the library being read.
@@ -38,6 +43,9 @@ pub struct CollectionView {
     /// Quitting waits for rekordbox to close, with when it was last looked
     /// for.
     quit_waiting: Option<std::time::Instant>,
+    /// Quitting once the save into rekordbox running now is done (it runs
+    /// in the background, so the window keeps answering meanwhile).
+    quit_after_save: bool,
     /// Changes being written into rekordbox's library, with the
     /// fingerprint of what is written and whether the save started itself.
     rekordbox_save: Option<(RekordboxSave, u64, bool)>,
@@ -56,9 +64,29 @@ pub struct CollectionView {
     /// Files dropped on a playlist that go into it once the scan reading
     /// them is done: (playlist, files).
     pending_adds: Vec<(u32, Vec<PathBuf>)>,
+    /// Playlists and folders picked by Cmd/Ctrl- or Shift-clicking (or one
+    /// clicked), to move or delete together.
+    picked: Vec<u32>,
+    /// Where a Shift-click range starts.
+    pick_anchor: Option<u32>,
+    /// The tree's rows shown last frame, in order (for Shift-click ranges).
+    shown_rows: Vec<u32>,
+    /// Playlists and folders waiting for "delete them?", and whether to ask
+    /// again next time.
+    confirm_delete: Option<(Vec<u32>, bool)>,
+    /// Tracks waiting for "remove them from the collection?".
+    confirm_forget: Option<Vec<u32>>,
+    /// "Convert these tracks" being asked: the tracks, whether to replace
+    /// the originals, and whether to remember that.
+    pub(super) converting: Option<(Vec<u32>, bool, bool)>,
+    /// Tracks being converted.
+    pub(super) conversion: Option<crate::convert::Conversion>,
 }
 
-impl DeckhandApp {
+/// Playlists and folders being dragged in the collection's tree.
+pub struct PlaylistDrag(pub Vec<u32>);
+
+impl RofLoxBoxApp {
     /// Tracks shown for the collection: the chosen playlist or everything,
     /// filtered by the search text.
     /// Tracks shown with their position in the list and whether that list
@@ -181,6 +209,11 @@ impl DeckhandApp {
             self.status = Some("Nothing to analyze (or the files are missing)".into());
             return;
         }
+        let what = if overwrite { "again" } else { "where missing" };
+        self.status = Some(format!(
+            "Analyzing BPM, beat grid and key of {} track(s) {what}…",
+            tracks.len()
+        ));
         self.collection_view.analysis =
             Some((crate::analyze::Analysis::start(tracks, overwrite), 0, 0));
     }
@@ -188,14 +221,31 @@ impl DeckhandApp {
     /// Stores finished analyses in the collection and on decks holding
     /// the track.
     fn poll_analysis(&mut self, ctx: &egui::Context) {
-        use deckhand_library::TempoMarker;
+        use rofloxbox_library::TempoMarker;
         let Some((analysis, found, failed)) = self.collection_view.analysis.as_mut() else {
             return;
         };
+        let total = analysis.total;
+        // One line per track in the log, after the track's changes.
+        let mut lines: Vec<(String, bool)> = Vec::new();
         while let Ok(r) = analysis.results.try_recv() {
+            analysis.received += 1;
+            let done = analysis.received;
+            let track = self.collection.track(r.id);
+            let title = track.map_or_else(String::new, |t| t.title.clone());
+            let progress = format!("Analysis {done}/{total}: {title}");
             if r.failed {
                 *failed += 1;
+                let path = track.map_or_else(String::new, |t| t.path.display().to_string());
+                lines.push((format!("{progress} — couldn't be read ({path})"), true));
                 continue;
+            }
+            let mut found_parts = Vec::new();
+            if let Some(g) = &r.grid {
+                found_parts.push(format!("{:.2} BPM", g.bpm));
+            }
+            if let Some(k) = &r.key {
+                found_parts.push(k.camelot());
             }
             let mut changed = false;
             self.collection.update_track(r.id, |t| {
@@ -214,6 +264,13 @@ impl DeckhandApp {
                     changed = true;
                 }
             });
+            let found_text = if found_parts.is_empty() {
+                "nothing found".into()
+            } else {
+                found_parts.join(", ")
+            };
+            let kept = if changed { "" } else { " (kept what it had)" };
+            lines.push((format!("{progress} — {found_text}{kept}"), false));
             if !changed {
                 continue;
             }
@@ -230,7 +287,14 @@ impl DeckhandApp {
                 }
             }
         }
-        if analysis.is_finished() {
+        let finished = analysis.is_finished();
+        for (line, error) in lines {
+            self.log(line, error);
+        }
+        let Some((analysis, found, failed)) = self.collection_view.analysis.as_mut() else {
+            return;
+        };
+        if finished {
             let (done, total) =
                 (analysis.done.load(std::sync::atomic::Ordering::Relaxed), analysis.total);
             let unread = if *failed > 0 {
@@ -240,7 +304,7 @@ impl DeckhandApp {
             };
             self.status = Some(format!(
                 "Analysis: {found} of {total} track(s) got a grid or key{unread}{}",
-                if done < total { " (cancelled)" } else { "" }
+                if done < total { " (stopped)" } else { "" }
             ));
             self.collection_view.analysis = None;
         } else {
@@ -254,13 +318,13 @@ impl DeckhandApp {
         self.config.prefs.rekordbox_db.clone().or_else(crate::rekordbox_db::default_path)
     }
 
-    /// At start: rekordbox's library is read again, unless deckhand has
+    /// At start: rekordbox's library is read again, unless RofLoxBox has
     /// changes it doesn't have yet (they go in first).
     pub(super) fn rekordbox_at_start(&mut self) {
         if self.collection.rekordbox_unsaved && self.config.prefs.rekordbox_write {
             self.collection_view.rekordbox_due = Some(std::time::Instant::now());
             self.status = Some(
-                "rekordbox's library doesn't have deckhand's last changes yet: saving them \
+                "rekordbox's library doesn't have RofLoxBox's last changes yet: saving them \
                  instead of reading it"
                     .into(),
             );
@@ -362,7 +426,7 @@ impl DeckhandApp {
                     .on_hover_text("Shortly after each change");
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.config.prefs.rekordbox_wait_closed, "Wait for rekordbox to close");
-                    crate::widgets::help(ui, "On: deckhand looks for rekordbox before each save and saves only once it's closed (quitting waits for it too). Off: saves go in whether rekordbox runs or not; rekordbox may not show them until it's restarted, and changes it makes meanwhile stop the save until the library is read again.");
+                    crate::widgets::help(ui, "On: RofLoxBox looks for rekordbox before each save and saves only once it's closed (quitting waits for it too). Off: saves go in whether rekordbox runs or not; rekordbox may not show them until it's restarted, and changes it makes meanwhile stop the save until the library is read again.");
                 });
             });
         }
@@ -381,14 +445,32 @@ impl DeckhandApp {
             }
             self.save_to_rekordbox_button(ui);
         });
+        let mut asked_again = self.convert_prefs(ui);
+        if asked_again {
+            self.config.save();
+        }
+        if self.config.prefs.delete_playlists_without_asking {
+            ui.add_space(10.0);
+            ui.label(RichText::new("Playlists").strong().size(15.0));
+            ui.label(
+                RichText::new("Deleting playlists and folders doesn't ask first (you said so).")
+                    .small()
+                    .weak(),
+            );
+            if ui.button("Ask again before deleting playlists").clicked() {
+                self.config.prefs.delete_playlists_without_asking = false;
+                asked_again = true;
+            }
+        }
         let p = &self.config.prefs;
-        (
-            p.rekordbox_key.clone(),
-            p.rekordbox_db.clone(),
-            p.rekordbox_at_start,
-            p.rekordbox_write,
-            p.rekordbox_autosave,
-        ) != before
+        asked_again
+            || (
+                p.rekordbox_key.clone(),
+                p.rekordbox_db.clone(),
+                p.rekordbox_at_start,
+                p.rekordbox_write,
+                p.rekordbox_autosave,
+            ) != before
     }
 
     /// Asks to back up rekordbox's library before writing to it is allowed.
@@ -439,6 +521,23 @@ impl DeckhandApp {
             )
             .on_hover_text(
                 "Write changes to rekordbox's library",
+            )
+            .clicked()
+            && let Some(path) = path.clone()
+        {
+            self.save_to_rekordbox(path, false);
+        }
+        if ui
+            .add_enabled(
+                path.is_some() && self.collection_view.rekordbox_save.is_none(),
+                egui::Button::new("Repair waveforms in rekordbox"),
+            )
+            .on_hover_text(
+                "Goes through the tracks rekordbox has that are in RofLoxBox's collection: those \
+                 missing analysis files (saved by an older RofLoxBox, or with files lost) get \
+                 them, worked out from the audio, so rekordbox shows their waveforms without \
+                 analysing them again. rekordbox's own files aren't changed. It's what every \
+                 save does as well; this runs it now.",
             )
             .clicked()
             && let Some(path) = path
@@ -545,7 +644,9 @@ impl DeckhandApp {
         let second = std::time::Duration::from_secs(1);
         if looked.elapsed() >= second {
             if !crate::rekordbox_db::rekordbox_running() {
-                self.quit();
+                self.collection_view.quit_waiting = None;
+                self.begin_quit(ctx);
+                return;
             }
             self.collection_view.quit_waiting = Some(std::time::Instant::now());
         }
@@ -585,30 +686,73 @@ impl DeckhandApp {
 
     /// At quit: changes rekordbox doesn't have yet are saved first (while
     /// it is closed), waiting for a save already running.
-    pub(super) fn save_to_rekordbox_at_quit(&mut self) {
-        if !self.config.prefs.rekordbox_write || !self.config.prefs.rekordbox_autosave {
-            return;
-        }
-        if let Some((rx, print, auto)) = self.collection_view.rekordbox_save.take()
-            && let Ok(result) = rx.recv_timeout(std::time::Duration::from_secs(60))
-        {
-            self.rekordbox_saved(result, print, auto);
-        }
-        if self.collection_view.rekordbox_due.is_some()
-            && !self.collection_view.rekordbox_paused
+    /// A save into rekordbox is running.
+    pub(super) fn rekordbox_saving(&self) -> bool {
+        self.collection_view.rekordbox_save.is_some()
+    }
+
+    /// Starts quitting: changes due for rekordbox are saved into it first,
+    /// in the background (a window says so), then the app quits.
+    pub(super) fn begin_quit(&mut self, ctx: &egui::Context) {
+        let prefs = &self.config.prefs;
+        let view = &self.collection_view;
+        let due = prefs.rekordbox_write
+            && prefs.rekordbox_autosave
+            && !view.rekordbox_paused
+            && view.rekordbox_due.is_some()
             && self.collection.rekordbox_count.is_some()
-            && !(self.config.prefs.rekordbox_wait_closed && crate::rekordbox_db::rekordbox_running())
+            && !(prefs.rekordbox_wait_closed && crate::rekordbox_db::rekordbox_running());
+        if due
+            && view.rekordbox_save.is_none()
             && let Some(path) = self.rekordbox_db().filter(|p| p.is_file())
-            && let Some(snapshot) = self.rekordbox_snapshot()
         {
             self.collection_view.rekordbox_due = None;
-            let print = self.rekordbox_fingerprint();
-            let prefs = &self.config.prefs;
-            let result =
-                save_into_rekordbox(&path, &prefs.rekordbox_key, &snapshot, prefs.rekordbox_wait_closed);
-            self.rekordbox_saved(result, print, true);
+            self.save_to_rekordbox(path, true);
         }
-        let _ = self.collection.save();
+        if self.collection_view.rekordbox_save.is_some() {
+            self.collection_view.quit_after_save = true;
+            ctx.request_repaint();
+        } else {
+            self.quit();
+        }
+    }
+
+    /// While quitting waits for a save into rekordbox: says so, and quits
+    /// once it's done (or right away, if asked to).
+    pub(super) fn quit_after_saving(&mut self, ctx: &egui::Context) {
+        if !self.collection_view.quit_after_save {
+            return;
+        }
+        if self.collection_view.rekordbox_save.is_none() {
+            self.quit();
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let (mut now, mut stay) = (false, false);
+        egui::Modal::new(egui::Id::new("quit after saving")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(RichText::new("Saving into rekordbox").strong().size(16.0));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Your changes go into rekordbox's library; RofLoxBox then quits.");
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                stay = ui.button("Don't quit").clicked();
+                now = ui
+                    .button("Quit now")
+                    .on_hover_text("The changes are saved into rekordbox next time")
+                    .clicked();
+            });
+        });
+        if now {
+            // Saved next time: the collection remembers they're due.
+            self.collection.set_rekordbox_unsaved(true);
+            self.quit();
+        }
+        if stay {
+            self.collection_view.quit_after_save = false;
+        }
     }
 
     /// Writes the collection's changes into rekordbox's library in the
@@ -616,7 +760,7 @@ impl DeckhandApp {
     fn save_to_rekordbox(&mut self, path: PathBuf, auto: bool) {
         let print = self.rekordbox_fingerprint();
         let Some(snapshot) = self.rekordbox_snapshot() else {
-            let never_read = anyhow::anyhow!("read rekordbox's library into deckhand first");
+            let never_read = anyhow::anyhow!("read rekordbox's library into RofLoxBox first");
             self.rekordbox_saved(Err(never_read), print, auto);
             return;
         };
@@ -645,6 +789,7 @@ impl DeckhandApp {
             Ok(saved) => {
                 if !saved.is_empty() {
                     self.collection.saved_to_rekordbox(&saved.ids, saved.count);
+                    self.collection.moved_in_rekordbox(&saved.moved);
                 }
                 view.rekordbox_print = Some(print);
                 view.rekordbox_paused = false;
@@ -658,6 +803,9 @@ impl DeckhandApp {
                     (saved.cues, "with new cues"),
                     (saved.grids, "with new beat grids"),
                     (saved.added, "added"),
+                    (saved.moved.len(), "moved to converted files"),
+                    (saved.analysed, "given RofLoxBox's waveforms"),
+                    (saved.unanalysed, "without waveforms (audio unreadable)"),
                     (saved.playlists, "playlist change(s)"),
                 ]
                 .iter()
@@ -677,7 +825,7 @@ impl DeckhandApp {
                 if !view.rekordbox_waiting_said {
                     view.rekordbox_waiting_said = true;
                     self.status = Some(
-                        "rekordbox is open: deckhand's changes go into its library once it's \
+                        "rekordbox is open: RofLoxBox's changes go into its library once it's \
                          closed"
                             .into(),
                     );
@@ -686,7 +834,7 @@ impl DeckhandApp {
             Err(err) if auto => {
                 view.rekordbox_paused = true;
                 view.error = Some(format!(
-                    "Saving into rekordbox stopped: {err:#}. Changes stay in deckhand; \
+                    "Saving into rekordbox stopped: {err:#}. Changes stay in RofLoxBox; \
                      \"Save changes to rekordbox\" tries again."
                 ));
             }
@@ -694,11 +842,21 @@ impl DeckhandApp {
         }
     }
 
+    /// Reads the Serato library in `serato` (a `_Serato_` folder) in the
+    /// background; it goes into the Serato folder.
+    fn import_serato(&mut self, serato: PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(rofloxbox_library::serato::open(&serato));
+        });
+        self.collection_view.serato = Some(rx);
+    }
+
     /// Reads a rekordbox XML export in the background.
     fn import_xml(&mut self, path: PathBuf) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(deckhand_library::XmlLibrary::open(&path));
+            let _ = tx.send(rofloxbox_library::XmlLibrary::open(&path));
         });
         self.collection_view.xml = Some(rx);
     }
@@ -706,6 +864,7 @@ impl DeckhandApp {
     /// Merges a finished scan or import and saves. Call every frame.
     pub(super) fn poll_collection(&mut self, ctx: &egui::Context) {
         self.poll_analysis(ctx);
+        self.poll_conversion(ctx);
         let finished = self
             .collection_view
             .rekordbox_save
@@ -760,6 +919,26 @@ impl DeckhandApp {
         } else if self.collection_view.xml.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+        if let Some(result) = self.collection_view.serato.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.collection_view.serato = None;
+            match result {
+                Ok(library) => {
+                    let s = self.collection.import_into(library, "Serato", true);
+                    let missing = if s.missing > 0 {
+                        format!(", {} file(s) not found on this computer", s.missing)
+                    } else {
+                        String::new()
+                    };
+                    self.status = Some(format!(
+                        "Serato import: {} added, {} updated, {} crates{missing}",
+                        s.added, s.updated, s.playlists
+                    ));
+                }
+                Err(err) => self.collection_view.error = Some(format!("Serato: {err:#}")),
+            }
+        } else if self.collection_view.serato.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         let view = &mut self.collection_view;
         if let Some(scan) = &view.scan {
             match scan.finished() {
@@ -781,13 +960,6 @@ impl DeckhandApp {
                 }
                 None => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
             }
-        }
-        // Files dropped on the window go into the collection.
-        let dropped: Vec<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if !dropped.is_empty() {
-            self.source = super::Source::Collection;
-            self.add_music(dropped);
         }
         if self.collection.is_dirty() {
             self.note_rekordbox_change();
@@ -825,7 +997,7 @@ impl DeckhandApp {
             ui.close();
             if let Some(files) = rfd::FileDialog::new()
                 .set_title("Add music files")
-                .add_filter("Audio", &deckhand_library::AUDIO_EXTENSIONS)
+                .add_filter("Audio", &rofloxbox_library::AUDIO_EXTENSIONS)
                 .pick_files()
             {
                 self.add_music(files);
@@ -866,6 +1038,42 @@ impl DeckhandApp {
                 self.import_xml(file);
             }
         }
+        // Serato's libraries found here (the Music folder's, each drive's),
+        // or one picked.
+        let view = &mut self.collection_view;
+        if view.serato_found.as_ref().is_none_or(|(at, _)| at.elapsed().as_secs() >= 5) {
+            view.serato_found = Some((std::time::Instant::now(), rofloxbox_library::serato::find()));
+        }
+        let found_here = view.serato_found.as_ref().map(|(_, f)| f.clone()).unwrap_or_default();
+        for found in found_here {
+            let place = found.parent().unwrap_or(&found).display().to_string();
+            if ui
+                .add_enabled(self.collection_view.serato.is_none(), egui::Button::new(format!("Import Serato library ({place})")))
+                .on_hover_text("Tracks, crates, hot cues, saved loops and beat grids, into the Serato folder")
+                .clicked()
+            {
+                ui.close();
+                self.import_serato(found);
+            }
+        }
+        if ui
+            .add_enabled(self.collection_view.serato.is_none(), egui::Button::new("Import Serato library…"))
+            .on_hover_text("Choose a _Serato_ folder (or the folder or drive it is in)")
+            .clicked()
+        {
+            ui.close();
+            if let Some(picked) =
+                rfd::FileDialog::new().set_title("Choose a _Serato_ folder").pick_folder()
+            {
+                match rofloxbox_library::serato::library_in(&picked) {
+                    Some(serato) => self.import_serato(serato),
+                    None => {
+                        self.collection_view.error =
+                            Some(format!("No Serato library in {}", picked.display()))
+                    }
+                }
+            }
+        }
         if ui
             .button("Analyze tracks without a grid or key")
             .on_hover_text(
@@ -880,15 +1088,337 @@ impl DeckhandApp {
         let parent = self.selected_folder();
         if ui.button("New playlist").clicked() {
             ui.close();
-            let id = self.collection.create("New playlist", NodeKind::Playlist, parent);
-            self.collection_view.renaming = Some((id, "New playlist".into()));
-            self.tree.collection_open = true;
+            self.new_node(NodeKind::Playlist, parent);
         }
         if ui.button("New folder").clicked() {
             ui.close();
-            let id = self.collection.create("New folder", NodeKind::Folder, parent);
-            self.collection_view.renaming = Some((id, "New folder".into()));
-            self.tree.collection_open = true;
+            self.new_node(NodeKind::Folder, parent);
+        }
+        ui.separator();
+        ui.label(RichText::new("Playlists").small().weak());
+        let mut by_name = self.config.playlists_by_name;
+        ui.radio_value(&mut by_name, false, "In their own order")
+            .on_hover_text("As you arranged them by dragging (rekordbox's order too)");
+        ui.radio_value(&mut by_name, true, "By name").on_hover_text("Folders first, A to Z");
+        if by_name != self.config.playlists_by_name {
+            self.config.playlists_by_name = by_name;
+            self.config.save();
+        }
+        if ui.button("Expand all folders").clicked() {
+            self.config.collapsed_folders.clear();
+            self.config.save();
+            ui.close();
+        }
+        if ui.button("Collapse all folders").clicked() {
+            self.config.collapsed_folders = self
+                .collection
+                .nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Folder)
+                .map(|n| n.id)
+                .collect();
+            self.config.save();
+            ui.close();
+        }
+    }
+
+    /// A new playlist or folder, at the top of `parent` (shown open), with
+    /// its name being typed.
+    fn new_node(&mut self, kind: NodeKind, parent: Option<u32>) {
+        let name = match kind {
+            NodeKind::Playlist => "New playlist",
+            NodeKind::Folder => "New folder",
+        };
+        let first = self.collection.tree().into_iter().find(|(_, n)| n.parent == parent);
+        let first = first.map(|(_, n)| n.id);
+        let id = self.collection.create(name, kind.clone(), parent);
+        if let Some(first) = first {
+            self.collection.move_nodes(&[id], Place::Before(first));
+        }
+        // Its folders open, so it shows.
+        let mut folder = parent;
+        while let Some(f) = folder {
+            self.config.collapsed_folders.retain(|c| *c != f);
+            folder = self.collection.node(f).and_then(|n| n.parent);
+        }
+        self.config.save();
+        self.tree.collection_open = true;
+        if kind == NodeKind::Playlist {
+            self.select_entry(super::library_tree::TreeEntry::Collection(Some(id)));
+            self.focus = Focus::Playlists;
+        }
+        (self.collection_view.picked, self.collection_view.pick_anchor) = (vec![id], Some(id));
+        self.collection_view.renaming = Some((id, name.into()));
+    }
+
+    /// Puts a spacer (a second of silence called "---") into a playlist
+    /// before entry `at`, or at its end.
+    fn insert_spacer(&mut self, playlist: u32, at: Option<usize>) {
+        let path = match spacer_file() {
+            Ok(path) => path,
+            Err(err) => {
+                self.collection_view.error = Some(format!("Making the spacer: {err:#}"));
+                return;
+            }
+        };
+        let key = path.to_string_lossy().into_owned();
+        let file = rofloxbox_library::ScannedFile {
+            path: path.clone(),
+            title: SPACER.into(),
+            duration: 1.0,
+            sample_rate: Some(SPACER_RATE),
+            ..Default::default()
+        };
+        let xml = rofloxbox_library::XmlTrack {
+            id: key.clone(),
+            location: key,
+            file,
+            rating: None,
+            ..Default::default()
+        };
+        let (ids, _) = self.collection.add_tracks(vec![xml]);
+        let Some(&id) = ids.first() else { return };
+        let Some(end) = self.collection.node(playlist).map(|n| n.tracks.len()) else { return };
+        self.collection.add_to_playlist(playlist, &[id]);
+        if let Some(at) = at.filter(|&at| at < end) {
+            self.collection.move_in_playlist(playlist, &[end], at);
+        }
+        self.status = Some("Spacer inserted".into());
+    }
+
+    /// Another copy of each of these entries, right after it.
+    fn duplicate_entries(&mut self, playlist: u32, mut entries: Vec<usize>) {
+        entries.sort_unstable();
+        entries.dedup();
+        // From the end, so the positions still to do stay right.
+        for &entry in entries.iter().rev() {
+            let Some(node) = self.collection.node(playlist) else { return };
+            let (Some(&track), end) = (node.tracks.get(entry), node.tracks.len()) else {
+                continue;
+            };
+            self.collection.add_to_playlist(playlist, &[track]);
+            self.collection.move_in_playlist(playlist, &[end], entry + 1);
+        }
+        self.status = Some(format!("Duplicated {} in the playlist", entries.len()));
+    }
+
+    /// The playlist entries selected (their positions), in list order.
+    fn selected_entries(&self) -> Vec<usize> {
+        if self.marked.is_empty() {
+            return self.selected_position.into_iter().collect();
+        }
+        self.visible_rows()
+            .into_iter()
+            .filter(|(_, position)| self.marked.contains(position))
+            .map(|(_, position)| position)
+            .collect()
+    }
+
+    /// Takes entries (positions) out of a playlist; the selection goes.
+    fn remove_entries(&mut self, playlist: u32, mut entries: Vec<usize>) {
+        if entries.is_empty() {
+            return;
+        }
+        // From the end, so the positions still left stay right.
+        entries.sort_unstable();
+        entries.dedup();
+        for &entry in entries.iter().rev() {
+            self.collection.remove_playlist_entry(playlist, entry);
+        }
+        self.marked.clear();
+        (self.selected, self.selected_position) = (None, None);
+        self.status = Some(format!("Removed {} from the playlist", entries.len()));
+    }
+
+    /// "Remove these tracks from the collection?"
+    pub(super) fn forget_tracks_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ids) = &self.collection_view.confirm_forget else { return };
+        let question = match ids.as_slice() {
+            [] => {
+                self.collection_view.confirm_forget = None;
+                return;
+            }
+            [one] => {
+                let title = self.collection.track(*one).map_or("", |t| t.title.as_str());
+                format!("Remove \"{title}\" from the collection?")
+            }
+            more => format!("Remove these {} tracks from the collection?", more.len()),
+        };
+        let mut answer = None;
+        egui::Window::new("Remove from collection")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(question);
+                ui.label(
+                    RichText::new(
+                        "They go from every playlist too, with their cues, grids and ratings. \
+                         The files stay on the computer.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Remove").strong()).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        answer = Some(false);
+                    }
+                });
+            });
+        if let Some(remove) = answer
+            && let Some(ids) = self.collection_view.confirm_forget.take()
+            && remove
+        {
+            self.collection.remove_tracks(&ids);
+            self.marked.clear();
+            (self.selected, self.selected_position) = (None, None);
+            self.status = Some(format!("Removed {} track(s) from the collection", ids.len()));
+        }
+    }
+
+    /// The playlists and folders a click, a key or a menu of `on` acts on:
+    /// the picked ones when `on` is one of them (or nothing is given),
+    /// otherwise `on` alone.
+    fn acted_on(&self, on: Option<u32>) -> Vec<u32> {
+        let picked: Vec<u32> = self
+            .collection_view
+            .picked
+            .iter()
+            .copied()
+            .filter(|&id| self.collection.node(id).is_some())
+            .collect();
+        match on {
+            Some(id) if !picked.contains(&id) => vec![id],
+            None if picked.is_empty() => self.collection_view.node.into_iter().collect(),
+            _ => picked,
+        }
+    }
+
+    /// A playlist or folder clicked: alone, or added to (Cmd/Ctrl) or
+    /// extended to (Shift) what's picked.
+    fn pick_node(&mut self, id: u32, kind: &NodeKind, modifiers: egui::Modifiers) {
+        let view = &mut self.collection_view;
+        if modifiers.shift
+            && let Some(anchor) = view.pick_anchor.or(view.node)
+            && let (Some(a), Some(b)) = (
+                view.shown_rows.iter().position(|&r| r == anchor),
+                view.shown_rows.iter().position(|&r| r == id),
+            )
+        {
+            view.picked = view.shown_rows[a.min(b)..=a.max(b)].to_vec();
+            return;
+        }
+        if modifiers.command {
+            if view.picked.is_empty()
+                && let Some(shown) = view.node
+            {
+                view.picked.push(shown);
+            }
+            if let Some(i) = view.picked.iter().position(|&p| p == id) {
+                view.picked.remove(i);
+            } else {
+                view.picked.push(id);
+            }
+            view.pick_anchor = Some(id);
+            return;
+        }
+        (view.picked, view.pick_anchor) = (vec![id], Some(id));
+        // Clicking a folder opens or closes it (and selects it, for new
+        // playlists).
+        if *kind == NodeKind::Folder {
+            if !self.config.collapsed_folders.contains(&id) {
+                self.config.collapsed_folders.push(id);
+            } else {
+                self.config.collapsed_folders.retain(|f| *f != id);
+            }
+            self.config.save();
+        }
+        self.select_entry(super::library_tree::TreeEntry::Collection(Some(id)));
+        self.focus = Focus::Playlists;
+    }
+
+    /// Deletes playlists and folders, after asking (unless asked not to).
+    fn ask_to_delete(&mut self, ids: Vec<u32>) {
+        if ids.is_empty() {
+            return;
+        }
+        if self.config.prefs.delete_playlists_without_asking {
+            self.delete_nodes(&ids);
+        } else {
+            self.collection_view.confirm_delete = Some((ids, false));
+        }
+    }
+
+    fn delete_nodes(&mut self, ids: &[u32]) {
+        for &id in ids {
+            self.collection.delete(id);
+        }
+        if self.collection_view.node.is_some_and(|n| self.collection.node(n).is_none()) {
+            self.collection_view.node = None;
+        }
+        self.collection_view.picked.clear();
+    }
+
+    /// "Delete these playlists?", with "Don't ask again".
+    pub(super) fn delete_playlists_dialog(&mut self, ctx: &egui::Context) {
+        let Some((ids, _)) = &self.collection_view.confirm_delete else { return };
+        let nodes: Vec<&rofloxbox_library::Node> =
+            ids.iter().filter_map(|&id| self.collection.node(id)).collect();
+        let question = match nodes.as_slice() {
+            [] => {
+                self.collection_view.confirm_delete = None;
+                return;
+            }
+            [one] if one.kind == NodeKind::Folder => {
+                format!("Delete the folder \"{}\" and everything in it?", one.name)
+            }
+            [one] => format!("Delete the playlist \"{}\"?", one.name),
+            more => format!("Delete these {} playlists and folders?", more.len()),
+        };
+        let folders = nodes.len() > 1 && nodes.iter().any(|n| n.kind == NodeKind::Folder);
+        let mut answer = None;
+        egui::Window::new("Delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(question);
+                if folders {
+                    ui.label(RichText::new("Folders go with everything in them.").small().weak());
+                }
+                ui.label(RichText::new("The tracks stay in the collection.").small().weak());
+                if let Some((_, never)) = &mut self.collection_view.confirm_delete {
+                    ui.checkbox(never, "Don't ask again");
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Delete").strong()).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        answer = Some(false);
+                    }
+                });
+            });
+        if let Some(delete) = answer
+            && let Some((ids, never)) = self.collection_view.confirm_delete.take()
+            && delete
+        {
+            if never {
+                self.config.prefs.delete_playlists_without_asking = true;
+                self.config.save();
+            }
+            self.delete_nodes(&ids);
         }
     }
 
@@ -898,6 +1428,18 @@ impl DeckhandApp {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(RichText::new("Reading rekordbox XML…").small());
+            });
+        }
+        if self.transferring() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Moving tracks between libraries…").small());
+            });
+        }
+        if self.collection_view.serato.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Reading the Serato library…").small());
             });
         }
         if let Some(scan) = &self.collection_view.scan {
@@ -911,15 +1453,65 @@ impl DeckhandApp {
                 }
             });
         }
-        if let Some((analysis, _, _)) = &self.collection_view.analysis {
+        if let Some(conversion) = &self.collection_view.conversion {
+            let (done, total) = (conversion.received, conversion.total);
             ui.horizontal(|ui| {
                 ui.spinner();
-                let done = analysis.done.load(std::sync::atomic::Ordering::Relaxed);
-                ui.label(RichText::new(format!("Analyzing {done}/{}…", analysis.total)).small());
-                if ui.small_button("Cancel").clicked() {
+                ui.label(format!("Converting {done} of {total}"));
+                if ui
+                    .button(RichText::new("Stop").color(WARN))
+                    .on_hover_text("Stops after the tracks being converted now")
+                    .clicked()
+                {
+                    conversion.cancel();
+                }
+            });
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                    .desired_width(220.0)
+                    .show_percentage(),
+            );
+            let now: Vec<String> = conversion
+                .working()
+                .into_iter()
+                .filter_map(|id| self.collection.track(id))
+                .map(|t| t.title.clone())
+                .collect();
+            if !now.is_empty() {
+                let text = RichText::new(format!("Now: {}", now.join(" · "))).small().weak();
+                ui.add(egui::Label::new(text).truncate());
+            }
+        }
+        if let Some((analysis, _, _)) = &self.collection_view.analysis {
+            let (done, total) = (analysis.received, analysis.total);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Analyzing {done} of {total}"));
+                if ui
+                    .button(RichText::new("Stop").color(WARN))
+                    .on_hover_text("Stops after the tracks being read now; what's done is kept")
+                    .clicked()
+                {
                     analysis.cancel();
                 }
             });
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                    .desired_width(220.0)
+                    .show_percentage(),
+            );
+            let now: Vec<String> = analysis
+                .working()
+                .into_iter()
+                .filter_map(|id| self.collection.track(id))
+                .map(|t| {
+                    if t.title.is_empty() { t.path.display().to_string() } else { t.title.clone() }
+                })
+                .collect();
+            if !now.is_empty() {
+                let text = RichText::new(format!("Now: {}", now.join(" · "))).small().weak();
+                ui.add(egui::Label::new(text).truncate()).on_hover_text(now.join("\n"));
+            }
         }
         if let Some(err) = &self.collection_view.error {
             ui.colored_label(WARN, err);
@@ -928,14 +1520,20 @@ impl DeckhandApp {
 
     /// The collection's playlists and folders in the sidebar tree.
     pub(super) fn collection_tree_rows(&mut self, ui: &mut Ui) {
-        let rows: Vec<(usize, u32, String, NodeKind, usize)> = self
-            .collection
-            .tree()
+        let tree = if self.config.playlists_by_name {
+            self.collection.tree_by_name()
+        } else {
+            self.collection.tree()
+        };
+        let songs = self.songs();
+        let unique = |tracks: &[u32]| unique_songs(&songs, tracks);
+        let rows: Vec<(usize, u32, String, NodeKind, usize)> = tree
             .into_iter()
-            .map(|(depth, n)| (depth, n.id, n.name.clone(), n.kind.clone(), n.tracks.len()))
+            .map(|(depth, n)| (depth, n.id, n.name.clone(), n.kind.clone(), unique(&n.tracks)))
             .collect();
         // Rows inside a collapsed folder are skipped.
         let mut hidden_below: Option<usize> = None;
+        let mut shown = Vec::new();
         for (depth, id, name, kind, count) in rows {
             if hidden_below.is_some_and(|d| depth > d) {
                 continue;
@@ -944,15 +1542,32 @@ impl DeckhandApp {
             if kind == NodeKind::Folder && self.config.collapsed_folders.contains(&id) {
                 hidden_below = Some(depth);
             }
+            shown.push(id);
             self.tree_row(ui, depth + 1, id, &name, kind, count);
         }
+        self.collection_view.shown_rows = shown;
+        // Delete (Backspace on a Mac's keyboard) deletes what's picked.
+        let delete = ui.input(|i| {
+            i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+        });
+        if delete
+            && self.focus == Focus::Playlists
+            && self.source == super::Source::Collection
+            && self.collection_view.renaming.is_none()
+            && self.collection_view.confirm_delete.is_none()
+            && !ui.ctx().wants_keyboard_input()
+        {
+            let ids = self.acted_on(None);
+            self.ask_to_delete(ids);
+        }
+        playlist_drag_hint(ui.ctx());
     }
 
     /// Writes hot cues, memory cues/loops and an edited (tapped, shifted…)
     /// beat grid of loaded collection tracks into the collection. Call
     /// every frame.
     pub(super) fn save_track_edits(&mut self) {
-        use deckhand_library::{Cue, CueKind, TempoMarker};
+        use rofloxbox_library::{Cue, CueKind, TempoMarker};
         for deck in &mut self.decks {
             // Track gain, measured on load or changed on the deck.
             if let Some(loaded) = deck.track.as_ref().filter(|t| t.from_collection)
@@ -1087,7 +1702,7 @@ impl DeckhandApp {
             let [title, artist, album, genre, label, comment] = fields.clone();
             self.collection.edit_track(
                 id,
-                deckhand_library::TrackEdit {
+                rofloxbox_library::TrackEdit {
                     title: Some(title.trim().to_owned()).filter(|t| !t.is_empty()),
                     artist: Some(artist.trim().to_owned()),
                     album: Some(album.trim().to_owned()),
@@ -1172,13 +1787,12 @@ impl DeckhandApp {
         let sticks: Vec<(PathBuf, String)> =
             self.libraries.iter().map(|l| (l.root.clone(), l.name())).collect();
         let mut export_to: Option<PathBuf> = None;
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             ui.add_space(indent);
             if let Some((renaming, text)) = &mut self.collection_view.renaming
                 && *renaming == id
             {
-                let response = ui.text_edit_singleline(text);
-                response.request_focus();
+                let response = crate::widgets::name_field(ui, text, 150.0);
                 if response.lost_focus() {
                     let name = text.trim().to_owned();
                     if !name.is_empty() {
@@ -1208,25 +1822,26 @@ impl DeckhandApp {
                 NodeKind::Playlist => format!("♫ {name} ({count})"),
                 NodeKind::Folder => name.to_owned(),
             };
-            let selected =
+            let shown =
                 self.source == super::Source::Collection && self.collection_view.node == Some(id);
-            let response = ui.add(egui::Button::selectable(selected, label).truncate());
-            if selected && self.reveal_playlist {
+            let picked = self.collection_view.picked.contains(&id);
+            let response = ui
+                .add(egui::Button::selectable(shown || picked, label).truncate())
+                .interact(egui::Sense::click_and_drag());
+            if shown && self.reveal_playlist {
                 response.scroll_to_me(Some(egui::Align::Center));
             }
-            // Clicking a folder opens or closes it (and selects it, for new
-            // playlists).
-            if response.clicked() && kind == NodeKind::Folder {
-                if !self.config.collapsed_folders.contains(&id) {
-                    self.config.collapsed_folders.push(id);
-                } else {
-                    self.config.collapsed_folders.retain(|f| *f != id);
-                }
-                self.config.save();
-            }
             if response.clicked() {
-                self.select_entry(super::library_tree::TreeEntry::Collection(Some(id)));
-                self.focus = Focus::Playlists;
+                let modifiers = ui.input(|i| i.modifiers);
+                self.pick_node(id, &kind, modifiers);
+            }
+            if response.drag_started() {
+                if !picked {
+                    (self.collection_view.picked, self.collection_view.pick_anchor) =
+                        (vec![id], Some(id));
+                }
+                let ids = self.acted_on(Some(id));
+                egui::DragAndDrop::set_payload(ui.ctx(), PlaylistDrag(ids));
             }
             // Tracks dropped on a playlist are added to it; it is outlined while they are over it.
             if kind == NodeKind::Playlist
@@ -1240,7 +1855,8 @@ impl DeckhandApp {
                 );
             }
             if kind == NodeKind::Playlist
-                && let Some(drag) = response.dnd_release_payload::<crate::browser::TrackDrag>()
+                && let Some(drag) =
+                    crate::widgets::dropped::<crate::browser::TrackDrag>(&response)
             {
                 self.drop_on_playlist(&drag, id);
             }
@@ -1271,14 +1887,11 @@ impl DeckhandApp {
                 }
                 if kind == NodeKind::Folder {
                     if ui.button("New playlist here").clicked() {
-                        let new =
-                            self.collection.create("New playlist", NodeKind::Playlist, Some(id));
-                        self.collection_view.renaming = Some((new, "New playlist".into()));
+                        self.new_node(NodeKind::Playlist, Some(id));
                         ui.close();
                     }
                     if ui.button("New folder here").clicked() {
-                        let new = self.collection.create("New folder", NodeKind::Folder, Some(id));
-                        self.collection_view.renaming = Some((new, "New folder".into()));
+                        self.new_node(NodeKind::Folder, Some(id));
                         ui.close();
                     }
                 }
@@ -1286,39 +1899,107 @@ impl DeckhandApp {
                     self.collection_view.renaming = Some((id, name.to_owned()));
                     ui.close();
                 }
+                let targets = self.acted_on(Some(id));
                 let folders: Vec<(u32, String)> = self
                     .collection
                     .tree()
                     .into_iter()
-                    .filter(|(_, n)| n.kind == NodeKind::Folder && n.id != id)
+                    .filter(|(_, n)| n.kind == NodeKind::Folder && !targets.contains(&n.id))
                     .map(|(_, n)| (n.id, n.name.clone()))
                     .collect();
-                ui.menu_button("Move to", |ui| {
+                let several = targets.len() > 1;
+                let move_to =
+                    if several { format!("Move {} to", targets.len()) } else { "Move to".into() };
+                ui.menu_button(move_to, |ui| {
                     if ui.button("Top level").clicked() {
-                        self.collection.move_node(id, None);
+                        self.collection.move_nodes(&targets, Place::Into(None));
                         ui.close();
                     }
                     for (folder, folder_name) in folders {
                         if ui.button(folder_name).clicked() {
-                            self.collection.move_node(id, Some(folder));
+                            self.collection.move_nodes(&targets, Place::Into(Some(folder)));
                             ui.close();
                         }
                     }
                 });
-                let what =
-                    if kind == NodeKind::Folder { "folder and its playlists" } else { "playlist" };
-                if ui.button(format!("Delete {what}")).clicked() {
-                    self.collection.delete(id);
-                    if self.collection_view.node.is_some_and(|n| self.collection.node(n).is_none())
-                    {
-                        self.collection_view.node = None;
-                    }
+                let what = match (several, &kind) {
+                    (true, _) => format!("{} selected", targets.len()),
+                    (false, NodeKind::Folder) => "folder and its playlists".into(),
+                    (false, NodeKind::Playlist) => "playlist".into(),
+                };
+                if ui.button(format!("Delete {what}…")).clicked() {
+                    self.ask_to_delete(targets.clone());
                     ui.close();
                 }
             });
         });
         if let Some(root) = export_to {
             self.start_export(id, root);
+        }
+        let rect = row.response.rect.with_max_x(ui.max_rect().right());
+        self.playlist_drop_target(ui, rect, id, &kind);
+    }
+
+    /// "All tracks" clicked: nothing picked any more.
+    pub(super) fn clear_picked(&mut self) {
+        self.collection_view.picked.clear();
+    }
+
+    /// Playlists and folders dropped on "All tracks" go to the top level.
+    pub(super) fn top_level_drop_target(&mut self, ui: &Ui, rect: egui::Rect) {
+        let row = ui.interact(rect, egui::Id::new("playlist drop top"), egui::Sense::hover());
+        let Some(drag) = row.dnd_hover_payload::<PlaylistDrag>() else { return };
+        let stroke = Stroke::new(2.0_f32, ui.visuals().selection.bg_fill);
+        ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+        if crate::widgets::dropped::<PlaylistDrag>(&row).is_some() {
+            self.collection.move_nodes(&drag.0, Place::Into(None));
+        }
+    }
+
+    /// Playlists and folders dragged over a row: before it (its upper
+    /// part), after it (a playlist's lower half) or into it (a folder's
+    /// rest); marked while over it, moved there on release.
+    fn playlist_drop_target(&mut self, ui: &Ui, rect: egui::Rect, id: u32, kind: &NodeKind) {
+        let row = ui.interact(rect, egui::Id::new(("playlist drop", id)), egui::Sense::hover());
+        let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
+        let Some(drag) = row.dnd_hover_payload::<PlaylistDrag>() else { return };
+        let part = (pointer.y - rect.top()) / rect.height().max(1.0);
+        let place = match kind {
+            NodeKind::Folder if part >= 0.3 => Place::Into(Some(id)),
+            NodeKind::Playlist if part >= 0.5 => Place::After(id),
+            _ => Place::Before(id),
+        };
+        // By name, the order is the names': only which folder counts.
+        let place = match place {
+            Place::Before(at) | Place::After(at) if self.config.playlists_by_name => {
+                match kind {
+                    NodeKind::Folder => Place::Into(Some(id)),
+                    NodeKind::Playlist => {
+                        Place::Into(self.collection.node(at).and_then(|n| n.parent))
+                    }
+                }
+            }
+            place => place,
+        };
+        let stroke = Stroke::new(2.0_f32, ui.visuals().selection.bg_fill);
+        let painter = ui.painter();
+        match place {
+            Place::Into(_) => {
+                painter.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
+            }
+            Place::Before(_) => {
+                painter.hline(rect.x_range(), rect.top(), stroke);
+            }
+            Place::After(_) => {
+                painter.hline(rect.x_range(), rect.bottom(), stroke);
+            }
+        }
+        if crate::widgets::dropped::<PlaylistDrag>(&row).is_some() {
+            self.collection.move_nodes(&drag.0, place);
+            if let Place::Into(Some(folder)) = place {
+                self.config.collapsed_folders.retain(|f| *f != folder);
+                self.config.save();
+            }
         }
     }
 
@@ -1357,6 +2038,16 @@ impl DeckhandApp {
                     analysis: t.analysis.clone(),
                 }),
                 cues: Some(crate::preview::track_marks(t)),
+                track_number: t.track_number,
+                color: t.color,
+                path: t.path.clone(),
+                size: t.file_size,
+                sample_rate: t.sample_rate,
+                hot_cues: Some(
+                    t.cues.iter().filter(|c| matches!(c.kind, CueKind::Hot(_))).count(),
+                ),
+                last_played: t.last_played.map(date).unwrap_or_default(),
+                ..Row::default()
             })
             .collect();
         sort_rows(&mut rows, self.config.sort);
@@ -1371,7 +2062,26 @@ impl DeckhandApp {
     ) -> Option<(u32, usize)> {
         let mut load = None;
         let shown = self.shown_decks();
+        // The playlist shown: its songs (each once, no spacers) and entries.
+        let counts = self
+            .collection_view
+            .node
+            .and_then(|n| self.collection.node(n))
+            .filter(|n| n.kind == NodeKind::Playlist)
+            .map(|n| (unique_songs(&self.songs(), &n.tracks), n.tracks.len()));
         ui.horizontal(|ui| {
+            if let Some((songs, entries)) = counts {
+                let text = if songs == entries {
+                    format!("{songs} tracks")
+                } else {
+                    format!("{songs} tracks ({entries} entries)")
+                };
+                ui.label(RichText::new(text).strong()).on_hover_text(
+                    "Each song once: copies of it and spacers aren't counted; \
+                     entries are everything in the playlist",
+                );
+                ui.separator();
+            }
             ui.label("🔍");
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
@@ -1418,7 +2128,11 @@ impl DeckhandApp {
         // Right-clicking a selected track acts on the whole selection.
         let selection = self.selected_ids();
         let marked = self.marked.clone();
-        let group = |id: u32| if marked.contains(&id) { selection.clone() } else { vec![id] };
+        let group = |row: &Row| {
+            if marked.contains(&row.position) { selection.clone() } else { vec![row.id] }
+        };
+        // The playlist entries selected (positions), for removing them.
+        let marked_entries = self.selected_entries();
         let stem_model = self.stem_model();
         let stem_recipes = stem_model.as_ref().map(crate::stems::recipes).unwrap_or_default();
         let separating = self.stems.pending();
@@ -1458,6 +2172,7 @@ impl DeckhandApp {
                     &options,
                     &mut |ui, row| {
                         let id = row.id;
+                        // Decks.
                         for &deck in &shown {
                             if ui.button(format!("Load to deck {}", deck + 1)).clicked() {
                                 actions.push(TrackAction::Load(id, deck));
@@ -1465,7 +2180,8 @@ impl DeckhandApp {
                             }
                         }
                         ui.separator();
-                        let ids = group(id);
+                        // Playlists.
+                        let ids = group(row);
                         let many = if ids.len() > 1 {
                             format!(" ({} tracks)", ids.len())
                         } else {
@@ -1482,30 +2198,63 @@ impl DeckhandApp {
                                 }
                             }
                         });
-                        if let Some(playlist) = in_playlist
-                            && ui.button("Remove from playlist").clicked()
-                        {
-                            actions.push(TrackAction::RemoveFrom(row.entry, playlist));
-                            ui.close();
+                        if let Some(playlist) = in_playlist {
+                            let entries = if marked.contains(&row.position) {
+                                marked_entries.clone()
+                            } else {
+                                row.entry.into_iter().collect()
+                            };
+                            let (duplicate, remove) = match entries.len() {
+                                1 => (
+                                    "Duplicate in playlist".to_owned(),
+                                    "Remove from playlist".to_owned(),
+                                ),
+                                n => (
+                                    format!("Duplicate {n} in playlist"),
+                                    format!("Remove {n} from playlist"),
+                                ),
+                            };
+                            if ui
+                                .button(duplicate)
+                                .on_hover_text("Another copy of it, right after it")
+                                .clicked()
+                            {
+                                actions.push(TrackAction::Duplicate(entries.clone(), playlist));
+                                ui.close();
+                            }
+                            if ui
+                                .button("Insert spacer")
+                                .on_hover_text(SPACER_HINT)
+                                .clicked()
+                            {
+                                actions.push(TrackAction::Spacer(row.entry, playlist));
+                                ui.close();
+                            }
+                            if ui.button(remove).clicked() {
+                                actions.push(TrackAction::RemoveFrom(entries, playlist));
+                                ui.close();
+                            }
                         }
-                        if let Some(path) = paths.get(&id)
-                            && ui.button(reveal_label()).clicked()
-                        {
-                            reveal(path);
-                            ui.close();
-                        }
+                        ui.separator();
+                        // The track itself.
                         if ui.button("Edit track info…").clicked() {
                             actions.push(TrackAction::Edit(id));
                             ui.close();
                         }
                         if ui
                             .button(format!("Analyze BPM, grid and key{many}"))
-                            .on_hover_text(
-                                "Detect grid and key again",
-                            )
+                            .on_hover_text("Detect grid and key again")
                             .clicked()
                         {
                             actions.push(TrackAction::Analyze(ids.clone()));
+                            ui.close();
+                        }
+                        if ui
+                            .button(format!("Convert…{many}"))
+                            .on_hover_text("To another format, bitrate or sample rate (ffmpeg)")
+                            .clicked()
+                        {
+                            actions.push(TrackAction::Convert(ids.clone()));
                             ui.close();
                         }
                         ui.menu_button(format!("Make{many}"), |ui| match &stem_model {
@@ -1549,16 +2298,26 @@ impl DeckhandApp {
                         if derived.contains(&id)
                             && ui
                                 .button("Update cues from original")
-                                .on_hover_text(
-                                    "Copy cues, grid and key from the original",
-                                )
+                                .on_hover_text("Copy cues, grid and key from the original")
                                 .clicked()
                         {
                             actions.push(TrackAction::UpdateFromOriginal(id));
                             ui.close();
                         }
-                        if ui.button("Remove from collection").clicked() {
-                            actions.push(TrackAction::Forget(id));
+                        if let Some(path) = paths.get(&id) {
+                            ui.separator();
+                            if ui.button(reveal_label()).clicked() {
+                                reveal(path);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        let forget = match ids.len() {
+                            1 => "Remove from collection…".to_owned(),
+                            n => format!("Remove {n} tracks from collection…"),
+                        };
+                        if ui.button(forget).clicked() {
+                            actions.push(TrackAction::Forget(ids.clone()));
                             ui.close();
                         }
                     },
@@ -1592,6 +2351,26 @@ impl DeckhandApp {
         if let Some((id, stars)) = output.rated {
             self.collection.update_track(id, |t| t.rating = stars);
         }
+        // Delete (Backspace on a Mac's keyboard): out of the playlist shown,
+        // or (all tracks shown) out of the collection, after asking.
+        let delete = ui.input(|i| {
+            i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+        });
+        if delete
+            && self.focus == Focus::Tracks
+            && self.collection_view.confirm_forget.is_none()
+            && !ui.ctx().wants_keyboard_input()
+        {
+            match in_playlist {
+                Some(playlist) => {
+                    actions.push(TrackAction::RemoveFrom(self.selected_entries(), playlist));
+                }
+                None if !self.selected_ids().is_empty() => {
+                    actions.push(TrackAction::Forget(self.selected_ids()));
+                }
+                None => {}
+            }
+        }
         for action in actions {
             match action {
                 TrackAction::Load(id, deck) => load = Some((id, deck)),
@@ -1599,13 +2378,19 @@ impl DeckhandApp {
                     self.request_add(ids[0], playlist)
                 }
                 TrackAction::AddTo(ids, playlist) => self.add_many(&ids, playlist),
-                TrackAction::RemoveFrom(entry, playlist) => {
-                    if let Some(entry) = entry {
-                        self.collection.remove_playlist_entry(playlist, entry);
-                    }
+                TrackAction::RemoveFrom(entries, playlist) => {
+                    self.remove_entries(playlist, entries);
                 }
-                TrackAction::Forget(id) => self.collection.remove_tracks(&[id]),
+                TrackAction::Forget(ids) => self.collection_view.confirm_forget = Some(ids),
+                TrackAction::Spacer(at, playlist) => self.insert_spacer(playlist, at),
+                TrackAction::Duplicate(entries, playlist) => {
+                    self.duplicate_entries(playlist, entries);
+                }
                 TrackAction::Analyze(ids) => self.analyze(ids, true),
+                TrackAction::Convert(ids) => {
+                    let replace = self.config.prefs.convert_replace.unwrap_or(false);
+                    self.collection_view.converting = Some((ids, replace, false));
+                }
                 TrackAction::Make(ids, recipe) => self.make_stems(&ids, &recipe),
                 TrackAction::PrepareStems(ids) => self.prepare_stems(&ids),
                 TrackAction::CancelStems => {
@@ -1636,11 +2421,16 @@ impl DeckhandApp {
 enum TrackAction {
     Load(u32, usize),
     AddTo(Vec<u32>, u32),
-    /// (playlist position, playlist).
-    RemoveFrom(Option<usize>, u32),
-    Forget(u32),
+    /// (playlist positions, playlist).
+    RemoveFrom(Vec<usize>, u32),
+    /// Another copy of these entries, each right after itself.
+    Duplicate(Vec<usize>, u32),
+    /// A spacer before this entry (at the end without one) of the playlist.
+    Spacer(Option<usize>, u32),
+    Forget(Vec<u32>),
     Edit(u32),
     Analyze(Vec<u32>),
+    Convert(Vec<u32>),
     Make(Vec<u32>, crate::stems::Recipe),
     PrepareStems(Vec<u32>),
     CancelStems,
@@ -1665,7 +2455,7 @@ fn date(unix: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-pub(super) fn deckhand_now() -> u64 {
+pub(super) fn rofloxbox_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
@@ -1725,9 +2515,9 @@ mod reveal_tests {
     }
 }
 
-/// Where copies of rekordbox's library are kept before deckhand changes it.
+/// Where copies of rekordbox's library are kept before RofLoxBox changes it.
 fn rekordbox_backups() -> PathBuf {
-    deckhand_library::data_dir().join("rekordbox-backups")
+    rofloxbox_library::data_dir().join("rekordbox-backups")
 }
 
 /// A save into rekordbox's library running in the background.
@@ -1746,4 +2536,135 @@ fn save_into_rekordbox(
         key => key.to_owned(),
     };
     crate::rekordbox_save::save(path, &key, snapshot, &rekordbox_backups(), wait_closed)
+}
+
+/// While playlists are dragged: how many, next to the pointer.
+fn playlist_drag_hint(ctx: &egui::Context) {
+    let Some(drag) = egui::DragAndDrop::payload::<PlaylistDrag>(ctx) else { return };
+    let Some(pointer) = ctx.pointer_hover_pos() else { return };
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    egui::Area::new(egui::Id::new("playlist drag hint"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(pointer + egui::vec2(14.0, 10.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| match drag.0.len() {
+                1 => ui.label("1 playlist"),
+                n => ui.label(format!("{n} playlists and folders")),
+            });
+        });
+}
+
+/// A spacer's title (and its file's name).
+const SPACER: &str = "---";
+const SPACER_RATE: u32 = 44_100;
+const SPACER_HINT: &str = "A second of silence called \"---\", before this track, to mark a \
+                           break in the set";
+
+impl RofLoxBoxApp {
+    /// Each collection track's song (see [`song_key`]); spacers have none.
+    fn songs(&self) -> std::collections::HashMap<u32, String> {
+        let spacer = spacer_path();
+        self.collection
+            .tracks
+            .iter()
+            .filter(|t| !is_spacer(t, &spacer))
+            .map(|t| (t.id, song_key(t)))
+            .collect()
+    }
+}
+
+/// How many songs `tracks` holds: copies of one (in the list, or as other
+/// files of the same song) count once, spacers not at all.
+fn unique_songs(songs: &std::collections::HashMap<u32, String>, tracks: &[u32]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    tracks.iter().filter_map(|t| songs.get(t)).filter(|key| seen.insert(*key)).count()
+}
+
+/// What makes two tracks the same song: artist and title (without case or
+/// extra spaces); a track without a title is its own.
+fn song_key(track: &rofloxbox_library::Track) -> String {
+    let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    if track.title.trim().is_empty() {
+        format!("file:{}", track.path.display())
+    } else {
+        format!("{}\u{1f}{}", words(&track.artist), words(&track.title))
+    }
+}
+
+/// A spacer between tracks of a playlist, not a track: RofLoxBox's own
+/// (`spacer`), one titled only with dashes ("---"), or a short silent file
+/// made by hand (two seconds at most, its file named "silent…").
+fn is_spacer(track: &rofloxbox_library::Track, spacer: &std::path::Path) -> bool {
+    spacer_like(&track.title, &track.path, track.duration, spacer)
+}
+
+fn spacer_like(
+    title: &str,
+    path: &std::path::Path,
+    duration: f64,
+    spacer: &std::path::Path,
+) -> bool {
+    let title = title.trim();
+    let silent_file = duration <= 2.0
+        && path
+            .file_stem()
+            .is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("silent"));
+    path == spacer || (!title.is_empty() && title.chars().all(|c| c == '-')) || silent_file
+}
+
+/// Where the spacer's audio is (see [`spacer_file`]).
+fn spacer_path() -> PathBuf {
+    rofloxbox_library::data_dir().join("Spacer").join(format!("{SPACER}.wav"))
+}
+
+/// The spacer's audio, a second of silence, made the first time it's needed
+/// in the settings folder.
+fn spacer_file() -> anyhow::Result<PathBuf> {
+    let path = spacer_path();
+    if path.is_file() {
+        return Ok(path);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // 16-bit stereo PCM WAV.
+    let data_len = SPACER_RATE * 2 * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&2u16.to_le_bytes()); // channels
+    wav.extend_from_slice(&SPACER_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SPACER_RATE * 4).to_le_bytes()); // bytes per second
+    wav.extend_from_slice(&4u16.to_le_bytes()); // bytes per frame
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + data_len as usize, 0);
+    std::fs::write(&path, wav)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod spacer_tests {
+    use super::*;
+
+    #[test]
+    fn spacers_are_told_from_tracks() {
+        let ours = PathBuf::from("/data/Spacer/---.wav");
+        let track = |title: &'static str, path: &'static str, duration: f64| {
+            (title, std::path::Path::new(path), duration)
+        };
+        let is_spacer = |(title, path, duration): (&str, &std::path::Path, f64), ours: &PathBuf| {
+            spacer_like(title, path, duration, ours)
+        };
+        assert!(is_spacer(track("---", "/data/Spacer/---.wav", 1.0), &ours));
+        assert!(is_spacer(track("-----", "/music/break.wav", 4.0), &ours));
+        assert!(is_spacer(track("", "/music/silent-1.mp3", 1.0), &ours));
+        assert!(!is_spacer(track("Silent Night", "/music/silent night.mp3", 180.0), &ours));
+        assert!(!is_spacer(track("House 1", "/music/House1.wav", 1.0), &ours));
+    }
 }

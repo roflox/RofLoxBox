@@ -18,8 +18,9 @@ pub struct XmlTrack {
     /// `Location` as written (a `file://` URL).
     pub location: String,
     pub file: ScannedFile,
-    /// 0–5 stars.
-    pub rating: u8,
+    /// 0–5 stars; `None` leaves the collection's (libraries without
+    /// ratings).
+    pub rating: Option<u8>,
     /// rekordbox colour label 1–8.
     pub color: Option<u8>,
     pub play_count: u32,
@@ -201,7 +202,7 @@ fn parse_track<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> XmlTrack {
         },
         location,
         // 0, 51, 102, 153, 204, 255 → 0–5 stars.
-        rating: number("Rating").map_or(0, |r| ((r + 25.0) / 51.0).clamp(0.0, 5.0) as u8),
+        rating: Some(number("Rating").map_or(0, |r| ((r + 25.0) / 51.0).clamp(0.0, 5.0) as u8)),
         color: get("Colour").and_then(color_label),
         play_count: number("PlayCount").map_or(0, |n| n as u32),
         added: get("DateAdded").and_then(unix_date),
@@ -340,7 +341,7 @@ mod tests {
         assert_eq!(t.file.title, "First & Last");
         assert_eq!(t.file.path, PathBuf::from("/Users/me/Music/a b.mp3"));
         assert_eq!((t.file.bpm, t.file.key.as_deref()), (Some(124.0), Some("Am")));
-        assert_eq!((t.rating, t.color, t.play_count), (4, Some(2), 3));
+        assert_eq!((t.rating, t.color, t.play_count), (Some(4), Some(2), 3));
         assert_eq!(t.added, Some(1_706_659_200));
         assert_eq!(t.tempo, [TempoMarker { start: 0.025, bpm: 124.0, beat: 1 }]);
         assert_eq!(t.cues.len(), 3);

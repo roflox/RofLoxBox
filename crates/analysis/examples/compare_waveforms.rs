@@ -1,14 +1,14 @@
-//! Compares deckhand's waveforms with the ones rekordbox stored on a
+//! Compares RofLoxBox's waveforms with the ones rekordbox stored on a
 //! USB export (read only).
 //!
-//! `cargo run --release -p deckhand-analysis --example compare_waveforms -- /Volumes/STICK [tracks]`
+//! `cargo run --release -p rofloxbox-analysis --example compare_waveforms -- /Volumes/STICK [tracks]`
 
 use std::path::Path;
 
 use anyhow::Result;
-use deckhand_analysis::waveform::color_detail;
-use deckhand_formats::anlz::{AnlzFile, WaveformKind};
-use deckhand_formats::pdb::Library;
+use rofloxbox_analysis::waveform::color_detail;
+use rofloxbox_formats::anlz::{AnlzFile, WaveformKind};
+use rofloxbox_formats::pdb::Library;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     let below = |p: &str| root.join(p.trim_start_matches('/'));
     // (title, audio path, analysis .DAT path) from the export's database, or
     // from the analysis files themselves (an imported folder has no database).
-    let only = std::env::var("DECKHAND_ONLY").ok().map(|e| e.to_lowercase());
+    let only = std::env::var("ROFLOXBOX_ONLY").ok().map(|e| e.to_lowercase());
     let tracks: Vec<(String, String, std::path::PathBuf)> =
         match Library::open(root.join("PIONEER/rekordbox/export.pdb")) {
             Ok(library) => library
@@ -57,17 +57,17 @@ fn main() -> Result<()> {
     });
     let mut totals = [0usize; 4];
     for (title, file_path, dat) in tracks.take(limit) {
-        // DECKHAND_PREVIEW: compare the preview (PWAV) and dots (PWV2).
-        if std::env::var_os("DECKHAND_PREVIEW").is_some() {
+        // ROFLOXBOX_PREVIEW: compare the preview (PWAV) and dots (PWV2).
+        if std::env::var_os("ROFLOXBOX_PREVIEW").is_some() {
             let Ok(file) = AnlzFile::open(&dat) else { continue };
             let (Some(pwav), Some(pwv2)) =
                 (file.waveform(WaveformKind::Preview), file.waveform(WaveformKind::TinyPreview))
             else {
                 continue;
             };
-            let Ok(audio) = deckhand_audio::decode_file(&below(&file_path)) else { continue };
+            let Ok(audio) = rofloxbox_audio::decode_file(&below(&file_path)) else { continue };
             let (ours, dots) =
-                deckhand_analysis::preview::preview(&audio.to_f32(), audio.sample_rate);
+                rofloxbox_analysis::preview::preview(&audio.to_f32(), audio.sample_rate);
             let count = |a: &[u8], b: &[u8], f: &dyn Fn(u8) -> u8| {
                 a.iter().zip(b).filter(|(x, y)| f(**x) == f(**y)).count()
             };
@@ -113,11 +113,11 @@ fn main() -> Result<()> {
         let Ok(ext) = AnlzFile::open(dat.with_extension("EXT")) else {
             continue;
         };
-        // DECKHAND_MONO: compare the monochrome detail (PWV3) instead.
-        if std::env::var_os("DECKHAND_MONO").is_some() {
+        // ROFLOXBOX_MONO: compare the monochrome detail (PWV3) instead.
+        if std::env::var_os("ROFLOXBOX_MONO").is_some() {
             let Some(theirs) = ext.waveform(WaveformKind::Detail) else { continue };
-            let Ok(audio) = deckhand_audio::decode_file(&below(&file_path)) else { continue };
-            let ours = deckhand_analysis::waveform::mono_detail(&audio.to_f32(), audio.sample_rate);
+            let Ok(audio) = rofloxbox_audio::decode_file(&below(&file_path)) else { continue };
+            let ours = rofloxbox_analysis::waveform::mono_detail(&audio.to_f32(), audio.sample_rate);
             let theirs: Vec<u8> = theirs.data.clone();
             let n = ours.len().min(theirs.len());
             let same = (0..n).filter(|&i| ours[i] == theirs[i]).count();
@@ -150,12 +150,12 @@ fn main() -> Result<()> {
             );
             continue;
         }
-        // DECKHAND_OVERVIEW: compare the colour overview (PWV4) instead.
-        if std::env::var_os("DECKHAND_OVERVIEW").is_some() {
+        // ROFLOXBOX_OVERVIEW: compare the colour overview (PWV4) instead.
+        if std::env::var_os("ROFLOXBOX_OVERVIEW").is_some() {
             let Some(theirs) = ext.waveform(WaveformKind::ColorPreview) else { continue };
-            let Ok(audio) = deckhand_audio::decode_file(&below(&file_path)) else { continue };
+            let Ok(audio) = rofloxbox_audio::decode_file(&below(&file_path)) else { continue };
             let ours =
-                deckhand_analysis::waveform::color_overview(&audio.to_f32(), audio.sample_rate);
+                rofloxbox_analysis::waveform::color_overview(&audio.to_f32(), audio.sample_rate);
             let theirs: Vec<[i8; 6]> =
                 theirs.columns().map(|c| std::array::from_fn(|i| c[i] as i8)).collect();
             let n = ours.len().min(theirs.len());
@@ -185,16 +185,16 @@ fn main() -> Result<()> {
         }
         let Some(theirs) = ext.waveform(WaveformKind::ColorDetail) else { continue };
         let theirs: Vec<u16> = theirs.columns().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        let audio = match deckhand_audio::decode_file(&below(&file_path)) {
+        let audio = match rofloxbox_audio::decode_file(&below(&file_path)) {
             Ok(audio) => audio,
             Err(err) => {
                 println!("{title}: {err:#}");
                 continue;
             }
         };
-        // DECKHAND_OFFSET frames of silence first (negative: skip frames).
+        // ROFLOXBOX_OFFSET frames of silence first (negative: skip frames).
         let offset: isize =
-            std::env::var("DECKHAND_OFFSET").ok().and_then(|o| o.parse().ok()).unwrap_or(0);
+            std::env::var("ROFLOXBOX_OFFSET").ok().and_then(|o| o.parse().ok()).unwrap_or(0);
         let samples: Vec<f32> = if offset >= 0 {
             std::iter::repeat_n(0.0, 2 * offset as usize)
                 .chain(audio.to_f32().iter().copied())
@@ -202,18 +202,18 @@ fn main() -> Result<()> {
         } else {
             audio.to_f32().iter().copied().skip(2 * (-offset) as usize).collect()
         };
-        // DECKHAND_TAIL frames of silence at the end (experiment).
+        // ROFLOXBOX_TAIL frames of silence at the end (experiment).
         let tail: usize =
-            std::env::var("DECKHAND_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            std::env::var("ROFLOXBOX_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let samples: Vec<f32> =
             samples.into_iter().chain(std::iter::repeat_n(0.0, 2 * tail)).collect();
-        // DECKHAND_CUT frames dropped at the end (experiment).
+        // ROFLOXBOX_CUT frames dropped at the end (experiment).
         let cut: usize =
-            std::env::var("DECKHAND_CUT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            std::env::var("ROFLOXBOX_CUT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let samples: Vec<f32> = samples[..samples.len().saturating_sub(2 * cut)].to_vec();
-        // DECKHAND_DECIMATE=k keeps every k-th frame (experiment).
+        // ROFLOXBOX_DECIMATE=k keeps every k-th frame (experiment).
         let k: usize =
-            std::env::var("DECKHAND_DECIMATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            std::env::var("ROFLOXBOX_DECIMATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let samples: Vec<f32> = samples.chunks(2).step_by(k).flatten().copied().collect();
         let ours = color_detail(&samples, audio.sample_rate / k as u32);
         // Decoders differ in how much silence they put first: find the shift
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
         let ours: Vec<u16> = ours.iter().skip((-shift).max(0) as usize).copied().collect();
         println!("  best shift {shift} columns");
         let n = ours.len().min(theirs.len());
-        if let Ok(dump) = std::env::var("DECKHAND_DUMP") {
+        if let Ok(dump) = std::env::var("ROFLOXBOX_DUMP") {
             let text: String = (0..n).map(|i| format!("{} {}\n", ours[i], theirs[i])).collect();
             std::fs::write(format!("{dump}-{title}.txt"), text)?;
         }
@@ -291,7 +291,7 @@ fn main() -> Result<()> {
         }
     }
     let [n, same, h, c] = totals;
-    if std::env::var_os("DECKHAND_PREVIEW").is_some() {
+    if std::env::var_os("ROFLOXBOX_PREVIEW").is_some() {
         let pct = |a: usize, b: usize| 100.0 * a as f64 / b.max(1) as f64;
         println!("all: PWAV {:.1}%, PWV2 {:.1}%", pct(same, n), pct(c, h));
         return Ok(());

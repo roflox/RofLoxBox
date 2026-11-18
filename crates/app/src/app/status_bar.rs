@@ -5,7 +5,7 @@
 use chrono::{DateTime, Local};
 use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Sense, ViewportBuilder, ViewportId};
 
-use super::{DeckhandApp, WARN};
+use super::{RofLoxBoxApp, WARN};
 
 /// Messages kept for the log.
 const HISTORY: usize = 1000;
@@ -26,7 +26,7 @@ pub struct StatusBar {
     pub log_open: bool,
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// Current messages: (text, is an error).
     fn current_messages(&self) -> Vec<(String, bool)> {
         let errors = [
@@ -41,6 +41,15 @@ impl DeckhandApp {
             .map(|e| (e.clone(), true))
             .chain(self.status.iter().map(|s| (s.clone(), false)))
             .collect()
+    }
+
+    /// Puts a line in the log only, not on the status line (one of many,
+    /// like each track of an analysis).
+    pub(super) fn log(&mut self, text: String, error: bool) {
+        let bar = &mut self.status_bar;
+        bar.history.push(Message { text, error, at: Local::now() });
+        let excess = bar.history.len().saturating_sub(HISTORY);
+        bar.history.drain(..excess);
     }
 
     /// Records new messages; call once per frame.

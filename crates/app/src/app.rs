@@ -1,6 +1,7 @@
 //! The main window.
 
 mod collection_view;
+mod convert_view;
 mod deck_view;
 mod explorer_view;
 mod history;
@@ -12,17 +13,18 @@ mod recording;
 mod selection;
 mod session;
 mod status_bar;
+mod transfer;
 mod stems_view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use deckhand_audio::{
+use rofloxbox_audio::{
     AudioOptions, BeatFxKind, ColorFxKind, Command, CrossfaderSide, DECKS, Engine, FxTarget,
 };
-use deckhand_control::rekordbox;
-use deckhand_control::{
+use rofloxbox_control::rekordbox;
+use rofloxbox_control::{
     Action, ActionKind, ControlEvent, DeckAction, DeckFeedback, Feedback, GlobalAction,
     GlobalFeedback, PadMode, Value, input_ports,
 };
@@ -34,17 +36,21 @@ use crate::browser::{Row, TableOptions, sort_rows, track_table};
 use crate::config::{AudioQuality, Config};
 use crate::controller::Controller;
 use crate::tour::{Tag as _, Target};
-use crate::deck::{AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, display_key, key_sync_shift};
+use crate::deck::{
+    AT_CUE, BEAT_JUMPS, Deck, DeckPrefs, HOT_CUES, LoopEdge, display_key, key_sync_shift,
+};
 use crate::effects::Effects;
 use crate::library::find_exports;
-use crate::prefs_view::{PrefsTab, appearance_prefs, deck_prefs, mixer_prefs};
+use crate::prefs_view::{
+    PrefsTab, analysis_prefs, deck_prefs, edit_prefs, mixer_prefs, view_prefs,
+};
 use collection_view::CollectionView;
-use deckhand_library::Collection;
+use rofloxbox_library::Collection;
 
 /// Which library the browser shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
-    /// deckhand's own collection.
+    /// RofLoxBox's own collection.
     Collection,
     /// An opened rekordbox export, by its root.
     Usb(PathBuf),
@@ -81,9 +87,9 @@ const MIXER_MASTER_PARTS: [crate::parts::MixerPart; 4] = [
 /// How often synced decks are checked for phase drift (the same as when
 /// an edited session is synced again).
 const DRIFT_CHECK: Duration =
-    Duration::from_millis((deckhand_audio::SYNC_CHECK_SECS * 1000.0) as u64);
+    Duration::from_millis((rofloxbox_audio::SYNC_CHECK_SECS * 1000.0) as u64);
 /// Phase error (in beats) that sync corrects.
-const DRIFT_LIMIT: f64 = deckhand_audio::SYNC_DRIFT_BEATS;
+const DRIFT_LIMIT: f64 = rofloxbox_audio::SYNC_DRIFT_BEATS;
 /// Auto master: below this gain (about −30 dB) the master has left the mix…
 const OUT_OF_MIX: f32 = 0.03;
 /// …and a deck must be above this one (about −20 dB) to take over, so a
@@ -103,7 +109,7 @@ enum Focus {
     Tracks,
 }
 
-pub struct DeckhandApp {
+pub struct RofLoxBoxApp {
     config: Config,
     engine: Option<Engine>,
     engine_error: Option<String>,
@@ -130,11 +136,15 @@ pub struct DeckhandApp {
     source: Source,
     collection: Collection,
     collection_view: CollectionView,
+    /// Files dragged in from the file manager.
+    os_drag: crate::os_drop::OsDrag,
+    /// A drag played by itself (`ROFLOXBOX_DRAG`, a test aid).
+    scripted_drag: Option<crate::os_drop::ScriptedDrag>,
     explorer: explorer_view::ExplorerView,
     search: String,
     selected: Option<u32>,
     /// More tracks selected along with `selected` (see `selection`).
-    marked: std::collections::HashSet<u32>,
+    marked: std::collections::HashSet<usize>,
     focus: Focus,
     controller: Controller,
     show_controller: bool,
@@ -162,7 +172,7 @@ pub struct DeckhandApp {
     /// F12: window and screen details for troubleshooting.
     show_diagnostics: bool,
     /// The master being recorded.
-    recording: Option<deckhand_audio::Recording>,
+    recording: Option<rofloxbox_audio::Recording>,
     /// A recording just stopped, being named: its WAV and the name typed.
     naming: Option<(PathBuf, String)>,
     /// A session being replayed into a WAV.
@@ -172,6 +182,9 @@ pub struct DeckhandApp {
     edit_view: mix_editor::EditView,
     /// The deck each side of the controller drives (left 1/3, right 2/4).
     active_decks: [usize; 2],
+    /// A deck the controller just switched to: scrolled into view if its
+    /// column doesn't show all of it.
+    reveal_deck: Option<usize>,
     keyboard: keyboard::KeyboardMixer,
     /// Separates tracks into stems in the background.
     stems: crate::stems::Separator,
@@ -215,21 +228,21 @@ pub struct DeckhandApp {
     screenshot: Option<Screenshot>,
     /// Test aid: the window asks to close at this time.
     close_at: Option<Instant>,
-    /// Test aid (`DECKHAND_AUTOPLAY`): start every loaded deck once its
+    /// Test aid (`ROFLOXBOX_AUTOPLAY`): start every loaded deck once its
     /// track is in.
     autoplay: bool,
 }
 
-/// Developer aid: `DECKHAND_SCREENSHOT=out.png` loads tracks, saves an image
+/// Developer aid: `ROFLOXBOX_SCREENSHOT=out.png` loads tracks, saves an image
 /// of the window once they are ready, and quits.
 struct Screenshot {
     path: PathBuf,
     requested: bool,
-    /// Earliest time to take it (`DECKHAND_SCREENSHOT_DELAY`, seconds).
+    /// Earliest time to take it (`ROFLOXBOX_SCREENSHOT_DELAY`, seconds).
     not_before: Instant,
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut config = Config::load();
         // Left over from a run that didn't quit normally.
@@ -238,32 +251,32 @@ impl DeckhandApp {
         }
         crate::widgets::apply_theme(&cc.egui_ctx, config.prefs.theme, config.prefs.text_scale);
         let keyboard = keyboard::KeyboardMixer::new(&config.prefs.key_bindings);
-        if let Some(root) = std::env::var_os("DECKHAND_LIBRARY") {
+        if let Some(root) = std::env::var_os("ROFLOXBOX_LIBRARY") {
             config.library_root = Some(root.into());
         }
-        if std::env::var_os("DECKHAND_FOUR_DECKS").is_some() {
+        if std::env::var_os("ROFLOXBOX_FOUR_DECKS").is_some() {
             config.four_decks = true;
         }
-        if std::env::var_os("DECKHAND_VERTICAL").is_some() {
+        if std::env::var_os("ROFLOXBOX_VERTICAL").is_some() {
             config.vertical_waveforms = true;
         }
         // Test aid: a ready-made screen arrangement by number.
-        if let Some(layout) = std::env::var("DECKHAND_SCREEN")
+        if let Some(layout) = std::env::var("ROFLOXBOX_SCREEN")
             .ok()
             .and_then(|n| n.parse::<usize>().ok())
             .and_then(|n| crate::screen_layout::ScreenLayout::built_in().into_iter().nth(n))
         {
             config.screen_layout = layout.1;
         }
-        if std::env::var_os("DECKHAND_HIDE_MIXER").is_some() {
+        if std::env::var_os("ROFLOXBOX_HIDE_MIXER").is_some() {
             config.show_mixer = false;
         }
-        let pad_mode = std::env::var("DECKHAND_PAD_MODE").ok().and_then(|name| {
+        let pad_mode = std::env::var("ROFLOXBOX_PAD_MODE").ok().and_then(|name| {
             PadMode::ALL
                 .into_iter()
                 .find(|m| m.label().eq_ignore_ascii_case(&name.replace('_', " ")))
         });
-        if std::env::var_os("DECKHAND_THREE_BAND").is_some() {
+        if std::env::var_os("ROFLOXBOX_THREE_BAND").is_some() {
             config.waveform_style = WaveformStyle::ThreeBand;
         }
         let mut app = Self {
@@ -286,25 +299,27 @@ impl DeckhandApp {
             source: Source::Collection,
             collection: Collection::default(),
             collection_view: CollectionView::default(),
+            os_drag: crate::os_drop::OsDrag::default(),
+            scripted_drag: crate::os_drop::ScriptedDrag::from_env(),
             explorer: Default::default(),
             search: String::new(),
             selected: None,
             marked: Default::default(),
             focus: Focus::Tracks,
             controller: Controller::default(),
-            show_controller: std::env::var_os("DECKHAND_SHOW_CONTROLLER").is_some(),
-            show_prefs: std::env::var_os("DECKHAND_SHOW_AUDIO").is_some()
-                || std::env::var_os("DECKHAND_SHOW_PREFS").is_some()
-                || std::env::var_os("DECKHAND_SHOW_LIBRARY_PREFS").is_some(),
-            prefs_tab: if std::env::var_os("DECKHAND_SHOW_MIXER_PREFS").is_some() {
+            show_controller: std::env::var_os("ROFLOXBOX_SHOW_CONTROLLER").is_some(),
+            show_prefs: std::env::var_os("ROFLOXBOX_SHOW_AUDIO").is_some()
+                || std::env::var_os("ROFLOXBOX_SHOW_PREFS").is_some()
+                || std::env::var_os("ROFLOXBOX_SHOW_LIBRARY_PREFS").is_some(),
+            prefs_tab: if std::env::var_os("ROFLOXBOX_SHOW_MIXER_PREFS").is_some() {
                 PrefsTab::Mixer
-            } else if std::env::var_os("DECKHAND_SHOW_KEYBOARD_PREFS").is_some() {
+            } else if std::env::var_os("ROFLOXBOX_SHOW_KEYBOARD_PREFS").is_some() {
                 PrefsTab::Keyboard
-            } else if std::env::var_os("DECKHAND_SHOW_STEMS_PREFS").is_some() {
+            } else if std::env::var_os("ROFLOXBOX_SHOW_STEMS_PREFS").is_some() {
                 PrefsTab::Stems
-            } else if std::env::var_os("DECKHAND_SHOW_LIBRARY_PREFS").is_some() {
+            } else if std::env::var_os("ROFLOXBOX_SHOW_LIBRARY_PREFS").is_some() {
                 PrefsTab::Library
-            } else if std::env::var_os("DECKHAND_SHOW_AUDIO").is_some() {
+            } else if std::env::var_os("ROFLOXBOX_SHOW_AUDIO").is_some() {
                 PrefsTab::Audio
             } else {
                 PrefsTab::default()
@@ -312,11 +327,12 @@ impl DeckhandApp {
             effects: Effects::default(),
             status_bar: status_bar::StatusBar::default(),
             deck_drag: None,
-            editing_layout: std::env::var_os("DECKHAND_EDIT_LAYOUT").is_some(),
+            editing_layout: std::env::var_os("ROFLOXBOX_EDIT_LAYOUT").is_some(),
             reveal_selected: false,
             reveal_playlist: false,
             selected_position: None,
             active_decks: [0, 1],
+            reveal_deck: None,
             keyboard,
             stems: Default::default(),
             live_stems: Default::default(),
@@ -329,7 +345,7 @@ impl DeckhandApp {
             naming: None,
             replay: None,
             // Test aid: start in EDIT mode with this session.
-            mode: if std::env::var_os("DECKHAND_EDIT_SESSION").is_some() {
+            mode: if std::env::var_os("ROFLOXBOX_EDIT_SESSION").is_some() {
                 mix_editor::Mode::Edit
             } else {
                 mix_editor::Mode::Performance
@@ -341,7 +357,7 @@ impl DeckhandApp {
             open_stem_presets: false,
             hotplug: Default::default(),
             was_bending: [false; DECKS],
-            show_diagnostics: std::env::var_os("DECKHAND_DIAGNOSTICS").is_some(),
+            show_diagnostics: std::env::var_os("ROFLOXBOX_DIAGNOSTICS").is_some(),
             session_checked: Instant::now(),
             started: Instant::now(),
             audio_caps: None,
@@ -353,12 +369,12 @@ impl DeckhandApp {
             pad_held: [[None; HOT_CUES]; DECKS],
             seconds_visible: keyboard::DEFAULT_SECONDS_VISIBLE,
             status: None,
-            close_at: std::env::var("DECKHAND_CLOSE_AFTER")
+            close_at: std::env::var("ROFLOXBOX_CLOSE_AFTER")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .map(|s| Instant::now() + Duration::from_secs(s)),
-            screenshot: std::env::var_os("DECKHAND_SCREENSHOT").map(|p| {
-                let delay = std::env::var("DECKHAND_SCREENSHOT_DELAY")
+            screenshot: std::env::var_os("ROFLOXBOX_SCREENSHOT").map(|p| {
+                let delay = std::env::var("ROFLOXBOX_SCREENSHOT_DELAY")
                     .ok()
                     .and_then(|d| d.parse().ok())
                     .unwrap_or(0);
@@ -368,7 +384,7 @@ impl DeckhandApp {
                     not_before: Instant::now() + Duration::from_secs(delay),
                 }
             }),
-            autoplay: std::env::var_os("DECKHAND_AUTOPLAY").is_some(),
+            autoplay: std::env::var_os("ROFLOXBOX_AUTOPLAY").is_some(),
             preset_name: String::new(),
             preset_note: None,
             config,
@@ -376,17 +392,17 @@ impl DeckhandApp {
         app.load_tours();
         app.restore_session();
         // Test aid: record into this folder from the start.
-        let record_to = std::env::var_os("DECKHAND_RECORD").map(PathBuf::from);
+        let record_to = std::env::var_os("ROFLOXBOX_RECORD").map(PathBuf::from);
         if let Some(dir) = &record_to {
             app.config.recordings_dir = Some(dir.clone());
         }
         app.effects.load_samples(&crate::config::samples_dir());
         // Test aid: analyze tracks without a grid or key from the start.
-        if std::env::var_os("DECKHAND_ANALYZE").is_some() {
+        if std::env::var_os("ROFLOXBOX_ANALYZE").is_some() {
             app.analyze_missing();
         }
         // Test aid: the beat-grid edit controls open.
-        if std::env::var_os("DECKHAND_GRID_EDIT").is_some() {
+        if std::env::var_os("ROFLOXBOX_GRID_EDIT").is_some() {
             app.decks.iter_mut().for_each(|d| d.grid_edit = true);
         }
         if let Some(mode) = pad_mode {
@@ -395,7 +411,7 @@ impl DeckhandApp {
             }
         }
         app.start_engine(app.config.audio_device.clone());
-        match Collection::open(&deckhand_library::collection_path()) {
+        match Collection::open(&rofloxbox_library::collection_path()) {
             Ok(collection) => app.collection = collection,
             Err(err) => app.collection_view.error = Some(format!("{err:#}")),
         }
@@ -415,13 +431,13 @@ impl DeckhandApp {
             }
             _ => app.set_source(Source::Collection),
         }
-        let only = std::env::var("DECKHAND_PORT_FILTER").ok();
+        let only = std::env::var("ROFLOXBOX_PORT_FILTER").ok();
         let ports: Vec<String> = input_ports()
             .into_iter()
             .filter(|p| only.as_ref().is_none_or(|f| p.contains(f.as_str())))
             .collect();
         // Tests can force a port (for example a virtual test device).
-        let forced = std::env::var("DECKHAND_MIDI_PORT").ok();
+        let forced = std::env::var("ROFLOXBOX_MIDI_PORT").ok();
         let port = forced
             .clone()
             .or_else(|| app.config.midi_port.clone().filter(|p| ports.contains(p)))
@@ -447,7 +463,7 @@ impl DeckhandApp {
             app.toggle_recording();
         }
         // Test aid: this folder shown in the explorer.
-        if let Some(folder) = std::env::var_os("DECKHAND_EXPLORER") {
+        if let Some(folder) = std::env::var_os("ROFLOXBOX_EXPLORER") {
             app.explorer.open = true;
             app.open_explorer_folder(folder.into());
         }
@@ -455,7 +471,7 @@ impl DeckhandApp {
             app.rekordbox_at_start();
         }
         // Test aid: start with the log open.
-        app.status_bar.log_open = std::env::var_os("DECKHAND_SHOW_LOG").is_some();
+        app.status_bar.log_open = std::env::var_os("ROFLOXBOX_SHOW_LOG").is_some();
         if app.screenshot.is_some() || app.autoplay {
             let ids = app.visible_track_ids();
             let decks = if app.config.four_decks { DECKS } else { 2 };
@@ -494,8 +510,8 @@ impl DeckhandApp {
             quality: self.config.audio_quality.engine(),
         };
         // Test aid: no audio output, as on a computer without one.
-        let mut result = if std::env::var_os("DECKHAND_NO_AUDIO").is_some() {
-            Err(anyhow::anyhow!("no audio output (DECKHAND_NO_AUDIO)"))
+        let mut result = if std::env::var_os("ROFLOXBOX_NO_AUDIO").is_some() {
+            Err(anyhow::anyhow!("no audio output (ROFLOXBOX_NO_AUDIO)"))
         } else {
             Engine::start(&options)
         };
@@ -710,6 +726,7 @@ impl DeckhandApp {
                 key_notation: p.key_notation,
                 call_resizes_loop: p.call_resizes_loop,
                 gate_while_playing: p.gate_while_playing,
+                memory_points_limit: p.memory_points_limit,
                 start_at_first_cue: p.start_at_first_cue,
                 auto_cue_db: p.auto_cue[index].then_some(p.auto_cue_level_db),
                 isolator: p.isolator,
@@ -881,7 +898,7 @@ impl DeckhandApp {
     fn mix_gain(&self, deck: usize) -> f32 {
         let d = &self.decks[deck];
         let p = &self.config.prefs;
-        deckhand_audio::channel_gain(
+        rofloxbox_audio::channel_gain(
             d.volume,
             d.side,
             self.crossfader,
@@ -1159,8 +1176,9 @@ impl DeckhandApp {
             .iter()
             .any(|b| matches!(b.action, Action::Deck(_, A::Select)));
         let switches = if deck_buttons { action == A::Select } else { !mixer };
-        if switches && (action != A::Select || pressed) {
+        if switches && (action != A::Select || pressed) && self.active_decks[d % 2] != d {
             self.active_decks[d % 2] = d;
+            self.reveal_deck = Some(d);
         }
         if action == A::Select {
             return;
@@ -1544,7 +1562,7 @@ impl DeckhandApp {
             set(DeckFeedback::Sync, on(deck.sync));
             set(DeckFeedback::SyncMaster, on(self.master == Some(d)));
             set(DeckFeedback::Quantize, on(deck.quantize));
-            for part in 0..deckhand_audio::PARTS {
+            for part in 0..rofloxbox_audio::PARTS {
                 set(
                     DeckFeedback::StemOn(part as u8),
                     on(deck.has_part(part) && deck.stem_on[part]),
@@ -1600,6 +1618,29 @@ impl DeckhandApp {
             set(DeckFeedback::HeadphoneCue, on(deck.headphone_cue));
             set(DeckFeedback::Loaded, on(loaded));
             set(DeckFeedback::Level, (engine.deck_peak(d).clamp(0.0, 1.0) * 127.0) as u8);
+            set(DeckFeedback::HotCueGateMode, on(deck.hot_cue_gate));
+            // Adjusting a loop end: its button flashes fast, the other's dark.
+            let fast_flash = (self.started.elapsed().as_millis() / 100).is_multiple_of(2);
+            let ends = [(LoopEdge::In, DeckFeedback::LoopIn), (LoopEdge::Out, DeckFeedback::LoopOut)];
+            for (edge, what) in ends {
+                let lit = match deck.loop_adjust {
+                    Some((adjusting, _)) => adjusting == edge && fast_flash,
+                    None => deck.loop_active,
+                };
+                set(what, on(lit));
+            }
+            let sides = [CrossfaderSide::A, CrossfaderSide::Thru, CrossfaderSide::B];
+            for (n, side) in sides.into_iter().enumerate() {
+                set(DeckFeedback::CrossfaderSide(n as u8), on(deck.side == side));
+            }
+            set(
+                DeckFeedback::Selected,
+                on(self.config.four_decks || self.active_decks[d % 2] == d),
+            );
+            set(DeckFeedback::KeyShifted, on(deck.key_shift != 0));
+            set(DeckFeedback::PadFxPage, on(deck.pad_fx_page == 1));
+            let narrowest = self.config.prefs.tempo_ranges.iter().min().copied();
+            set(DeckFeedback::TempoRangeWide, on(narrowest.is_some_and(|n| deck.tempo_range > n)));
         }
         let fx = &self.effects;
         values.insert(Feedback::Global(GlobalFeedback::FxOn), on(fx.on));
@@ -1607,25 +1648,58 @@ impl DeckhandApp {
         values.insert(Feedback::Global(GlobalFeedback::ColorFxOn), on(fx.color_on));
         values.insert(Feedback::Global(GlobalFeedback::MasterCue), on(fx.master_cue));
         values.insert(Feedback::Global(GlobalFeedback::FxBeat), fx.beat_indicator());
+        for (n, kind) in BeatFxKind::ALL.into_iter().enumerate() {
+            values.insert(Feedback::Global(GlobalFeedback::FxType(n as u8)), on(fx.kind == kind));
+        }
+        for n in 0..6u8 {
+            let target = match n {
+                0..=3 => FxTarget::Channel(usize::from(n)),
+                4 => FxTarget::Master,
+                _ => FxTarget::Sampler,
+            };
+            values.insert(Feedback::Global(GlobalFeedback::FxAssign(n)), on(fx.target == target));
+        }
+        values.insert(Feedback::Global(GlobalFeedback::FxTapped), on(fx.tapped_bpm.is_some()));
         values
     }
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// Saves what is left and leaves.
     pub(super) fn quit(&mut self) -> ! {
-        self.save_to_rekordbox_at_quit();
+        // A save into rekordbox still running is left to finish next time
+        // (see `begin_quit`, which waits for it).
+        if self.rekordbox_saving() {
+            self.collection.set_rekordbox_unsaved(true);
+        }
+        let _ = self.collection.save();
         self.save_session(true);
         self.finish_recording();
         self.config.save();
         if !self.config.prefs.keep_stems {
             crate::stems::clear_cache();
         }
-        std::process::exit(0);
+        exit_now();
     }
 }
 
-impl eframe::App for DeckhandApp {
+/// Ends the process now, everything being saved. On Windows without the
+/// shutdown that runs every library's exit code: with the audio device's
+/// and the MIDI ports' threads still running, that can hang ("Not
+/// responding").
+fn exit_now() -> ! {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // SAFETY: ends this process; nothing runs after it.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+    std::process::exit(0)
+}
+
+impl eframe::App for RofLoxBoxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let performing = self.mode == mix_editor::Mode::Performance;
         if performing {
@@ -1646,10 +1720,13 @@ impl eframe::App for DeckhandApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.ask_to_close_rekordbox();
             } else {
-                self.quit();
+                // Not closed yet: a save into rekordbox may run first.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.begin_quit(ctx);
             }
         }
         self.quit_waiting_for_rekordbox(ctx);
+        self.quit_after_saving(ctx);
         if let Some(at) = self.close_at {
             if Instant::now() >= at {
                 self.close_at = None;
@@ -1662,6 +1739,9 @@ impl eframe::App for DeckhandApp {
             engine.collect_garbage();
             for deck in &mut self.decks {
                 deck.poll(engine);
+                if let Some(notice) = deck.notice.take() {
+                    self.status = Some(notice);
+                }
             }
         }
         self.sync_jog_resolution();
@@ -1696,7 +1776,14 @@ impl eframe::App for DeckhandApp {
             self.effects.update(engine, bpm);
         }
         let values = self.feedback_values();
-        self.controller.send_feedback(|f| values.get(&f).copied().unwrap_or(0));
+        // Decks adjusting a loop end take the jog through the app.
+        let adjusting = self.decks.iter().enumerate().filter(|(_, d)| d.loop_adjust.is_some());
+        self.controller.bypass_jog(adjusting.fold(0, |bits, (i, _)| bits | 1 << i));
+        let modes: Vec<PadMode> = self.decks.iter().map(|d| d.pad_mode).collect();
+        self.controller.send_feedback(
+            |f| values.get(&f).copied().unwrap_or(0),
+            |deck| modes.get(deck).copied().unwrap_or_default(),
+        );
 
         let busy = self
             .engine
@@ -1783,6 +1870,10 @@ impl eframe::App for DeckhandApp {
             self.controller_window(ctx);
         }
         self.duplicate_dialog(ctx);
+        self.delete_playlists_dialog(ctx);
+        self.add_folder_dialog(ctx);
+        self.forget_tracks_dialog(ctx);
+        self.convert_dialog(ctx);
         self.cleanup_dialog(ctx);
         self.edit_dialog(ctx);
         if self.show_prefs {
@@ -1790,7 +1881,7 @@ impl eframe::App for DeckhandApp {
         }
         // Test aid: move the window to "x,y" two seconds after start (to
         // try another monitor while running).
-        if let Ok(target) = std::env::var("DECKHAND_MOVE_TO")
+        if let Ok(target) = std::env::var("ROFLOXBOX_MOVE_TO")
             && self.started.elapsed() > Duration::from_secs(2)
             && !self.moved_window
             && let Some((x, y)) = target.split_once(',')
@@ -1801,23 +1892,38 @@ impl eframe::App for DeckhandApp {
         }
         self.start_tours_when_due();
         self.run_tour(ctx);
-        if std::env::var_os("DECKHAND_TARGETS").is_some() {
+        if std::env::var_os("ROFLOXBOX_TARGETS").is_some() {
             crate::tour::show_targets(ctx);
+        }
+        // Files from the file manager dropped where nothing took them go
+        // into the collection.
+        if let Some(files) = self.os_drag.unclaimed(ctx) {
+            self.source = Source::Collection;
+            self.add_music(files);
         }
         self.handle_screenshot(ctx);
     }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.os_drag.feed(ctx, raw_input);
+        if let Some(drag) = self.scripted_drag.as_mut()
+            && !drag.feed(ctx, raw_input)
+        {
+            self.scripted_drag = None;
+        }
+    }
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// Loads the tours and starts the first auto one not done yet.
-    /// Test aid: `DECKHAND_TOUR=id` or `id:step` (from 1) shows that one.
+    /// Test aid: `ROFLOXBOX_TOUR=id` or `id:step` (from 1) shows that one.
     fn load_tours(&mut self) {
         let (tours, errors) = crate::tour::load(&crate::config::data_dir().join("tours"));
         self.tours = tours;
         if !errors.is_empty() {
             self.status = Some(errors.join("; "));
         }
-        if let Ok(forced) = std::env::var("DECKHAND_TOUR") {
+        if let Ok(forced) = std::env::var("ROFLOXBOX_TOUR") {
             let (id, step) = forced.split_once(':').unwrap_or((&forced, "1"));
             self.start_tour(id);
             if let Some(run) = &mut self.tour {
@@ -1836,8 +1942,8 @@ impl DeckhandApp {
     /// Starts a tour whose moment has come (`start-when`), once: not while
     /// another runs, nor one finished or skipped before.
     fn start_tours_when_due(&mut self) {
-        // Not in screenshots (test aid DECKHAND_TRIGGER_TOURS lets them).
-        let shooting = self.screenshot.is_some() && std::env::var_os("DECKHAND_TRIGGER_TOURS").is_none();
+        // Not in screenshots (test aid ROFLOXBOX_TRIGGER_TOURS lets them).
+        let shooting = self.screenshot.is_some() && std::env::var_os("ROFLOXBOX_TRIGGER_TOURS").is_none();
         if self.tour.is_some() || shooting {
             return;
         }
@@ -1919,7 +2025,9 @@ impl DeckhandApp {
                 Some(PrefsTab::Stems)
             }
             Target::PrefsLibrary | Target::RekordboxWrite => Some(PrefsTab::Library),
-            Target::PrefsAppearance => Some(PrefsTab::Appearance),
+            Target::PrefsAppearance => Some(PrefsTab::View),
+            Target::PrefsAnalysis => Some(PrefsTab::Analysis),
+            Target::PrefsEdit => Some(PrefsTab::Edit),
             Target::PrefsAudio => Some(PrefsTab::Audio),
             _ => None,
         };
@@ -2225,6 +2333,7 @@ impl DeckhandApp {
                     cue_point: deck.cue_point,
                     active_loop: deck.loop_region.map(|r| (r, deck.loop_active)),
                     grid_strength: self.config.grid_strength,
+                    slip: engine.slip_position_secs(index),
                 };
                 draw_detail(
                     &painter,
@@ -2545,7 +2654,7 @@ impl DeckhandApp {
         (strips + master).max(crossfader).max(order) + 16.0
     }
 
-    /// A column of decks; `mirror` for the right one (see [`DeckhandApp::deck_ui`]).
+    /// A column of decks; `mirror` for the right one (see [`RofLoxBoxApp::deck_ui`]).
     fn deck_column(&mut self, ui: &mut Ui, decks: &[usize], width: f32, height: f32, mirror: bool) {
         let compact = decks.len() > 1;
         ui.allocate_ui_with_layout(vec2(width, height), Layout::top_down(Align::Min), |ui| {
@@ -2562,11 +2671,27 @@ impl DeckhandApp {
                     } else {
                         Stroke::new(2.0_f32, Color32::TRANSPARENT)
                     };
-                    egui::Frame::new()
+                    let shown = egui::Frame::new()
                         .stroke(stroke)
                         .corner_radius(4)
                         .inner_margin(3.0)
                         .show(ui, |ui| self.deck_ui(ui, deck, compact, mirror));
+                    // Switched to on the controller: all of it in view.
+                    if self.reveal_deck == Some(deck) {
+                        self.reveal_deck = None;
+                        let rect = shown.response.rect;
+                        if !ui.clip_rect().contains_rect(rect) {
+                            // Its top first when it's taller than the column.
+                            let align = if rect.top() < ui.clip_rect().top()
+                                || rect.height() > ui.clip_rect().height()
+                            {
+                                Align::Min
+                            } else {
+                                Align::Max
+                            };
+                            ui.scroll_to_rect(rect, Some(align));
+                        }
+                    }
                     if compact {
                         ui.separator();
                     }
@@ -3153,7 +3278,9 @@ impl DeckhandApp {
             compatible_with: self.compatible_key(),
         };
         let selection = self.selected_ids();
-        let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };
+        let group = |row: &Row| {
+            if self.marked.contains(&row.position) { selection.clone() } else { vec![row.id] }
+        };
         let mut context_load = None;
         let output = egui::Frame::new()
             .stroke(focus_stroke(self.focus == Focus::Tracks))
@@ -3173,7 +3300,7 @@ impl DeckhandApp {
                             }
                         }
                         ui.separator();
-                        let ids = group(row.id);
+                        let ids = group(row);
                         let many = if ids.len() > 1 {
                             format!(" ({} tracks)", ids.len())
                         } else {
@@ -3257,6 +3384,21 @@ impl DeckhandApp {
                         .then(|| library.resolve(&t.track.analyze_path)),
                 }),
                 cues: None,
+                track_number: Some(t.track.track_number).filter(|n| *n > 0),
+                disc_number: Some(u32::from(t.track.disc_number)).filter(|n| *n > 0),
+                composer: t.composer.clone().unwrap_or_default(),
+                remixer: t.remixer.clone().unwrap_or_default(),
+                original_artist: t.original_artist.clone().unwrap_or_default(),
+                mix_name: t.track.mix_name.clone(),
+                color: t.track.color_id.filter(|c| (1..=8).contains(c)),
+                path: library.resolve(&t.track.file_path),
+                size: u64::from(t.track.file_size),
+                sample_rate: Some(t.track.sample_rate).filter(|r| *r > 0),
+                bit_depth: Some(u32::from(t.track.sample_depth)).filter(|d| *d > 0),
+                release_date: t.track.release_date.clone(),
+                message: t.track.message.clone(),
+                hot_cues: None,
+                last_played: String::new(),
             })
             .collect();
         sort_rows(&mut rows, self.config.sort);
@@ -3328,8 +3470,16 @@ impl DeckhandApp {
                         prefs_changed |= self.library_prefs(ui);
                         return;
                     }
-                    PrefsTab::Appearance => {
-                        prefs_changed |= appearance_prefs(ui, &mut self.config.prefs);
+                    PrefsTab::Analysis => {
+                        prefs_changed |= analysis_prefs(ui, &mut self.config.prefs);
+                        return;
+                    }
+                    PrefsTab::Edit => {
+                        prefs_changed |= edit_prefs(ui, &mut self.config.prefs);
+                        return;
+                    }
+                    PrefsTab::View => {
+                        prefs_changed |= view_prefs(ui, &mut self.config.prefs);
                         // The View menu too, so both are the same.
                         ui.add_space(8.0);
                         ui.separator();
@@ -3855,7 +4005,7 @@ fn pad_face(
         },
         // The deck view draws its own STEMS pads; this is for anything else.
         PadMode::Stems => face(
-            deckhand_control::STEM_PARTS.get(pad).map_or("", |p| p).into(),
+            rofloxbox_control::STEM_PARTS.get(pad).map_or("", |p| p).into(),
             idle,
             "Turn a stem part off or on",
         ),

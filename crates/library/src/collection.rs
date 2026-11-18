@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::rekordbox_xml::{XmlLibrary, XmlNode};
+use crate::rekordbox_xml::{XmlLibrary, XmlNode, XmlTrack};
 use crate::scan::ScannedFile;
 
 /// The name of the folder a rekordbox import puts its playlists in.
@@ -69,7 +69,7 @@ pub struct Track {
     /// Beat grid: where the tempo starts or changes.
     #[serde(default)]
     pub tempo: Vec<TempoMarker>,
-    /// Text fields changed in deckhand; rescans and imports leave them alone.
+    /// Text fields changed in RofLoxBox; rescans and imports leave them alone.
     /// The audio file is never changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edited: Vec<EditedField>,
@@ -84,6 +84,63 @@ pub struct Track {
     /// when the track is first loaded, then changed by hand on the deck.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gain_db: Option<f32>,
+    /// The file rekordbox's library still has for this track, after a
+    /// converted file replaced it: the next save into rekordbox moves its
+    /// entry (cues, grid, playlists and all) over to `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekordbox_path: Option<PathBuf>,
+}
+
+impl XmlTrack {
+    /// A collection track in the form libraries hand tracks over in.
+    pub fn from_track(track: &Track) -> Self {
+        let path = track.path.to_string_lossy().into_owned();
+        XmlTrack {
+            id: path.clone(),
+            location: path,
+            file: ScannedFile {
+                path: track.path.clone(),
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                album: track.album.clone(),
+                genre: track.genre.clone(),
+                label: track.label.clone(),
+                comment: track.comment.clone(),
+                year: track.year,
+                track_number: track.track_number,
+                duration: track.duration,
+                bpm: track.bpm,
+                key: track.key.clone(),
+                sample_rate: track.sample_rate,
+                bitrate: track.bitrate,
+                has_artwork: track.has_artwork,
+                file_size: track.file_size,
+                modified: track.modified,
+            },
+            rating: Some(track.rating),
+            color: track.color,
+            play_count: track.play_count,
+            added: Some(track.added),
+            tempo: track.tempo.clone(),
+            cues: track.cues.clone(),
+            analysis: track.analysis.clone(),
+        }
+    }
+
+    /// The track as a collection track with `id` (not added anywhere).
+    pub fn to_track(&self, id: u32) -> Track {
+        let mut track = self.file.clone().into_track(id);
+        track.rating = self.rating.unwrap_or(0);
+        track.color = self.color;
+        track.play_count = self.play_count;
+        if let Some(added) = self.added {
+            track.added = added;
+        }
+        track.tempo = self.tempo.clone();
+        track.cues = self.cues.clone();
+        track.analysis = self.analysis.clone();
+        track
+    }
 }
 
 /// Where a track made from stems came from.
@@ -97,7 +154,7 @@ pub struct Derived {
     pub model: String,
 }
 
-/// A track field that can be edited in deckhand.
+/// A track field that can be edited in RofLoxBox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EditedField {
     Title,
@@ -199,6 +256,16 @@ pub struct Node {
     /// rekordbox's library (or was saved into it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rekordbox: Option<String>,
+}
+
+/// Where playlists and folders are moved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// Into a folder (at its end), or the top level.
+    Into(Option<u32>),
+    /// Next to a playlist or folder, in the same folder.
+    Before(u32),
+    After(u32),
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -498,6 +565,15 @@ impl Collection {
 
     /// After saving into rekordbox: the ids it gave new playlists, and its
     /// change count now.
+    /// rekordbox's library now has these tracks at their files (after a
+    /// converted file replaced the original).
+    pub fn moved_in_rekordbox(&mut self, tracks: &[u32]) {
+        for track in self.tracks.iter_mut().filter(|t| tracks.contains(&t.id)) {
+            track.rekordbox_path = None;
+            self.dirty = true;
+        }
+    }
+
     pub fn saved_to_rekordbox(&mut self, ids: &[(u32, String)], count: i64) {
         for (node, id) in ids {
             self.set_rekordbox_id(*node, Some(id.clone()));
@@ -506,22 +582,16 @@ impl Collection {
         self.dirty = true;
     }
 
-    /// Imports tracks and playlists like [`Collection::import_rekordbox`],
-    /// with the playlists in the top-level folder `folder`. With `replace`,
-    /// that folder is rebuilt; without, its playlists of the same names are
-    /// replaced and the others kept.
-    pub fn import_into(
-        &mut self,
-        library: XmlLibrary,
-        folder: &str,
-        replace: bool,
-    ) -> ImportSummary {
+    /// Adds tracks handed over by another library (or an import): a file
+    /// already in the collection is updated (its cues and grid replaced
+    /// when the newcomer has some), others are added. Returns their ids,
+    /// in order.
+    pub fn add_tracks(&mut self, tracks: Vec<XmlTrack>) -> (Vec<u32>, ImportSummary) {
         let mut summary = ImportSummary::default();
         let mut by_path: HashMap<PathBuf, u32> =
             self.tracks.iter().map(|t| (t.path.clone(), t.id)).collect();
-        let mut by_key: HashMap<String, u32> = HashMap::new();
-        let mut by_location: HashMap<String, u32> = HashMap::new();
-        for xml in library.tracks {
+        let mut ids = Vec::with_capacity(tracks.len());
+        for xml in tracks {
             if !xml.file.path.is_file() {
                 summary.missing += 1;
             }
@@ -547,7 +617,9 @@ impl Collection {
                 if modified != 0 {
                     (track.file_size, track.modified) = (size, modified);
                 }
-                track.rating = xml.rating;
+                if let Some(rating) = xml.rating {
+                    track.rating = rating;
+                }
                 track.color = xml.color.or(track.color);
                 track.play_count = track.play_count.max(xml.play_count);
                 if let Some(added) = xml.added {
@@ -563,8 +635,30 @@ impl Collection {
                     track.analysis = xml.analysis;
                 }
             }
-            by_key.insert(xml.id, id);
-            by_location.insert(xml.location, id);
+            ids.push(id);
+        }
+        self.dirty |= !ids.is_empty();
+        (ids, summary)
+    }
+
+    /// Imports tracks and playlists like [`Collection::import_rekordbox`],
+    /// with the playlists in the top-level folder `folder`. With `replace`,
+    /// that folder is rebuilt; without, its playlists of the same names are
+    /// replaced and the others kept.
+    pub fn import_into(
+        &mut self,
+        library: XmlLibrary,
+        folder: &str,
+        replace: bool,
+    ) -> ImportSummary {
+        let keys: Vec<(String, String)> =
+            library.tracks.iter().map(|t| (t.id.clone(), t.location.clone())).collect();
+        let (ids, mut summary) = self.add_tracks(library.tracks);
+        let mut by_key: HashMap<String, u32> = HashMap::new();
+        let mut by_location: HashMap<String, u32> = HashMap::new();
+        for ((key, location), id) in keys.into_iter().zip(ids) {
+            by_key.insert(key, id);
+            by_location.insert(location, id);
         }
 
         let existing: Vec<u32> = self
@@ -762,6 +856,70 @@ impl Collection {
         }
     }
 
+    /// Moves playlists and folders (in the tree's order, wherever they
+    /// were) to `place`. One inside another that moves goes along inside
+    /// it; a folder never goes into itself or what's in it.
+    pub fn move_nodes(&mut self, ids: &[u32], place: Place) {
+        let parent = match place {
+            Place::Into(parent) => parent,
+            Place::Before(id) | Place::After(id) => match self.node(id) {
+                Some(node) => node.parent,
+                None => return,
+            },
+        };
+        if parent.is_some_and(|p| self.node(p).is_none_or(|n| n.kind != NodeKind::Folder)) {
+            return;
+        }
+        let inside = |c: &Self, mut at: Option<u32>, id: u32| {
+            while let Some(a) = at {
+                if a == id {
+                    return true;
+                }
+                at = c.node(a).and_then(|n| n.parent);
+            }
+            false
+        };
+        // In the tree's order; not the place itself, nor what goes along
+        // inside another one, nor a folder the place is in.
+        let moving: Vec<u32> = self
+            .tree()
+            .into_iter()
+            .map(|(_, n)| n.id)
+            .filter(|&id| ids.contains(&id))
+            .filter(|&id| !matches!(place, Place::Before(p) | Place::After(p) if p == id))
+            .filter(|&id| {
+                let parent = self.node(id).and_then(|n| n.parent);
+                !ids.iter().any(|&o| o != id && inside(self, parent, o))
+            })
+            .filter(|&id| !inside(self, parent, id))
+            .collect();
+        if moving.is_empty() {
+            return;
+        }
+        let mut taken = Vec::new();
+        self.nodes.retain(|n| {
+            if moving.contains(&n.id) {
+                taken.push(n.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken.sort_by_key(|n| moving.iter().position(|&m| m == n.id));
+        for node in &mut taken {
+            node.parent = parent;
+        }
+        // Siblings keep the order of `nodes`: in there, next to the place.
+        let at = match place {
+            Place::Before(id) => self.nodes.iter().position(|n| n.id == id),
+            Place::After(id) => self.nodes.iter().position(|n| n.id == id).map(|i| i + 1),
+            Place::Into(_) => None,
+        };
+        let at = at.unwrap_or(self.nodes.len());
+        self.nodes.splice(at..at, taken);
+        self.dirty = true;
+    }
+
     /// The history playlist `name` (e.g. "HISTORY 2026-11-04") in the
     /// top-level HISTORY folder, made when missing, like rekordbox's.
     pub fn history_playlist(&mut self, name: &str) -> u32 {
@@ -781,6 +939,29 @@ impl Collection {
             Some(playlist) => playlist.id,
             None => self.create(name, NodeKind::Playlist, Some(folder)),
         }
+    }
+
+    /// The tree with each folder's playlists and folders by name (folders
+    /// first), rather than in their own order: (depth, node).
+    pub fn tree_by_name(&self) -> Vec<(usize, &Node)> {
+        fn walk<'a>(
+            c: &'a Collection,
+            parent: Option<u32>,
+            depth: usize,
+            out: &mut Vec<(usize, &'a Node)>,
+        ) {
+            let mut children: Vec<&Node> = c.nodes.iter().filter(|n| n.parent == parent).collect();
+            children.sort_by_cached_key(|n| (n.kind != NodeKind::Folder, n.name.to_lowercase()));
+            for node in children {
+                out.push((depth, node));
+                if node.kind == NodeKind::Folder {
+                    walk(c, Some(node.id), depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, None, 0, &mut out);
+        out
     }
 
     /// The tree in display order: (depth, node).
@@ -807,6 +988,49 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(c: &Collection) -> Vec<String> {
+        c.tree()
+            .into_iter()
+            .map(|(depth, n)| format!("{}{}", "-".repeat(depth), n.name))
+            .collect()
+    }
+
+    #[test]
+    fn playlists_move_together_into_folders_and_between_others() {
+        let mut c = Collection::default();
+        let a = c.create("a", NodeKind::Playlist, None);
+        let b = c.create("b", NodeKind::Playlist, None);
+        let f = c.create("f", NodeKind::Folder, None);
+        let g = c.create("g", NodeKind::Folder, Some(f));
+        let x = c.create("x", NodeKind::Playlist, Some(g));
+        let d = c.create("d", NodeKind::Playlist, None);
+        assert_eq!(names(&c), ["a", "b", "f", "-g", "--x", "d"]);
+
+        // Several, picked in any order, into a folder: in the tree's order.
+        c.move_nodes(&[d, a], Place::Into(Some(f)));
+        assert_eq!(names(&c), ["b", "f", "-g", "--x", "-a", "-d"]);
+        // Before and after another one, out of the folder again.
+        c.move_nodes(&[a], Place::Before(b));
+        assert_eq!(names(&c), ["a", "b", "f", "-g", "--x", "-d"]);
+        c.move_nodes(&[d, x], Place::After(a));
+        assert_eq!(names(&c), ["a", "x", "d", "b", "f", "-g"]);
+        // A folder doesn't go into itself or what's in it.
+        c.move_nodes(&[f], Place::Into(Some(g)));
+        c.move_nodes(&[f], Place::Into(Some(f)));
+        assert_eq!(names(&c), ["a", "x", "d", "b", "f", "-g"]);
+        // A folder and something inside it: that goes along, inside.
+        let y = c.create("y", NodeKind::Playlist, Some(g));
+        c.move_nodes(&[g, y], Place::Before(a));
+        assert_eq!(names(&c), ["g", "-y", "a", "x", "d", "b", "f"]);
+        // Into the top level: at the end.
+        c.move_nodes(&[y], Place::Into(None));
+        assert_eq!(names(&c), ["g", "a", "x", "d", "b", "f", "y"]);
+        // By name: folders first, without case; their own order stays.
+        let by_name: Vec<&str> = c.tree_by_name().iter().map(|(_, n)| n.name.as_str()).collect();
+        assert_eq!(by_name, ["f", "g", "a", "b", "d", "x", "y"]);
+        assert_eq!(names(&c), ["g", "a", "x", "d", "b", "f", "y"]);
+    }
 
     fn scanned(path: &str, title: &str) -> ScannedFile {
         ScannedFile { path: PathBuf::from(path), title: title.to_owned(), ..ScannedFile::default() }
@@ -835,6 +1059,28 @@ mod tests {
         let track = c.track(a).unwrap();
         assert_eq!((track.title.as_str(), track.rating), ("A (remaster)", 4));
         assert_ne!(c.tracks[1].id, a);
+    }
+
+    /// A track handed over and taken back keeps what the collection has;
+    /// adding it where it already is updates it rather than adding twice.
+    #[test]
+    fn tracks_are_handed_over_whole() {
+        let mut c = Collection::default();
+        c.merge(vec![scanned("/song.mp3", "Song")]);
+        c.update_track(c.tracks[0].id, |t| {
+            t.rating = 4;
+            t.cues = vec![Cue { kind: CueKind::Hot(0), start: 1.0, end: None, color: None, name: "A".into(), active: false }];
+            t.tempo = vec![TempoMarker { start: 0.1, bpm: 128.0, beat: 1 }];
+        });
+        let original = c.tracks[0].clone();
+        let shared = XmlTrack::from_track(&original);
+        let back = shared.to_track(original.id);
+        assert_eq!((back.rating, &back.cues, &back.tempo), (4, &original.cues, &original.tempo));
+        assert_eq!((back.title.as_str(), back.path.as_path()), ("Song", original.path.as_path()));
+        let (ids, summary) = c.add_tracks(vec![shared, XmlTrack::from_track(&scanned("/new.mp3", "New").into_track(0))]);
+        assert_eq!((summary.updated, summary.added), (1, 1));
+        assert_eq!(ids[0], original.id);
+        assert_eq!(c.tracks.len(), 2);
     }
 
     #[test]
@@ -942,7 +1188,7 @@ mod tests {
 
     #[test]
     fn saves_and_reopens() {
-        let dir = std::env::temp_dir().join(format!("deckhand-collection-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-collection-{}", std::process::id()));
         let path = dir.join("collection.json");
         let mut c = Collection::open(&path).unwrap();
         c.merge(vec![scanned("/a.mp3", "A")]);

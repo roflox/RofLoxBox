@@ -1,8 +1,8 @@
 //! Prints the raw playlist tree and the first entries of each playlist.
 //!
-//! `cargo run -p deckhand-formats --example playlist_rows -- export.pdb`
+//! `cargo run -p rofloxbox-formats --example playlist_rows -- export.pdb`
 
-use deckhand_formats::pdb::{Database, PlaylistEntry, PlaylistTreeNode};
+use rofloxbox_formats::pdb::{Database, PlaylistEntry, PlaylistTreeNode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).expect("export.pdb");

@@ -55,12 +55,12 @@ export OPENSSL_INCLUDE_DIR=$OPENSSL/app/include
 export OPENSSL_LIB_DIR=$OPENSSL/app/lib/VC/x64/MT
 export OPENSSL_LIBS=libssl_static:libcrypto_static
 
-cargo build --release -p deckhand-app --target "$TARGET" "$@"
+cargo build --release -p rofloxbox-app --target "$TARGET" "$@"
 
 DIST=$(pwd)/target/dist
 mkdir -p "$DIST"
 EXE=$DIST/RofLoxBox.exe
-cp "target/$TARGET/release/deckhand-app.exe" "$EXE"
+cp "target/$TARGET/release/rofloxbox-app.exe" "$EXE"
 
 sign() {
     if [ -z "${WINDOWS_SIGN_PFX:-}" ]; then

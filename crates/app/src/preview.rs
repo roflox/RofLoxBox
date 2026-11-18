@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use deckhand_formats::anlz::{AnlzFile, CueListKind};
+use rofloxbox_formats::anlz::{AnlzFile, CueListKind};
 use eframe::egui::{self, Color32, Painter, Rect, Stroke, pos2};
 
 use crate::waveform::{Column, WaveformData};
@@ -170,10 +170,10 @@ fn from_analysis(source: &Source) -> Option<Preview> {
 
 /// Worked out from the audio, coloured by its bands like the decks'.
 fn from_audio(path: &Path) -> Option<Preview> {
-    let audio = deckhand_audio::decode_file(path).ok()?;
+    let audio = rofloxbox_audio::decode_file(path).ok()?;
     let mut data = WaveformData::from_peaks(
-        &deckhand_audio::peak_waveform(&audio),
-        deckhand_audio::band_waveform(&audio),
+        &rofloxbox_audio::peak_waveform(&audio),
+        rofloxbox_audio::band_waveform(&audio),
     );
     data.shape_from_bands();
     let seconds = audio.frames() as f64 / f64::from(audio.sample_rate);
@@ -201,8 +201,8 @@ fn shrink(detail: &[Column]) -> Vec<Column> {
 fn cache_path(audio: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     audio.hash(&mut hasher);
-    deckhand_library::file_stamp(audio).hash(&mut hasher);
-    deckhand_library::data_dir().join("previews").join(format!("{:016x}.bin", hasher.finish()))
+    rofloxbox_library::file_stamp(audio).hash(&mut hasher);
+    rofloxbox_library::data_dir().join("previews").join(format!("{:016x}.bin", hasher.finish()))
 }
 
 /// The seconds (f64), then height, red, green, blue per column.
@@ -285,18 +285,18 @@ pub fn draw(painter: &Painter, rect: Rect, preview: &Preview, cues: &[Mark], sec
 }
 
 /// A collection track's cues as marks.
-pub fn track_marks(track: &deckhand_library::Track) -> Vec<Mark> {
+pub fn track_marks(track: &rofloxbox_library::Track) -> Vec<Mark> {
     track
         .cues
         .iter()
         .map(|cue| match cue.kind {
-            deckhand_library::CueKind::Hot(_) => {
+            rofloxbox_library::CueKind::Hot(_) => {
                 let color = cue
                     .color
                     .map_or(crate::deck::HOT_CUE_DEFAULT, |[r, g, b]| Color32::from_rgb(r, g, b));
                 (cue.start, color, true)
             }
-            deckhand_library::CueKind::Memory => {
+            rofloxbox_library::CueKind::Memory => {
                 let color = cue.color.map_or(MEMORY_CUE, |[r, g, b]| Color32::from_rgb(r, g, b));
                 (cue.start, color, false)
             }

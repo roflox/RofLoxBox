@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use deckhand_analysis::beats::{DEFAULT_RANGE, Grid, beat_grid};
-use deckhand_analysis::key::{Key, detect_key};
+use rofloxbox_analysis::beats::{DEFAULT_RANGE, Grid, beat_grid};
+use rofloxbox_analysis::key::{Key, detect_key};
 
 /// What the analysis found for one track.
 pub struct Analysed {
@@ -26,6 +26,10 @@ pub struct Analysis {
     pub done: Arc<AtomicUsize>,
     cancelled: Arc<AtomicBool>,
     pub results: Receiver<Analysed>,
+    /// The tracks being analysed right now (one per thread).
+    working: Arc<Mutex<Vec<u32>>>,
+    /// Results taken in so far (counted by whoever takes them).
+    pub received: usize,
 }
 
 impl Analysis {
@@ -37,13 +41,25 @@ impl Analysis {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, results) = channel();
         let queue = Arc::new(Mutex::new(tracks.into_iter()));
-        let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 4));
+        let working = Arc::new(Mutex::new(Vec::new()));
+        // All cores but one (for the audio and the screen), at most six:
+        // each holds a decoded track (some 150 MB for five minutes).
+        let threads = std::thread::available_parallelism()
+            .map_or(2, |n| n.get().saturating_sub(1).clamp(1, 6))
+            .min(total.max(1));
         for _ in 0..threads {
-            let (queue, done, cancelled, tx) =
-                (queue.clone(), done.clone(), cancelled.clone(), tx.clone());
-            std::thread::spawn(move || work(&queue, &done, &cancelled, &tx, overwrite));
+            let (queue, done, cancelled, tx, working) =
+                (queue.clone(), done.clone(), cancelled.clone(), tx.clone(), working.clone());
+            std::thread::spawn(move || {
+                work(&queue, &done, &cancelled, &tx, &working, overwrite);
+            });
         }
-        Self { total, done, cancelled, results }
+        Self { total, done, cancelled, results, working, received: 0 }
+    }
+
+    /// The tracks being analysed right now.
+    pub fn working(&self) -> Vec<u32> {
+        self.working.lock().map(|w| w.clone()).unwrap_or_default()
     }
 
     pub fn cancel(&self) {
@@ -60,11 +76,21 @@ fn work(
     done: &AtomicUsize,
     cancelled: &AtomicBool,
     tx: &Sender<Analysed>,
+    working: &Mutex<Vec<u32>>,
     overwrite: bool,
 ) {
+    let set = |id: u32, on: bool| {
+        if let Ok(mut w) = working.lock() {
+            w.retain(|&t| t != id);
+            if on {
+                w.push(id);
+            }
+        }
+    };
     while !cancelled.load(Ordering::Relaxed) {
         let Some((id, path)) = queue.lock().ok().and_then(|mut q| q.next()) else { break };
-        let result = match deckhand_audio::decode_file(&path) {
+        set(id, true);
+        let result = match rofloxbox_audio::decode_file(&path) {
             Ok(audio) => {
                 let samples = audio.to_f32();
                 Analysed {
@@ -77,6 +103,7 @@ fn work(
             }
             Err(_) => Analysed { id, overwrite, grid: None, key: None, failed: true },
         };
+        set(id, false);
         if cancelled.load(Ordering::Relaxed) || tx.send(result).is_err() {
             break;
         }
@@ -132,7 +159,7 @@ mod tests {
 
     #[test]
     fn analyses_a_file_and_reports_missing_ones() {
-        let dir = std::env::temp_dir().join(format!("deckhand-analyze-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-analyze-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("track.wav");
         write_track(&file);

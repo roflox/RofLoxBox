@@ -1,4 +1,4 @@
-//! The Deck and Mixer pages of the Preferences window.
+//! The Deck, Mixer, Analysis, EDIT and View pages of the Preferences window.
 
 use eframe::egui::{self, RichText, Ui};
 
@@ -13,21 +13,27 @@ pub enum PrefsTab {
     #[default]
     Deck,
     Mixer,
+    Analysis,
+    Edit,
     Keyboard,
     Stems,
     Library,
-    Appearance,
+    /// Theme, sizes, waveforms, key display and the View menu.
+    #[serde(alias = "appearance")]
+    View,
     Audio,
 }
 
 impl PrefsTab {
-    pub const ALL: [PrefsTab; 7] = [
+    pub const ALL: [PrefsTab; 9] = [
         PrefsTab::Deck,
         PrefsTab::Mixer,
+        PrefsTab::Analysis,
+        PrefsTab::Edit,
         PrefsTab::Keyboard,
         PrefsTab::Stems,
         PrefsTab::Library,
-        PrefsTab::Appearance,
+        PrefsTab::View,
         PrefsTab::Audio,
     ];
 
@@ -35,10 +41,12 @@ impl PrefsTab {
         match self {
             PrefsTab::Deck => "Deck",
             PrefsTab::Mixer => "Mixer",
+            PrefsTab::Analysis => "Analysis",
+            PrefsTab::Edit => "EDIT",
             PrefsTab::Keyboard => "Keyboard",
             PrefsTab::Stems => "Stems",
             PrefsTab::Library => "Library",
-            PrefsTab::Appearance => "Appearance",
+            PrefsTab::View => "View",
             PrefsTab::Audio => "Audio",
         }
     }
@@ -66,10 +74,10 @@ fn lock(ui: &mut Ui, locked: &mut bool) -> bool {
     *locked != before
 }
 
-/// Dark, light or the system's, and the text size; returns whether
+/// How things look: theme, sizes, waveforms, keys; returns whether
 /// anything changed.
-pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
-    let before = (p.theme, p.text_scale, p.button_scale, p.tempo_display_scale);
+pub fn view_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
+    let before = p.clone();
     section(ui, "Theme", "Waveforms stay dark.", |ui| {
         ui.radio_value(&mut p.theme, Theme::Dark, "Dark");
         ui.radio_value(&mut p.theme, Theme::Light, "Light");
@@ -100,7 +108,81 @@ pub fn appearance_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             }
         });
     });
-    (p.theme, p.text_scale, p.button_scale, p.tempo_display_scale) != before
+    section(ui, "Waveforms", "", |ui| {
+        use crate::waveform::WaveformDetail;
+        ui.label("Detail");
+        ui.indent("waveform detail", |ui| {
+            ui.radio_value(&mut p.waveform_detail, WaveformDetail::Standard, "Standard (rekordbox's)");
+            ui.radio_value(&mut p.waveform_detail, WaveformDetail::High, "High (4× finer)")
+                .on_hover_text("Sharper when zoomed in. For tracks loaded from now on.");
+        });
+        ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
+            .on_hover_text("Cut bands shrink in the waveforms");
+        ui.checkbox(&mut p.scroll_zoom, "Scroll over a waveform to zoom").on_hover_text(
+            "Wheel, scroll or pinch",
+        );
+    });
+    section(ui, "Key display format", "On decks and in lists.", |ui| {
+        use crate::deck::KeyNotation;
+        ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
+        ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.highlight_compatible_keys, "Highlight compatible keys in the track lists");
+            help(ui, "Keys that mix with the master deck's turn green.");
+        });
+    });
+    *p != before
+}
+
+/// How tracks are analysed; returns whether anything changed.
+pub fn analysis_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
+    let before = p.clone();
+    section(ui, "Method", "For tracks rekordbox hasn't analysed.", |ui| {
+        use crate::deck::AnalysisMethod;
+        ui.radio_value(&mut p.analysis, AnalysisMethod::Rekordbox, "rekordbox-compatible");
+        ui.radio_value(&mut p.analysis, AnalysisMethod::RofLoxBox, "RofLoxBox (quicker)");
+    });
+    section(ui, "On load", "", |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut p.analyze_on_load, "Analyze BPM, beat grid and key on load");
+            help(ui, "Only for tracks missing them; edited ones are kept.");
+        });
+    });
+    ui.add_space(8.0);
+    if ui.button("Reset to defaults").clicked() {
+        let defaults = Preferences::default();
+        p.analysis = defaults.analysis;
+        p.analyze_on_load = defaults.analyze_on_load;
+    }
+    *p != before
+}
+
+/// The EDIT mode's settings; returns whether anything changed.
+pub fn edit_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
+    let before = p.clone();
+    section(ui, "Playback", "", |ui| {
+        ui.checkbox(&mut p.edit_follow_playhead, "Follow playhead")
+            .on_hover_text("The view scrolls along while playing");
+    });
+    section(ui, "Automation", "", |ui| {
+        ui.checkbox(&mut p.edit_eq_boost, "EQ can boost above 0 dB")
+            .on_hover_text("Otherwise EQ points stop at 0 dB unless you hold Option/Alt");
+    });
+    if p.edit_delete.is_some() {
+        section(ui, "Deleting audio", "What a deck's deleted audio takes along.", |ui| {
+            if ui.button("Ask again before deleting audio").clicked() {
+                p.edit_delete = None;
+            }
+        });
+    }
+    ui.add_space(8.0);
+    if ui.button("Reset to defaults").clicked() {
+        let defaults = Preferences::default();
+        p.edit_follow_playhead = defaults.edit_follow_playhead;
+        p.edit_eq_boost = defaults.edit_eq_boost;
+        p.edit_delete = defaults.edit_delete;
+    }
+    *p != before
 }
 
 /// Deck settings; returns whether anything changed.
@@ -109,6 +191,11 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
     {
         section(ui, "Eject/Load Lock", "Locked: no loading onto a playing deck.", |ui| {
             lock(ui, &mut p.load_lock);
+        });
+        section(ui, "Load", "", |ui| {
+            ui.checkbox(&mut p.start_at_first_cue, "Start at the first cue");
+            ui.checkbox(&mut p.instant_doubles, "Instant Doubles")
+                .on_hover_text("Loading a playing track picks up where it is");
         });
         section(ui, "Auto Gain", "Evens out loudness. Drag a deck's dB value to change it.", |ui| {
             ui.checkbox(&mut p.auto_gain, "Play tracks at their track gain");
@@ -123,36 +210,6 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
         section(ui, "Needle Lock", "Locked: the small waveform of a playing deck doesn't jump.", |ui| {
             lock(ui, &mut p.needle_lock);
         });
-        section(ui, "EDIT", "The view scrolls along while playing. EQ points stop at 0 dB unless you hold Option/Alt, or allow boosting here.", |ui| {
-            ui.checkbox(&mut p.edit_follow_playhead, "Follow playhead");
-            ui.checkbox(&mut p.edit_eq_boost, "EQ can boost above 0 dB");
-            if p.edit_delete.is_some() && ui.button("Ask again before deleting audio").clicked() {
-                p.edit_delete = None;
-            }
-        });
-        section(ui, "Key display format", "On decks and in lists.", |ui| {
-            use crate::deck::KeyNotation;
-            ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
-            ui.radio_value(&mut p.key_notation, KeyNotation::Classic, "Classic (Fm, C)");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut p.highlight_compatible_keys, "Highlight compatible keys in the track lists");
-                help(ui, "Keys that mix with the master deck's turn green.");
-            });
-        });
-        section(ui, "Waveform detail", "High is sharper when zoomed in. For newly loaded tracks.", |ui| {
-            use crate::waveform::WaveformDetail;
-            ui.radio_value(&mut p.waveform_detail, WaveformDetail::Standard, "Standard (rekordbox's)");
-            ui.radio_value(&mut p.waveform_detail, WaveformDetail::High, "High (4× finer)");
-        });
-        section(ui, "Analysis", "For tracks rekordbox hasn't analysed.", |ui| {
-            use crate::deck::AnalysisMethod;
-            ui.radio_value(&mut p.analysis, AnalysisMethod::Rekordbox, "rekordbox-compatible");
-            ui.radio_value(&mut p.analysis, AnalysisMethod::Deckhand, "RofLoxBox (quicker)");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut p.analyze_on_load, "Analyze BPM, beat grid and key on load");
-                help(ui, "Only for tracks missing them; edited ones are kept.");
-            });
-        });
         section(ui, "Tempo ranges", "TEMPO RANGE steps through these. WIDE is ±100 %.", |ui| {
             tempo_ranges(ui, &mut p.tempo_ranges);
         });
@@ -162,17 +219,34 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
         section(ui, "Memory Cue Call Lock", "Locked: no memory cue calls on a playing deck.", |ui| {
             lock(ui, &mut p.memory_call_lock);
         });
+        section(
+            ui,
+            "Memory points",
+            "The most memory cues and loops a track may have; storing more is refused. rekordbox \
+             keeps 10 per track. More can lead to unexpected behaviour: rekordbox, its exports \
+             and CDJs or other players may drop the extra ones, or not show them all.",
+            |ui| {
+                ui.add(
+                    egui::Slider::new(&mut p.memory_points_limit, 0..=100)
+                        .text("per track")
+                        .custom_formatter(|v, _| {
+                            if v == 0.0 { "No limit".into() } else { format!("{v:.0}") }
+                        }),
+                );
+                let rekordbox = crate::deck::REKORDBOX_MEMORY_POINTS;
+                if p.memory_points_limit != rekordbox
+                    && ui.button(format!("Back to rekordbox's {rekordbox}")).clicked()
+                {
+                    p.memory_points_limit = rekordbox;
+                }
+            },
+        );
         section(ui, "CALL ◀ ▶ during loop playback", "Loop ½ / ×2 can also be mapped in Controller.", |ui| {
             ui.radio_value(&mut p.call_resizes_loop, false, "Moves between memory cues and loops");
             ui.radio_value(&mut p.call_resizes_loop, true, "Halves / doubles the loop (Pioneer)");
         });
         section(ui, "Hot Cue Gate", "On: a hot cue on a playing deck also stops on release.", |ui| {
             ui.checkbox(&mut p.gate_while_playing, "Gate also while playing");
-        });
-        section(ui, "Load", "", |ui| {
-            ui.checkbox(&mut p.start_at_first_cue, "Start at the first cue");
-            ui.checkbox(&mut p.instant_doubles, "Instant Doubles")
-                .on_hover_text("Loading a playing track picks up where it is");
         });
         section(ui, "Auto Cue", "On load, cue where the music starts.", |ui| {
             ui.horizontal(|ui| {
@@ -209,18 +283,11 @@ pub fn deck_prefs(ui: &mut Ui, p: &mut Preferences, decks: usize) -> bool {
             p.auto_gain = defaults.auto_gain;
             p.track_end_warning = defaults.track_end_warning;
             p.memory_call_lock = defaults.memory_call_lock;
-            p.key_notation = defaults.key_notation;
-            p.highlight_compatible_keys = defaults.highlight_compatible_keys;
-            p.edit_follow_playhead = defaults.edit_follow_playhead;
-            p.edit_eq_boost = defaults.edit_eq_boost;
-            p.edit_delete = defaults.edit_delete;
-            p.analysis = defaults.analysis;
-            p.waveform_detail = defaults.waveform_detail;
             p.auto_master = defaults.auto_master;
             p.tempo_ranges = defaults.tempo_ranges.clone();
-            p.analyze_on_load = defaults.analyze_on_load;
             p.call_resizes_loop = defaults.call_resizes_loop;
             p.gate_while_playing = defaults.gate_while_playing;
+            p.memory_points_limit = defaults.memory_points_limit;
             p.start_at_first_cue = defaults.start_at_first_cue;
             p.instant_doubles = defaults.instant_doubles;
             p.auto_cue = defaults.auto_cue;
@@ -239,7 +306,7 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
     let before = p.clone();
     section(ui, "Beat FX to step through", "A controller's next / previous FX buttons go through these.", |ui| {
         ui.horizontal_wrapped(|ui| {
-            for kind in deckhand_audio::BeatFxKind::ALL {
+            for kind in rofloxbox_audio::BeatFxKind::ALL {
                 let mut on = p.beat_fx_cycle.contains(&kind);
                 if ui.checkbox(&mut on, kind.label()).changed() {
                     p.beat_fx_cycle.retain(|k| *k != kind);
@@ -283,13 +350,6 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             hz(ui, &mut p.eq_high_hz, "HI", 3_000.0..=16_000.0);
         }
     });
-    section(ui, "Waveform", "", |ui| {
-        ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
-            .on_hover_text("Cut bands shrink in the waveforms");
-        ui.checkbox(&mut p.scroll_zoom, "Scroll over a waveform to zoom").on_hover_text(
-            "Wheel, scroll or pinch",
-        );
-    });
     section(ui, "Knobs", "Scroll over a knob to turn it; hold Shift for fine steps.", |ui| {
         ui.add(
             egui::Slider::new(&mut p.knob_scroll, 0.0..=4.0)
@@ -312,8 +372,6 @@ pub fn mixer_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
         p.iso_low_hz = defaults.iso_low_hz;
         p.iso_high_hz = defaults.iso_high_hz;
         p.limiter = defaults.limiter;
-        p.eq_waveforms = defaults.eq_waveforms;
-        p.scroll_zoom = defaults.scroll_zoom;
         p.knob_scroll = defaults.knob_scroll;
     }
     *p != before

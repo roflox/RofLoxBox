@@ -6,15 +6,15 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use deckhand_audio::{
+use rofloxbox_audio::{
     Command, CrossfaderSide, DRUMS, Engine, PARTS, StemLayers, TrackAudio, VOCALS, band_waveform,
     decode_file, peak_waveform,
 };
-use deckhand_control::PadMode;
-use deckhand_formats::anlz::{
+use rofloxbox_control::PadMode;
+use rofloxbox_formats::anlz::{
     AnlzFile, CueKind, CueListKind, CueStatus, Section, Waveform, WaveformKind,
 };
-use deckhand_formats::pdb::LibraryTrack;
+use rofloxbox_formats::pdb::LibraryTrack;
 use eframe::egui::{self, Color32};
 
 use crate::library::UsbLibrary;
@@ -35,6 +35,12 @@ const NUDGE_HOLD: Duration = Duration::from_millis(35);
 const JOG_WINDOW: Duration = Duration::from_millis(50);
 /// Jog search movement per step.
 const SEARCH_SECONDS_PER_STEP: f64 = 0.1;
+/// Loop in / out adjust: how far one jog turn moves the point, and how
+/// long the adjust lasts untouched (as on Pioneer players).
+const LOOP_ADJUST_SECONDS_PER_TURN: f64 = 0.5;
+const LOOP_ADJUST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Shortest loop an adjust leaves.
+const SHORTEST_LOOP: f64 = 0.01;
 /// Positions this close to the cue point count as "at the cue".
 pub const AT_CUE: f64 = 0.02;
 /// Beat-jump pads: back/forward pairs.
@@ -163,12 +169,16 @@ pub struct HotCue {
     pub color: Color32,
 }
 
+/// Memory cues and loops per track as rekordbox keeps them (10, as its
+/// manual and CDJs' give).
+pub const REKORDBOX_MEMORY_POINTS: u32 = 10;
+
 /// Everything known about the track on a deck.
 pub struct LoadedTrack {
     pub id: u32,
     /// The audio file.
     pub path: PathBuf,
-    /// From deckhand's collection rather than a USB export.
+    /// From RofLoxBox's collection rather than a USB export.
     pub from_collection: bool,
     /// The export it came from (USB tracks).
     pub usb_root: Option<PathBuf>,
@@ -204,8 +214,8 @@ impl LoadedTrack {
     }
 
     /// The beat grid as recorded sessions keep it, to redo sync.
-    pub fn session_grid(&self) -> deckhand_audio::Grid {
-        deckhand_audio::Grid {
+    pub fn session_grid(&self) -> rofloxbox_audio::Grid {
+        rofloxbox_audio::Grid {
             bpm: self.bpm,
             beats: self.beats.iter().map(|b| b.0).collect(),
             bars: self.beats.iter().map(|b| b.1).collect(),
@@ -238,6 +248,20 @@ impl LoadedTrack {
         let a = (beat.floor().max(0.0) as usize).min(beats.len() - 2);
         let (ta, tb) = (beats[a].0, beats[a + 1].0);
         ta + (beat - a as f64) * (tb - ta)
+    }
+
+    /// Where a loop of `beats` made at `seconds` starts: quantized, on
+    /// the beat playback is in (for loops under a beat, on a step of the
+    /// loop's own length); otherwise right there.
+    pub fn beat_loop_start(&self, seconds: f64, beats: f64, quantize: bool) -> f64 {
+        if !quantize {
+            return seconds;
+        }
+        let step = beats.min(1.0);
+        // A hair of slack: a position right on a beat can read a hair
+        // before it, which would floor to the beat before.
+        let beat = ((self.beat_at(seconds) + 1e-6) / step).floor() * step;
+        self.time_of_beat(beat)
     }
 
     pub fn nearest_beat_time(&self, seconds: f64) -> f64 {
@@ -333,6 +357,13 @@ pub fn bars_label(beats: i64) -> String {
 
 type LoadResult = Result<(LoadedTrack, Arc<TrackAudio>)>;
 
+/// An end of a loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopEdge {
+    In,
+    Out,
+}
+
 pub struct Deck {
     pub index: usize,
     pub track: Option<LoadedTrack>,
@@ -344,6 +375,8 @@ pub struct Deck {
     /// Detection filled in the grid or key; the collection should keep it.
     pub analysed: bool,
     pub error: Option<String>,
+    /// Something to tell in the status bar (taken from there each frame).
+    pub notice: Option<String>,
     pub cue_point: f64,
     previewing: bool,
     /// −1.0 (slowest) … 1.0 (fastest).
@@ -362,6 +395,15 @@ pub struct Deck {
     pub loop_in: Option<f64>,
     pub loop_region: Option<(f64, f64)>,
     pub loop_active: bool,
+    /// Loop in / out adjust: the jog moves that end of the active loop
+    /// (since the last touch).
+    pub loop_adjust: Option<(LoopEdge, Instant)>,
+    /// Playback has been inside the active loop: a record let go outside
+    /// it leaves the loop.
+    in_loop: bool,
+    /// The track's active loop was exited (RELOOP/EXIT while in it): not
+    /// armed again until it's entered again, or the track loaded again.
+    active_loop_off: bool,
     jog_touched: bool,
     nudge_until: Option<Instant>,
     /// Jog steps since the last frame, and the smoothed spin speed
@@ -457,6 +499,7 @@ impl Deck {
             analysing: None,
             analysed: false,
             error: None,
+            notice: None,
             cue_point: 0.0,
             previewing: false,
             tempo_fader: 0.0,
@@ -470,6 +513,9 @@ impl Deck {
             loop_in: None,
             loop_region: None,
             loop_active: false,
+            loop_adjust: None,
+            in_loop: false,
+            active_loop_off: false,
             jog_touched: false,
             nudge_until: None,
             nudge_steps: Default::default(),
@@ -534,7 +580,7 @@ impl Deck {
     pub fn eq_gains(&self) -> [f32; 3] {
         self.eq.map(|knob| {
             let db = eq_db(knob, self.prefs.isolator);
-            if db <= deckhand_audio::EQ_MIN_DB { 0.0 } else { 10f32.powf(db / 20.0).min(1.6) }
+            if db <= rofloxbox_audio::EQ_MIN_DB { 0.0 } else { 10f32.powf(db / 20.0).min(1.6) }
         })
     }
 
@@ -585,8 +631,8 @@ impl Deck {
         self.start_request(request, ctx);
     }
 
-    /// Loads a track of deckhand's collection.
-    pub fn start_load_file(&mut self, track: &deckhand_library::Track, ctx: &egui::Context) {
+    /// Loads a track of RofLoxBox's collection.
+    pub fn start_load_file(&mut self, track: &rofloxbox_library::Track, ctx: &egui::Context) {
         let request = LoadRequest {
             id: track.id,
             from_collection: true,
@@ -611,7 +657,7 @@ impl Deck {
     pub fn start_load_path(
         &mut self,
         id: u32,
-        file: &deckhand_library::ScannedFile,
+        file: &rofloxbox_library::ScannedFile,
         ctx: &egui::Context,
     ) {
         let title = if file.title.is_empty() {
@@ -676,6 +722,8 @@ impl Deck {
                         .unwrap_or(0.0);
                     engine.send(Command::Seek { deck: self.index, seconds: self.cue_point });
                     (self.loop_in, self.loop_region, self.loop_active) = (None, None, false);
+                    // Nothing of the last track's loop carries over.
+                    (self.in_loop, self.loop_adjust, self.active_loop_off) = (false, None, false);
                     if let Some((start, end)) = track.active_loop {
                         self.loop_in = Some(start);
                         self.loop_region = Some((start, end));
@@ -716,6 +764,7 @@ impl Deck {
                 }
             }
         }
+        self.follow_loop(engine);
         // Pitch bend follows how fast the jog spins, smoothed over frames.
         let now = Instant::now();
         let dt = now.duration_since(self.last_poll).as_secs_f64().clamp(1e-3, 0.1);
@@ -880,7 +929,9 @@ impl Deck {
                 self.set_loop(start, end, engine);
             }
             // A plain memory cue leaves any active loop.
-            None if self.loop_active => {
+            // Not the active loop armed ahead: it still catches when
+            // playback gets there.
+            None if self.loop_active && !self.on_active_loop() => {
                 self.loop_active = false;
                 engine.send(Command::ClearLoop { deck: self.index });
             }
@@ -888,12 +939,22 @@ impl Deck {
         }
     }
 
-    /// Stores the active loop, or the cue point (paused) or position (playing).
+    /// Stores the active loop, or the cue point (paused) or position
+    /// (playing); not past the memory points limit (Preferences → Deck).
     pub fn memory_set(&mut self, engine: &mut Engine) {
         let playing = engine.is_playing(self.index);
         let position = self.quantized(engine.position_secs(self.index));
         let (region, active, cue_point) = (self.loop_region, self.loop_active, self.cue_point);
+        let limit = self.prefs.memory_points_limit as usize;
         let Some(track) = self.track.as_mut() else { return };
+        if limit > 0 && track.memory_cues.len() + track.memory_loops.len() >= limit {
+            self.notice = Some(format!(
+                "Deck {}: this track has {limit} memory cues and loops, the most allowed \
+                 (Preferences → Deck → Memory points)",
+                self.index + 1
+            ));
+            return;
+        }
         match region.filter(|_| active) {
             Some(range) => {
                 if !track.memory_loops.iter().any(|l| (l.0 - range.0).abs() < AT_CUE) {
@@ -925,7 +986,9 @@ impl Deck {
                 self.loop_in = Some(start);
                 self.set_loop(start, end, engine);
             }
-            None if self.loop_active => {
+            // Not the active loop armed ahead: it still catches when
+            // playback gets there.
+            None if self.loop_active && !self.on_active_loop() => {
                 self.loop_active = false;
                 engine.send(Command::ClearLoop { deck: self.index });
             }
@@ -946,7 +1009,19 @@ impl Deck {
         } else {
             None
         };
+        self.active_loop_off = false;
         self.edited = true;
+    }
+
+    /// The loop set is the track's active loop (armed, or looping).
+    fn on_active_loop(&self) -> bool {
+        self.loop_active && self.region_is_active_loop()
+    }
+
+    fn region_is_active_loop(&self) -> bool {
+        self.loop_region
+            .zip(self.track.as_ref())
+            .is_some_and(|(range, track)| track.is_active_loop(range))
     }
 
     /// Deletes one memory cue (`end` `None`) or loop from the list.
@@ -1010,14 +1085,18 @@ impl Deck {
         engine.send(Command::Seek { deck: self.index, seconds });
     }
 
-    /// Jumps by a number of beats along the beat grid.
     /// Jumps by a number of beats along the beat grid, keeping the position
-    /// within the beat. Like rekordbox, an active loop moves along with the
-    /// jump instead of being left behind.
+    /// within the beat. Like rekordbox, a loop playback is in moves along
+    /// with the jump instead of being left behind; one ahead or behind (an
+    /// active loop armed, waiting) stays where it is.
     pub fn beat_jump(&mut self, beats: f64, engine: &mut Engine) {
         let Some(track) = &self.track else { return };
         let position = engine.position_secs(self.index);
-        let active_loop = self.loop_region.filter(|_| self.loop_active);
+        const SLACK: f64 = 0.02;
+        let active_loop = self
+            .loop_region
+            .filter(|_| self.loop_active)
+            .filter(|(start, end)| (start - SLACK..=end + SLACK).contains(&position));
         let Some((target, moved_loop)) = plan_beat_jump(track, position, active_loop, beats) else {
             return;
         };
@@ -1061,19 +1140,125 @@ impl Deck {
         }
         self.loop_region = Some((start, end));
         self.loop_active = true;
+        self.in_loop = false;
         engine.send(Command::SetLoop { deck: self.index, start, end });
+        // Playback past the new end (OUT a moment late, a loop halved)
+        // goes round into it, as if it had played on inside.
+        let position = engine.position_secs(self.index);
+        if position >= end && position < end + (end - start) {
+            let seconds = start + (position - end) % (end - start);
+            engine.send(Command::Seek { deck: self.index, seconds });
+        }
     }
 
+    /// LOOP IN: the loop's start here; during a loop, Loop In Adjust (the
+    /// jog moves the start; pressed again, it ends).
     pub fn loop_in(&mut self, engine: &mut Engine) {
+        if self.toggle_loop_adjust(LoopEdge::In) {
+            return;
+        }
         if self.track.is_some() {
             self.loop_in = Some(self.quantized(engine.position_secs(self.index)));
         }
     }
 
+    /// LOOP OUT: a loop from LOOP IN to here; during a loop, Loop Out
+    /// Adjust.
     pub fn loop_out(&mut self, engine: &mut Engine) {
+        if self.toggle_loop_adjust(LoopEdge::Out) {
+            return;
+        }
         let end = self.quantized(engine.position_secs(self.index));
         if let Some(start) = self.loop_in {
             self.set_loop(start, end, engine);
+        }
+    }
+
+    /// During a loop, starts adjusting `edge` (or ends adjusting it);
+    /// `false` without an active loop.
+    fn toggle_loop_adjust(&mut self, edge: LoopEdge) -> bool {
+        if !self.loop_active || self.loop_region.is_none() {
+            return false;
+        }
+        self.loop_adjust = match self.loop_adjust {
+            Some((current, _)) if current == edge => None,
+            _ => Some((edge, Instant::now())),
+        };
+        true
+    }
+
+    /// The jog during Loop In / Out Adjust: moves that end of the loop.
+    fn adjust_loop(&mut self, steps: i32, engine: &mut Engine) {
+        let Some((edge, _)) = self.loop_adjust else { return };
+        let Some((start, end)) = self.loop_region else { return };
+        self.loop_adjust = Some((edge, Instant::now()));
+        let moved = f64::from(steps) * LOOP_ADJUST_SECONDS_PER_TURN / self.jog_steps_per_turn;
+        let length = self.audio.as_ref().map_or(f64::MAX, |a| a.duration_secs());
+        let (start, end) = match edge {
+            LoopEdge::In => ((start + moved).clamp(0.0, (end - SHORTEST_LOOP).max(0.0)), end),
+            LoopEdge::Out => {
+                let shortest = start + SHORTEST_LOOP;
+                (start, (end + moved).clamp(shortest, length.max(shortest)))
+            }
+        };
+        if edge == LoopEdge::In {
+            self.loop_in = Some(start);
+        }
+        self.set_loop(start, end, engine);
+        // Playback is kept inside the loop it's adjusting.
+        self.in_loop = true;
+        let position = engine.position_secs(self.index);
+        if position >= end || position < start {
+            engine.send(Command::Seek { deck: self.index, seconds: start });
+        }
+    }
+
+    /// With no loop on (another one left, a memory cue called), the
+    /// track's active loop is armed again while it's still ahead, unless
+    /// it was exited.
+    fn rearm_active_loop(&mut self, engine: &mut Engine) {
+        if self.loop_active || self.active_loop_off {
+            return;
+        }
+        let Some((start, end)) = self.track.as_ref().and_then(|t| t.active_loop) else { return };
+        if engine.position_secs(self.index) >= end {
+            return;
+        }
+        (self.loop_region, self.loop_active, self.in_loop) = (Some((start, end)), true, false);
+        engine.send(Command::SetLoop { deck: self.index, start, end });
+    }
+
+    /// Ends a loop adjust left alone, or with the loop gone; leaves the loop
+    /// when playback is put outside it (a jump: the jog goes round it, see
+    /// the engine).
+    fn follow_loop(&mut self, engine: &mut Engine) {
+        if !self.loop_active
+            || self.loop_adjust.is_some_and(|(_, at)| at.elapsed() > LOOP_ADJUST_TIMEOUT)
+        {
+            self.loop_adjust = None;
+        }
+        self.rearm_active_loop(engine);
+        let Some((start, end)) = self.loop_region.filter(|_| self.loop_active) else {
+            self.in_loop = false;
+            return;
+        };
+        if self.loop_adjust.is_some() || self.jog_touched || self.grabbed {
+            return;
+        }
+        let position = engine.position_secs(self.index);
+        const SLACK: f64 = 0.02;
+        // The track's active loop stays armed when playback jumps out of
+        // it: it loops again whenever playback gets there (until it's
+        // exited), as on a CDJ.
+        let armed = self.track.as_ref().is_some_and(|t| t.is_active_loop((start, end)));
+        if (start..=end).contains(&position) {
+            self.in_loop = true;
+        } else if self.in_loop && (position < start - SLACK || position > end + SLACK) {
+            self.in_loop = false;
+            if !armed {
+                self.loop_active = false;
+                engine.send(Command::ClearLoop { deck: self.index });
+            }
         }
     }
 
@@ -1095,7 +1280,12 @@ impl Deck {
     }
 
     pub fn reloop_exit(&mut self, engine: &mut Engine) {
+        self.loop_adjust = None;
         self.adopt_memory_loop(engine);
+        // Exiting the active loop disarms it; going back into it arms it.
+        if self.region_is_active_loop() {
+            self.active_loop_off = self.loop_active;
+        }
         if self.loop_active {
             self.loop_active = false;
             engine.send(Command::ClearLoop { deck: self.index });
@@ -1122,10 +1312,12 @@ impl Deck {
                 return;
             }
         }
-        let beat = track.beat_at(position);
-        let start_beat = if self.quantize { (beat * 4.0).floor() / 4.0 } else { beat };
-        let start = track.time_of_beat(start_beat);
-        let end = track.time_of_beat(start_beat + beats);
+        // Another size during a loop playing: the same start, a new length.
+        let start = match self.loop_region {
+            Some((start, end)) if self.loop_active && (start..=end).contains(&position) => start,
+            _ => track.beat_loop_start(position, beats, self.quantize),
+        };
+        let end = track.time_of_beat(track.beat_at(start) + beats);
         self.loop_in = Some(start);
         self.set_loop(start, end, engine);
     }
@@ -1144,6 +1336,9 @@ impl Deck {
 
     /// Fast search through the track (jog with Shift on many controllers).
     pub fn jog_search(&mut self, steps: i32, engine: &mut Engine) {
+        if self.loop_adjust.is_some() {
+            return self.adjust_loop(steps, engine);
+        }
         engine.send(Command::Shift {
             deck: self.index,
             seconds: f64::from(steps) * SEARCH_SECONDS_PER_STEP,
@@ -1174,6 +1369,9 @@ impl Deck {
     /// Jog side or (outside vinyl scratching) top: bends the tempo while
     /// playing, moves through the track while paused.
     pub fn jog(&mut self, steps: i32, engine: &mut Engine) {
+        if self.loop_adjust.is_some() {
+            return self.adjust_loop(steps, engine);
+        }
         if engine.is_playing(self.index) {
             // Bends while spinning; poll() turns the speed into a bend.
             self.nudge_steps.push_back((Instant::now(), f64::from(steps)));
@@ -1188,7 +1386,7 @@ impl Deck {
 
     /// Jog top movement.
     pub fn jog_scratch(&mut self, steps: i32, engine: &mut Engine) {
-        if self.is_scratching() {
+        if self.is_scratching() && self.loop_adjust.is_none() {
             engine.send(Command::JogMove {
                 deck: self.index,
                 seconds: f64::from(steps) * JOG_SECONDS_PER_TURN / self.jog_steps_per_turn
@@ -1252,7 +1450,8 @@ impl Deck {
             self.rephase = true;
         }
         self.jog_touched = touched;
-        if self.vinyl {
+        // Adjusting a loop, the jog top moves the loop, not the record.
+        if self.vinyl && (self.loop_adjust.is_none() || !touched) {
             engine.send(Command::Hold { deck: self.index, held: touched });
         }
     }
@@ -1406,7 +1605,7 @@ impl Deck {
     /// Lets recorded sessions know the track's beat grid as it is now.
     pub fn remember_grid(&self) {
         if let (Some(audio), Some(track)) = (&self.audio, &self.track) {
-            deckhand_audio::remember_grid(audio, track.session_grid());
+            rofloxbox_audio::remember_grid(audio, track.session_grid());
         }
     }
 
@@ -1466,6 +1665,9 @@ impl Deck {
     /// Turns the stored loop on or off without moving the playhead.
     pub fn toggle_active_loop(&mut self, engine: &mut Engine) {
         self.adopt_memory_loop(engine);
+        if self.region_is_active_loop() {
+            self.active_loop_off = self.loop_active;
+        }
         if self.loop_active {
             self.loop_active = false;
             engine.send(Command::ClearLoop { deck: self.index });
@@ -1751,7 +1953,7 @@ pub fn plan_beat_jump(
 /// EQ knob position to gain: center flat, right end +6 dB. As an
 /// isolator the left end cuts the band fully; as an EQ it stops at −26 dB.
 pub fn eq_db(knob: f32, isolator: bool) -> f32 {
-    use deckhand_audio::{EQ_MAX_DB, EQ_MIN_DB};
+    use rofloxbox_audio::{EQ_MAX_DB, EQ_MIN_DB};
     let knob = knob.clamp(0.0, 1.0);
     if knob >= 0.5 {
         (knob - 0.5) * 2.0 * EQ_MAX_DB
@@ -1772,6 +1974,8 @@ pub struct DeckPrefs {
     pub call_resizes_loop: bool,
     /// Gated hot cues also stop on release when the deck was playing.
     pub gate_while_playing: bool,
+    /// Most memory cues and loops per track; 0 is no limit.
+    pub memory_points_limit: u32,
     pub start_at_first_cue: bool,
     /// Auto Cue level in dB, when Auto Cue is on for the deck.
     pub auto_cue_db: Option<f32>,
@@ -1797,8 +2001,8 @@ pub enum AnalysisMethod {
     /// Waveforms matching rekordbox's analysis files.
     #[default]
     Rekordbox,
-    /// deckhand's own, quicker method.
-    Deckhand,
+    /// RofLoxBox's own, quicker method.
+    RofLoxBox,
 }
 
 impl Default for DeckPrefs {
@@ -1808,6 +2012,7 @@ impl Default for DeckPrefs {
             key_notation: KeyNotation::default(),
             call_resizes_loop: false,
             gate_while_playing: false,
+            memory_points_limit: REKORDBOX_MEMORY_POINTS,
             start_at_first_cue: true,
             auto_cue_db: None,
             isolator: true,
@@ -1842,8 +2047,8 @@ pub enum Stems {
 
 /// What detection found for a loaded track.
 struct Detected {
-    grid: Option<deckhand_analysis::beats::Grid>,
-    key: Option<deckhand_analysis::key::Key>,
+    grid: Option<rofloxbox_analysis::beats::Grid>,
+    key: Option<rofloxbox_analysis::key::Key>,
 }
 
 /// Detects the beat grid and/or key `track` lacks, in the background;
@@ -1855,11 +2060,11 @@ fn detect_missing(track: &LoadedTrack, audio: Arc<TrackAudio>) -> Option<Receive
     }
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        use deckhand_analysis::beats::{DEFAULT_RANGE, beat_grid};
+        use rofloxbox_analysis::beats::{DEFAULT_RANGE, beat_grid};
         let samples = audio.to_f32();
         let found = Detected {
             grid: grid.then(|| beat_grid(&samples, audio.sample_rate, DEFAULT_RANGE)).flatten(),
-            key: key.then(|| deckhand_analysis::key::detect_key(&samples, audio.sample_rate)).flatten(),
+            key: key.then(|| rofloxbox_analysis::key::detect_key(&samples, audio.sample_rate)).flatten(),
         };
         let _ = tx.send(found);
     });
@@ -1913,7 +2118,7 @@ struct Known {
 }
 
 impl Known {
-    fn from_track(track: &deckhand_library::Track) -> Self {
+    fn from_track(track: &rofloxbox_library::Track) -> Self {
         let mut known = Known {
             gain_db: track.gain_db,
             beats: track.beats(track.duration.max(1.0) + 1.0),
@@ -1924,18 +2129,18 @@ impl Known {
         };
         for cue in &track.cues {
             match (cue.kind, cue.end) {
-                (deckhand_library::CueKind::Hot(n), _) if usize::from(n) < HOT_CUES => {
+                (rofloxbox_library::CueKind::Hot(n), _) if usize::from(n) < HOT_CUES => {
                     let color =
                         cue.color.map_or(HOT_CUE_DEFAULT, |[r, g, b]| Color32::from_rgb(r, g, b));
                     known.hot_cues[usize::from(n)] = Some(HotCue { seconds: cue.start, color });
                 }
-                (deckhand_library::CueKind::Memory, Some(end)) => {
+                (rofloxbox_library::CueKind::Memory, Some(end)) => {
                     known.memory_loops.push((cue.start, end));
                     if cue.active {
                         known.active_loop = Some((cue.start, end));
                     }
                 }
-                (deckhand_library::CueKind::Memory, None) => known.memory_cues.push(cue.start),
+                (rofloxbox_library::CueKind::Memory, None) => known.memory_cues.push(cue.start),
                 _ => {}
             }
         }
@@ -1978,23 +2183,23 @@ impl LoadRequest {
         let two_ex =
             self.analysis_path.as_ref().and_then(|p| AnlzFile::open(p.with_extension("2EX")).ok());
         // Without rekordbox's analysis: worked out to match its files,
-        // or deckhand's quicker way.
+        // or RofLoxBox's quicker way.
         let worked_out = || match self.analysis {
             AnalysisMethod::Rekordbox => {
                 let columns =
-                    deckhand_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
+                    rofloxbox_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
                 let data = columns.iter().flat_map(|c| c.to_be_bytes()).collect();
                 let waveform = Waveform { kind: WaveformKind::ColorDetail, entry_len: 2, data };
                 let ext = AnlzFile { sections: vec![Section::Waveform(waveform)] };
                 WaveformData::from_analysis(Some(&ext), None)
             }
-            AnalysisMethod::Deckhand => None,
+            AnalysisMethod::RofLoxBox => None,
         };
         let waveform = if self.waveform_detail == crate::waveform::WaveformDetail::High {
             let per_second = crate::waveform::HIGH_COLUMNS_PER_SECOND;
             WaveformData::high_detail(
-                &deckhand_audio::peak_waveform_at(&audio, per_second),
-                deckhand_audio::band_waveform_at(&audio, per_second),
+                &rofloxbox_audio::peak_waveform_at(&audio, per_second),
+                rofloxbox_audio::band_waveform_at(&audio, per_second),
                 per_second,
             )
         } else {
@@ -2070,7 +2275,7 @@ impl LoadRequest {
         let stored_gain = self.known.as_ref().and_then(|k| k.gain_db);
         if let Some(known) = self.known {
             // Collection tracks: the collection's grid and cues (edited in
-            // deckhand) win over rekordbox's analysis, which then only gives
+            // RofLoxBox) win over rekordbox's analysis, which then only gives
             // the waveform. Otherwise the analysis wins.
             let known_cues = known.hot_cues.iter().any(Option::is_some)
                 || !known.memory_cues.is_empty()
@@ -2107,8 +2312,8 @@ impl LoadRequest {
             gain_db: stored_gain.unwrap_or_else(|| auto_gain_db(&audio)),
         };
         let audio = Arc::new(audio);
-        deckhand_audio::remember_track(&audio, &self.audio_path);
-        deckhand_audio::remember_grid(&audio, track.session_grid());
+        rofloxbox_audio::remember_track(&audio, &self.audio_path);
+        rofloxbox_audio::remember_grid(&audio, track.session_grid());
         Ok((track, audio))
     }
 }
@@ -2117,11 +2322,11 @@ impl LoadRequest {
 mod tests {
 
     /// Time of each step of loading a track:
-    /// `DECKHAND_TEST_TRACK=song.wav cargo test -p deckhand-app load_steps -- --ignored --nocapture`
+    /// `ROFLOXBOX_TEST_TRACK=song.wav cargo test -p rofloxbox-app load_steps -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn load_steps() {
-        let path = PathBuf::from(std::env::var("DECKHAND_TEST_TRACK").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_TEST_TRACK").unwrap());
         let time = |name: &str, started: std::time::Instant| {
             eprintln!("{name:>14}: {:6.3} s", started.elapsed().as_secs_f64());
         };
@@ -2129,7 +2334,7 @@ mod tests {
         let audio = decode_file(&path).unwrap();
         time("decode", started);
         let started = std::time::Instant::now();
-        let _ = deckhand_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
+        let _ = rofloxbox_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
         time("color waveform", started);
         let started = std::time::Instant::now();
         let _ = band_waveform(&audio);
@@ -2218,6 +2423,23 @@ mod tests {
     }
 
     #[test]
+    fn beat_loops_start_on_the_beat() {
+        // 120 BPM starting at 0.1 s.
+        let grid: Vec<(f64, u16)> =
+            (0..100).map(|i| (0.1 + f64::from(i) * 0.5, (i % 4 + 1) as u16)).collect();
+        let t = track(grid, 120.0);
+        // Anywhere in a beat (not on a quarter of it): the beat's start.
+        for at in [1.1, 1.2, 1.3, 1.45, 1.599_9] {
+            assert!((t.beat_loop_start(at, 4.0, true) - 1.1).abs() < 1e-9, "{at}");
+        }
+        assert!((t.beat_loop_start(1.6, 4.0, true) - 1.6).abs() < 1e-9);
+        // A half-beat loop: on a half beat.
+        assert!((t.beat_loop_start(1.45, 0.5, true) - 1.35).abs() < 1e-9);
+        // Quantize off: right there.
+        assert_eq!(t.beat_loop_start(1.45, 4.0, false), 1.45);
+    }
+
+    #[test]
     fn beat_positions_follow_the_grid() {
         // 120 BPM starting at 0.1 s.
         let grid: Vec<(f64, u16)> =
@@ -2286,14 +2508,14 @@ mod tests {
         let track = deck.track.as_ref().unwrap();
         assert_eq!((track.active_loop, track.memory_loops.len(), track.memory_cues.len()), (None, 0, 0));
         // From the collection: the flagged loop is the active one.
-        let mut collection = deckhand_library::Collection::default();
-        collection.merge(vec![deckhand_library::ScannedFile {
+        let mut collection = rofloxbox_library::Collection::default();
+        collection.merge(vec![rofloxbox_library::ScannedFile {
             path: "/a.wav".into(),
             ..Default::default()
         }]);
         let mut stored = collection.tracks[0].clone();
-        stored.cues = vec![deckhand_library::Cue {
-            kind: deckhand_library::CueKind::Memory,
+        stored.cues = vec![rofloxbox_library::Cue {
+            kind: rofloxbox_library::CueKind::Memory,
             start: 30.0,
             end: Some(32.0),
             color: None,
@@ -2438,7 +2660,7 @@ mod tests {
 
     #[test]
     fn eq_knob_curve() {
-        use deckhand_audio::{EQ_MAX_DB, EQ_MIN_DB};
+        use rofloxbox_audio::{EQ_MAX_DB, EQ_MIN_DB};
         for isolator in [true, false] {
             assert_eq!(eq_db(0.5, isolator), 0.0);
             assert!((eq_db(1.0, isolator) - EQ_MAX_DB).abs() < 1e-6);

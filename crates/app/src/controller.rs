@@ -4,11 +4,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
-use deckhand_control::{
+use rofloxbox_control::{
     Action, ControlEvent, DeckAction, Encoding, Feedback, Learner, Mapping, MessageType, MidiInput,
-    MidiMessage, MidiOutput, ShiftControl, Translator,
+    MidiMessage, MidiOutput, PadMode, ShiftControl, Translator,
 };
-use deckhand_control::{pioneer, rekordbox};
+use rofloxbox_control::{pioneer, rekordbox};
 use eframe::egui;
 
 use crate::config::mapping_path;
@@ -24,7 +24,10 @@ pub struct Controller {
     /// The next button pressed becomes a Shift button.
     learning_shift: bool,
     /// Where jog wheel movement goes straight from the MIDI thread.
-    jog: Option<std::sync::Arc<std::sync::Mutex<deckhand_audio::JogSender>>>,
+    jog: Option<std::sync::Arc<std::sync::Mutex<rofloxbox_audio::JogSender>>>,
+    /// Decks (a bit each) whose jog goes through the app instead, for now
+    /// (adjusting a loop end).
+    jog_bypass: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Last value sent per (status, number), so only changes are sent.
     sent: HashMap<(u8, u8), u8>,
     pub log: VecDeque<String>,
@@ -178,16 +181,20 @@ impl Controller {
 
     /// Makes an action's binding apply with Shift held (or without).
     pub fn set_shifted(&mut self, action: Action, shift: bool) {
+        // Moved to the other layer, with their lights.
         let mut mapping = self.translator.mapping().clone();
-        for binding in mapping.bindings.iter_mut().filter(|b| b.action == action) {
-            binding.shift = shift;
+        let moved: Vec<_> =
+            mapping.bindings.iter().filter(|b| b.action == action).cloned().collect();
+        mapping.unbind(action);
+        for binding in moved {
+            mapping.bind(rofloxbox_control::Binding { shift, ..binding });
         }
         self.store(mapping);
     }
 
     pub fn unbind(&mut self, action: Action) {
         let mut mapping = self.translator.mapping().clone();
-        mapping.bindings.retain(|b| b.action != action);
+        mapping.unbind(action);
         self.store(mapping);
     }
 
@@ -200,6 +207,24 @@ impl Controller {
     }
 
     fn store(&mut self, mapping: Mapping) {
+        // Lights nothing shows any more go dark.
+        let status = |message: MessageType, channel: u8| match message {
+            MessageType::Note => Some(0x90 | (channel.saturating_sub(1) & 0x0f)),
+            MessageType::Cc => Some(0xb0 | (channel.saturating_sub(1) & 0x0f)),
+            MessageType::PitchBend => None,
+        };
+        let kept: std::collections::HashSet<(u8, u8)> = mapping
+            .outputs
+            .iter()
+            .filter_map(|o| Some((status(o.message, o.channel)?, o.number)))
+            .collect();
+        let dark: Vec<(u8, u8)> = self.sent.keys().filter(|k| !kept.contains(k)).copied().collect();
+        for key in dark {
+            self.sent.remove(&key);
+            if let Some(output) = self.output.as_mut() {
+                output.send(&[key.0, key.1, 0]);
+            }
+        }
         if let Some(port) = self.port()
             && let Err(err) = mapping.save(&mapping_path(port))
         {
@@ -209,8 +234,14 @@ impl Controller {
         self.install_jog();
     }
 
+    /// Jog movement of these decks (a bit each) goes through the app as
+    /// control events rather than straight to the engine.
+    pub fn bypass_jog(&self, decks: u8) {
+        self.jog_bypass.store(decks, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Jog movement goes to this engine from now on.
-    pub fn set_jog_sender(&mut self, sender: Option<deckhand_audio::JogSender>) {
+    pub fn set_jog_sender(&mut self, sender: Option<rofloxbox_audio::JogSender>) {
         self.jog = sender.map(|s| std::sync::Arc::new(std::sync::Mutex::new(s)));
         self.install_jog();
     }
@@ -249,6 +280,7 @@ impl Controller {
             input.set_fast_path(None);
             return;
         }
+        let bypass = self.jog_bypass.clone();
         input.set_fast_path(Some(Box::new(move |message| {
             let MidiMessage::ControlChange { channel, control, value } = *message else {
                 return false;
@@ -258,6 +290,9 @@ impl Controller {
             else {
                 return false;
             };
+            if bypass.load(std::sync::atomic::Ordering::Relaxed) & (1 << deck) != 0 {
+                return false;
+            }
             let steps = match encoding {
                 Encoding::RelativeOffset64 => i32::from(value) - 64,
                 _ if value < 64 => i32::from(value),
@@ -325,18 +360,26 @@ impl Controller {
     }
 
     /// Sends LED and meter state; `value` gives 0–127 per feedback item.
-    pub fn send_feedback(&mut self, value: impl Fn(Feedback) -> u8) {
+    /// Each light shows what its button does now: with Shift held, the
+    /// Shift function; in the deck's pad mode, that mode's.
+    pub fn send_feedback(
+        &mut self,
+        value: impl Fn(Feedback) -> u8,
+        pad_mode: impl Fn(usize) -> PadMode,
+    ) {
         let Some(output) = self.output.as_mut() else { return };
-        for out in &self.translator.mapping().outputs {
-            let status = match out.message {
+        let shift = self.translator.shift_held();
+        let lights = self.translator.mapping().lights(shift, pad_mode);
+        for ((message, channel, number), shows) in lights {
+            let status = match message {
                 MessageType::Note => 0x90,
                 MessageType::Cc => 0xb0,
                 MessageType::PitchBend => continue,
-            } | (out.channel.saturating_sub(1) & 0x0f);
-            let v = value(out.feedback).min(127);
-            if self.sent.get(&(status, out.number)) != Some(&v) {
-                self.sent.insert((status, out.number), v);
-                output.send(&[status, out.number, v]);
+            } | (channel.saturating_sub(1) & 0x0f);
+            let v = shows.map_or(0, |f| value(f).min(127));
+            if self.sent.get(&(status, number)) != Some(&v) {
+                self.sent.insert((status, number), v);
+                output.send(&[status, number, v]);
             }
         }
     }

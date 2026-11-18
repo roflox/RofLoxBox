@@ -1,15 +1,15 @@
-//! Compares deckhand's beat grids and keys with rekordbox's, as imported
+//! Compares RofLoxBox's beat grids and keys with rekordbox's, as imported
 //! into a collection (read only): BPM, phase, downbeat and key.
 //!
-//! `cargo run --release -p deckhand-analysis --example compare_analysis -- collection.json [tracks]`
+//! `cargo run --release -p rofloxbox-analysis --example compare_analysis -- collection.json [tracks]`
 
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use deckhand_analysis::beats::{DEFAULT_RANGE, beat_grid};
-use deckhand_analysis::key::{Key, detect_key};
-use deckhand_library::Collection;
+use rofloxbox_analysis::beats::{DEFAULT_RANGE, beat_grid};
+use rofloxbox_analysis::key::{Key, detect_key};
+use rofloxbox_library::Collection;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
                         *n - 1
                     };
                     let Some(track) = tracks.get(i) else { break };
-                    let Ok(audio) = deckhand_audio::decode_file(&track.path) else { continue };
+                    let Ok(audio) = rofloxbox_audio::decode_file(&track.path) else { continue };
                     let grid = beat_grid(&audio.to_f32(), audio.sample_rate, DEFAULT_RANGE);
                     let key = detect_key(&audio.to_f32(), audio.sample_rate);
                     rows.lock().expect("a worker panicked").push((track, grid, key));

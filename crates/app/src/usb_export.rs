@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use deckhand_formats::anlz::{
+use rofloxbox_formats::anlz::{
     AnlzFile, Beat, BeatGrid, Cue as AnlzCue, CueKind as AnlzCueKind, CueList, CueListKind,
     CueStatus, HotCueColor, Section, Waveform, WaveformKind,
 };
-use deckhand_formats::pdb::{
+use rofloxbox_formats::pdb::{
     Album, Artist, Database, DatabaseWriter, Genre, Key, Label, PlaylistTables, Track, TrackExtras,
     backup_path,
 };
-use deckhand_library::{CueKind, Track as CollectionTrack};
+use rofloxbox_library::{CueKind, Track as CollectionTrack};
 
 use crate::deck::{AnalysisMethod, KeyNotation, format_key, parse_key};
 
@@ -33,6 +33,9 @@ pub struct ExportRequest {
     /// The stick's root (where `PIONEER` and `Contents` go).
     pub root: PathBuf,
     pub playlist: String,
+    /// A playlist on the stick (its id) the tracks are added to the end of,
+    /// rather than the top-level `playlist` they make (or replace).
+    pub add_to: Option<u32>,
     /// The playlist's tracks in order (a track may repeat).
     pub tracks: Vec<CollectionTrack>,
     /// For key names the stick does not have yet.
@@ -150,16 +153,23 @@ fn run(request: &ExportRequest, done: &AtomicUsize, cancel: &AtomicBool) -> Resu
         done.fetch_add(1, Ordering::Relaxed);
     }
 
-    // The playlist: replaced if one of that name is at the top level.
-    let existing_playlist = rows
-        .playlists
-        .nodes
-        .iter()
-        .find(|n| n.parent_id.is_none() && !n.is_folder && n.name == request.playlist)
-        .map(|n| n.id);
-    let playlist =
-        existing_playlist.unwrap_or_else(|| rows.playlists.create(&request.playlist, false, None));
-    rows.playlists.set_tracks(playlist, &entries);
+    let mut existing_playlist = None;
+    match request.add_to.filter(|id| rows.playlists.nodes.iter().any(|n| n.id == *id && !n.is_folder)) {
+        // Added after the playlist's own tracks.
+        Some(playlist) => rows.playlists.add_tracks(playlist, &entries),
+        // The playlist: replaced if one of that name is at the top level.
+        None => {
+            existing_playlist = rows
+                .playlists
+                .nodes
+                .iter()
+                .find(|n| n.parent_id.is_none() && !n.is_folder && n.name == request.playlist)
+                .map(|n| n.id);
+            let playlist = existing_playlist
+                .unwrap_or_else(|| rows.playlists.create(&request.playlist, false, None));
+            rows.playlists.set_tracks(playlist, &entries);
+        }
+    }
 
     let mut writer = match &existing {
         Some(db) => DatabaseWriter::from_database(db)?,
@@ -381,8 +391,9 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Writes the track's `.DAT` and `.EXT` (and `.2EX` when rekordbox made one).
-fn write_analysis(
+/// Writes the track's `.DAT` and `.EXT` (and `.2EX` when rekordbox made one)
+/// at `analyze_path` below `root` (a stick, or rekordbox's `share` folder).
+pub(crate) fn write_analysis(
     root: &Path,
     analyze_path: &str,
     file_path: &str,
@@ -402,10 +413,10 @@ fn write_analysis(
             rekordbox_analysis(dat, ext, two_ex, file_path, track)
         }
         None => {
-            let audio = deckhand_audio::decode_file(&track.path)
+            let audio = rofloxbox_audio::decode_file(&track.path)
                 .with_context(|| format!("reading {}", track.path.display()))?;
             let (dat, ext) = own_analysis(&audio, file_path, track, method);
-            (dat, Some(ext), None)
+            (dat, Some(ext), Some(three_band_analysis(&audio, file_path)))
         }
     };
     std::fs::write(&dat_path, dat.to_bytes())?;
@@ -427,7 +438,7 @@ fn rekordbox_analysis(
     file_path: &str,
     track: &CollectionTrack,
 ) -> (AnlzFile, Option<AnlzFile>, Option<AnlzFile>) {
-    // The grid is rewritten only when it was edited in deckhand: compared
+    // The grid is rewritten only when it was edited in RofLoxBox: compared
     // by tempo markers (the collection keeps the length in whole seconds,
     // so the last beat may differ).
     let grid_changed = match dat.beat_grid() {
@@ -510,8 +521,8 @@ pub(crate) fn replace_grid(file: &mut AnlzFile, grid: BeatGrid) {
 }
 
 pub(crate) fn same_markers(
-    a: &[deckhand_library::TempoMarker],
-    b: &[deckhand_library::TempoMarker],
+    a: &[rofloxbox_library::TempoMarker],
+    b: &[rofloxbox_library::TempoMarker],
 ) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -587,9 +598,9 @@ fn collection_cues(track: &CollectionTrack, original: &[AnlzCue]) -> (CueList, C
 }
 
 /// The collection's memory cues and loops as a basic list's entries, the
-/// active loop flagged there (where players and deckhand read it from);
+/// active loop flagged there (where players and RofLoxBox read it from);
 /// entries already in the list keep their details.
-fn basic_memory(cues: &[deckhand_library::Cue], original: &[AnlzCue]) -> Vec<AnlzCue> {
+fn basic_memory(cues: &[rofloxbox_library::Cue], original: &[AnlzCue]) -> Vec<AnlzCue> {
     let mut cues: Vec<AnlzCue> = cues
         .iter()
         .filter(|c| c.kind == CueKind::Memory)
@@ -626,15 +637,78 @@ fn basic_memory(cues: &[deckhand_library::Cue], original: &[AnlzCue]) -> Vec<Anl
     cues
 }
 
+/// Writes just the `.2EX` (3-band waveforms) of the analysis at
+/// `analyze_path` below `root`, worked out from the track's audio.
+pub(crate) fn write_three_band(
+    root: &Path,
+    analyze_path: &str,
+    file_path: &str,
+    track: &CollectionTrack,
+) -> Result<()> {
+    let audio = rofloxbox_audio::decode_file(&track.path)
+        .with_context(|| format!("reading {}", track.path.display()))?;
+    let two_ex = three_band_analysis(&audio, file_path);
+    std::fs::write(below(root, analyze_path).with_extension("2EX"), two_ex.to_bytes())?;
+    Ok(())
+}
+
+/// The `.2EX`: the 3-band waveforms rekordbox 7 and CDJ-3000s show (lows,
+/// mids, highs; 150 columns a second and a 1200-column overview), as
+/// rekordbox lays them out: each band's levels 0–127, and in `PWVC` each
+/// band's level its peak stands for (the peak is 1.27 of it; never under
+/// 80).
+fn three_band_analysis(audio: &rofloxbox_audio::TrackAudio, file_path: &str) -> AnlzFile {
+    let bands = rofloxbox_audio::band_waveform(audio);
+    let peaks: [f32; 3] = std::array::from_fn(|b| {
+        bands.iter().map(|c| c[b]).fold(0f32, f32::max).max(1e-6)
+    });
+    // Levels show louder than amplitudes would (rekordbox's are fuller).
+    let level =
+        |v: f32, b: usize| ((v / peaks[b]).clamp(0.0, 1.0).powf(0.7) * 127.0).round() as u8;
+    let detail: Vec<u8> = bands.iter().flat_map(|c| [0, 1, 2].map(|b| level(c[b], b))).collect();
+    const OVERVIEW: usize = 1200;
+    let columns = detail.len() / 3;
+    let overview: Vec<u8> = (0..OVERVIEW)
+        .flat_map(|i| {
+            let from = i * columns / OVERVIEW;
+            let to = ((i + 1) * columns / OVERVIEW).max(from + 1).min(columns.max(1));
+            let band = |b: usize| {
+                (from..to).map(|c| detail.get(c * 3 + b).copied().unwrap_or(0)).max().unwrap_or(0)
+            };
+            [0, 1, 2].map(band)
+        })
+        .collect();
+    let peak_level = |b: usize| -> u16 {
+        let top = (0..columns).map(|c| detail[c * 3 + b]).max().unwrap_or(0);
+        ((f32::from(top) / 1.27).round() as u16).max(80)
+    };
+    let mut pwvc = b"PWVC".to_vec();
+    pwvc.extend(14u32.to_be_bytes());
+    pwvc.extend(20u32.to_be_bytes());
+    pwvc.extend([0, 0]);
+    for b in 0..3 {
+        pwvc.extend(peak_level(b).to_be_bytes());
+    }
+    let waveform = |kind, data| Section::Waveform(Waveform { kind, entry_len: 3, data });
+    AnlzFile {
+        sections: vec![
+            Section::Path(file_path.to_owned()),
+            waveform(WaveformKind::ThreeBandDetail, detail),
+            waveform(WaveformKind::ThreeBandPreview, overview),
+            Section::Unknown { tag: *b"PWVC", bytes: pwvc },
+        ],
+    }
+}
+
 /// `.DAT` and `.EXT` worked out from the audio, in rekordbox's section order.
 fn own_analysis(
-    audio: &deckhand_audio::TrackAudio,
+    audio: &rofloxbox_audio::TrackAudio,
     file_path: &str,
     track: &CollectionTrack,
     method: AnalysisMethod,
 ) -> (AnlzFile, AnlzFile) {
-    let peaks = deckhand_audio::peak_waveform(audio);
-    let bands = deckhand_audio::band_waveform(audio);
+    let peaks = rofloxbox_audio::peak_waveform(audio);
+    let bands = rofloxbox_audio::band_waveform(audio);
     // As floats, once, for rekordbox's analyses.
     let samples = audio.to_f32();
     let top = peaks.iter().copied().fold(0f32, f32::max).max(1e-6);
@@ -663,9 +737,9 @@ fn own_analysis(
     // the peaks.
     let (preview, tiny): (Vec<u8>, Vec<u8>) = match method {
         AnalysisMethod::Rekordbox => {
-            deckhand_analysis::preview::preview(&samples, audio.sample_rate)
+            rofloxbox_analysis::preview::preview(&samples, audio.sample_rate)
         }
-        AnalysisMethod::Deckhand => (
+        AnalysisMethod::RofLoxBox => (
             squeeze(400).into_iter().map(|(h, w)| mono(h, w)).collect(),
             squeeze(100)
                 .into_iter()
@@ -678,9 +752,9 @@ fn own_analysis(
     // from the bands.
     let color: Vec<u16> = match method {
         AnalysisMethod::Rekordbox => {
-            deckhand_analysis::waveform::color_detail(&samples, audio.sample_rate)
+            rofloxbox_analysis::waveform::color_detail(&samples, audio.sample_rate)
         }
-        AnalysisMethod::Deckhand => (0..peaks.len())
+        AnalysisMethod::RofLoxBox => (0..peaks.len())
             .map(|i| {
                 let [low, mid, high] = bands.get(i).copied().unwrap_or([0.0; 3]);
                 let channel = |v: f32| u16::from((v.clamp(0.0, 1.0) * 7.0).round() as u8);
@@ -693,9 +767,9 @@ fn own_analysis(
     // columns as the colour one.
     let detail: Vec<u8> = match method {
         AnalysisMethod::Rekordbox => {
-            deckhand_analysis::waveform::mono_detail(&samples, audio.sample_rate)
+            rofloxbox_analysis::waveform::mono_detail(&samples, audio.sample_rate)
         }
-        AnalysisMethod::Deckhand => (0..color.len()).map(|i| mono(level(i), highs(i))).collect(),
+        AnalysisMethod::RofLoxBox => (0..color.len()).map(|i| mono(level(i), highs(i))).collect(),
     };
     let color: Vec<u8> = color.iter().flat_map(|v| v.to_be_bytes()).collect();
     let waveform = |kind, entry_len, data| Section::Waveform(Waveform { kind, entry_len, data });
@@ -704,7 +778,9 @@ fn own_analysis(
         Section::Cues(CueList { kind, extended: false, memory_count: u32::MAX, cues: Vec::new() })
     };
 
-    let mut dat = vec![Section::Path(file_path.to_owned())];
+    // rekordbox's own files have the VBR index next, all zeros but for some
+    // MP3s (401 entries).
+    let mut dat = vec![Section::Path(file_path.to_owned()), Section::Vbr(vec![0; 401])];
     let grid = collection_grid(track);
     if !grid.beats.is_empty() {
         dat.push(Section::BeatGrid(grid));
@@ -732,7 +808,7 @@ fn own_analysis(
     // The colour overview, which only the rekordbox-compatible analysis has.
     if method == AnalysisMethod::Rekordbox {
         let overview =
-            deckhand_analysis::waveform::color_overview(&samples, audio.sample_rate);
+            rofloxbox_analysis::waveform::color_overview(&samples, audio.sample_rate);
         let data = overview.iter().flatten().map(|&b| b as u8).collect();
         ext.push(waveform(WaveformKind::ColorPreview, 6, data));
     }
@@ -747,7 +823,7 @@ mod tests {
     /// in order, the active loop flagged, entries rekordbox wrote kept.
     #[test]
     fn basic_memory_list_flags_the_active_loop() {
-        let cue = |start: f64, end: Option<f64>, active| deckhand_library::Cue {
+        let cue = |start: f64, end: Option<f64>, active| rofloxbox_library::Cue {
             kind: CueKind::Memory,
             start,
             end,
@@ -803,14 +879,91 @@ mod tests {
 mod export_tests {
     use super::*;
 
-    /// Imports the export in `DECKHAND_TEST_EXPORT` into a collection, then
+    /// A one-second 44.1 kHz stereo WAV of a quiet tone.
+    fn wav(path: &Path, hz: f32) {
+        let frames = 44_100u32;
+        let mut bytes = Vec::new();
+        bytes.extend(b"RIFF");
+        bytes.extend((36 + frames * 4).to_le_bytes());
+        bytes.extend(b"WAVEfmt ");
+        bytes.extend(16u32.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend(2u16.to_le_bytes());
+        bytes.extend(44_100u32.to_le_bytes());
+        bytes.extend((44_100u32 * 4).to_le_bytes());
+        bytes.extend(4u16.to_le_bytes());
+        bytes.extend(16u16.to_le_bytes());
+        bytes.extend(b"data");
+        bytes.extend((frames * 4).to_le_bytes());
+        for i in 0..frames {
+            let v = ((i as f32 * hz * std::f32::consts::TAU / 44_100.0).sin() * 8000.0) as i16;
+            bytes.extend(v.to_le_bytes());
+            bytes.extend(v.to_le_bytes());
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Tracks dropped on a stick's playlist go after the ones it has, in
+    /// the shared form libraries hand tracks over in.
+    #[test]
+    fn adds_tracks_to_a_playlist_on_the_stick() {
+        let temp = std::env::temp_dir().join(format!("rofloxbox-add-to-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let mut collection = rofloxbox_library::Collection::default();
+        let files: Vec<PathBuf> = (0..2).map(|i| temp.join(format!("music/T{i}.wav"))).collect();
+        for (i, file) in files.iter().enumerate() {
+            wav(file, 220.0 * (i + 1) as f32);
+        }
+        let scanned = files
+            .iter()
+            .map(|f| rofloxbox_library::read_file(f).unwrap())
+            .collect();
+        collection.merge(scanned);
+        let stick = temp.join("stick");
+        let export = |tracks: Vec<CollectionTrack>, add_to| ExportRequest {
+            root: stick.clone(),
+            playlist: "Set".into(),
+            add_to,
+            tracks,
+            key_notation: KeyNotation::Alphanumeric,
+            analysis: AnalysisMethod::RofLoxBox,
+        };
+        let first = collection.tracks[0].clone();
+        run(&export(vec![first], None), &AtomicUsize::new(0), &AtomicBool::new(false)).unwrap();
+        let on_stick = crate::library::UsbLibrary::open(&stick).unwrap();
+        let set = on_stick.playlists.iter().find(|p| p.name == "Set").unwrap().id;
+        // Handed over and taken back, as a drop does.
+        let shared = rofloxbox_library::XmlTrack::from_track(&collection.tracks[1]);
+        let added = run(
+            &export(vec![shared.to_track(1)], Some(set)),
+            &AtomicUsize::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!((added.added, added.replaced), (1, false));
+        let on_stick = crate::library::UsbLibrary::open(&stick).unwrap();
+        let row = on_stick.playlists.iter().find(|p| p.id == set).unwrap();
+        let titles: Vec<String> = row
+            .track_ids
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|id| on_stick.library.track(*id).unwrap().track.title.clone())
+            .collect();
+        assert_eq!(titles, ["T0", "T1"]);
+        assert_eq!(on_stick.playlists.iter().filter(|p| p.track_ids.is_some()).count(), 1);
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    /// Imports the export in `ROFLOXBOX_TEST_EXPORT` into a collection, then
     /// exports it to a new stick (skipped without it).
     #[test]
     fn exports_to_a_new_stick_and_again() {
-        let Some(source) = std::env::var_os("DECKHAND_TEST_EXPORT").map(PathBuf::from) else {
+        let Some(source) = std::env::var_os("ROFLOXBOX_TEST_EXPORT").map(PathBuf::from) else {
             return;
         };
-        let temp = std::env::temp_dir().join(format!("deckhand-export-{}", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("rofloxbox-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         // Into a collection.
         let library = crate::library::UsbLibrary::open(&source).unwrap();
@@ -821,12 +974,12 @@ mod export_tests {
             playlists: Vec::new(),
         };
         let imported = crate::usb_import::run_for_tests(&request).unwrap();
-        let mut collection = deckhand_library::Collection::default();
+        let mut collection = rofloxbox_library::Collection::default();
         collection.import_into(imported.library, "USB test", true);
         let mut tracks = collection.tracks.clone();
         assert!(tracks.len() >= 2);
         // One track with rekordbox's analysis and an extra cue, one without.
-        tracks[0].cues.push(deckhand_library::Cue {
+        tracks[0].cues.push(rofloxbox_library::Cue {
             kind: CueKind::Hot(7),
             start: 1.5,
             end: None,
@@ -837,6 +990,7 @@ mod export_tests {
         tracks[1].analysis = None;
         let stick = temp.join("stick");
         let request = ExportRequest {
+            add_to: None,
             root: stick.clone(),
             playlist: "Exported".into(),
             tracks: vec![tracks[0].clone(), tracks[1].clone(), tracks[0].clone()],

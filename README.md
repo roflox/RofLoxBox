@@ -1,7 +1,5 @@
 # RofLoxBox
 
-(Working name in the code: deckhand.)
-
 A DJ app for macOS, Windows and Linux, written in Rust: two or four decks,
 a full mixer with effects, live stems, a library that works with rekordbox
 and Pioneer DJ / AlphaTheta gear, and a recorder that keeps every move of a
@@ -29,8 +27,8 @@ changes back to rekordbox**, make a backup of the library in rekordbox:
   while rekordbox runs.
 - RofLoxBox keeps a copy of the library from before each save, in
   `rekordbox-backups` next to its settings
-  (`~/Library/Application Support/deckhand/` on macOS,
-  `%APPDATA%\deckhand\` on Windows). That is a safety net, not a
+  (`~/Library/Application Support/RofLoxBox/` on macOS,
+  `%APPDATA%\RofLoxBox\` on Windows). That is a safety net, not a
   replacement for your own backup.
 - RofLoxBox is not made, endorsed or supported by AlphaTheta or Pioneer DJ;
   rekordbox is their trademark. Don't ask them for help with a library
@@ -42,7 +40,7 @@ changes back to rekordbox**, make a backup of the library in rekordbox:
 
 - Two or four decks with scrolling and overview waveforms (rekordbox's RGB
   look, or CDJ-style 3-band), beat grids, hot cues, memory cues and loops.
-  **Preferences → Waveform detail → High** draws the deck waveforms four
+  **Preferences → View → Waveforms → High** draws the deck waveforms four
   times finer than rekordbox's analysis.
 - CUE / PLAY, SYNC with a master deck, quantize, slip, vinyl mode, beat
   loops and loop resizing, beat jump, GATE (hot cues play only while held)
@@ -119,7 +117,7 @@ The screen is yours to arrange, all from the **View** menu:
   views in one click. **Export presets…** writes them to a file and
   **Import presets…** reads them back, to keep them safe or take them to
   another computer.
-- **Preferences → Appearance**: dark, light, or following the system, and
+- **Preferences → View**: dark, light, or following the system, and
   the text size in percent.
 
 ### Controllers and keyboard
@@ -219,11 +217,11 @@ Open a session:
 ## Building and running
 
 ```sh
-cargo run --release -p deckhand-app   # the app
+cargo run --release -p rofloxbox-app   # the app
 cargo test
 ```
 
-The `deckhand` command-line tool reads and rewrites Pioneer formats:
+The `rofloxbox` command-line tool reads and rewrites Pioneer formats:
 
 ```sh
 cargo run -- pdb info      /Volumes/USB/PIONEER/rekordbox/export.pdb
@@ -232,11 +230,11 @@ cargo run -- pdb playlists /Volumes/USB/PIONEER/rekordbox/export.pdb
 cargo run -- pdb tags      /Volumes/USB/PIONEER/rekordbox/exportExt.pdb
 cargo run -- anlz          /Volumes/USB/PIONEER/USBANLZ/P016/0000875E/ANLZ0000.EXT
 cargo run -- settings      /Volumes/USB/PIONEER/MYSETTING.DAT
-cargo run -- usb rewrite   /Volumes/USB /Volumes/OTHER_USB   # rewrite an export with deckhand's writers
+cargo run -- usb rewrite   /Volumes/USB /Volumes/OTHER_USB   # rewrite an export with RofLoxBox's writers
 ```
 
 Settings, mappings, caches and backups live in
-`~/Library/Application Support/deckhand/` on macOS and `%APPDATA%\deckhand\`
+`~/Library/Application Support/RofLoxBox/` on macOS and `%APPDATA%\RofLoxBox\`
 on Windows.
 
 ### Installers
@@ -278,13 +276,13 @@ The icon is `packaging/icon.svg`; `packaging/make-icons.sh` renders the
 
 ## Crates
 
-- `crates/formats` (`deckhand-formats`): Pioneer on-disk formats
-- `crates/cli` (`deckhand`): command-line tool
-- `crates/library` (`deckhand-library`): deckhand's own collection
+- `crates/formats` (`rofloxbox-formats`): Pioneer on-disk formats
+- `crates/cli` (`rofloxbox`): command-line tool
+- `crates/library` (`rofloxbox-library`): RofLoxBox's own collection
   (`collection.json`), folder scanning and tag reading (`lofty`)
-- `crates/audio` (`deckhand-audio`): decoding and the real-time mixer
-- `crates/control` (`deckhand-control`): MIDI input, mappings, learn mode
-- `crates/app` (`deckhand-app`): the desktop application
+- `crates/audio` (`rofloxbox-audio`): decoding and the real-time mixer
+- `crates/control` (`rofloxbox-control`): MIDI input, mappings, learn mode
+- `crates/app` (`rofloxbox-app`): the desktop application
 
 ## Support me
 

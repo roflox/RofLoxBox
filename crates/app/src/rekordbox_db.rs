@@ -1,12 +1,12 @@
 //! Reading rekordbox's own library (`master.db`): tracks with their tags,
 //! hot cues, memory cues and loops, the playlist tree, and the beat grids
 //! from rekordbox's analysis files beside it. With Preferences allowing it,
-//! deckhand's changes are written back (`rekordbox_save`), with a copy of
+//! RofLoxBox's changes are written back (`rekordbox_save`), with a copy of
 //! the library kept first (and rekordbox closed, if Preferences say so).
 //!
 //! The database is SQLCipher (encrypted SQLite), opened like rekordbox opens
 //! it: SQLCipher decrypts the pages it reads and encrypts the ones it
-//! writes, with its write-ahead log beside the file. deckhand doesn't carry
+//! writes, with its write-ahead log beside the file. RofLoxBox doesn't carry
 //! the passphrase: it is fetched from the pyrekordbox project, which
 //! publishes it (or entered in Preferences), and kept in the settings.
 
@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use deckhand_formats::anlz::AnlzFile;
-use deckhand_library::{Cue, CueKind, ScannedFile, XmlLibrary, XmlNode, XmlTrack, file_stamp};
+use rofloxbox_formats::anlz::AnlzFile;
+use rofloxbox_library::{Cue, CueKind, ScannedFile, XmlLibrary, XmlNode, XmlTrack, file_stamp};
 use rusqlite::OptionalExtension;
 
 use crate::usb_import::grid_markers;
@@ -90,7 +90,7 @@ pub fn fetch_key() -> Result<String> {
         Some(line[start..start + line[start..].find('"')?].to_owned())
     };
     let (Some(blob), Some(mask)) = (quoted("BLOB = "), quoted("BLOB_KEY = ")) else {
-        bail!("pyrekordbox no longer publishes the rekordbox key where deckhand looks");
+        bail!("pyrekordbox no longer publishes the rekordbox key where RofLoxBox looks");
     };
     deobfuscate(&blob, mask.as_bytes())
 }
@@ -437,7 +437,7 @@ fn read(db: &rusqlite::Connection, share: &Path) -> Result<XmlLibrary> {
         tracks.push(XmlTrack {
             location: path.to_string_lossy().into_owned(),
             file,
-            rating: number(14)?.clamp(0, 5) as u8,
+            rating: Some(number(14)?.clamp(0, 5) as u8),
             color: u8::try_from(number(16)?).ok().filter(|c| (1..=8).contains(c)),
             play_count: u32::try_from(number(17)?).unwrap_or(0),
             added,
@@ -612,7 +612,7 @@ pub(crate) mod tests {
 
     /// A temporary file name for a test library.
     pub(crate) fn temporary(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("deckhand-rb-{name}-{}.db", std::process::id()))
+        std::env::temp_dir().join(format!("rofloxbox-rb-{name}-{}.db", std::process::id()))
     }
 
     #[test]
@@ -636,7 +636,7 @@ pub(crate) mod tests {
         assert_eq!((one.file.title.as_str(), one.file.artist.as_str()), ("One", "Artist"));
         assert_eq!(one.file.bpm, Some(174.0));
         assert_eq!(one.file.key.as_deref(), Some("8A"));
-        assert_eq!((one.rating, one.color, one.play_count), (4, Some(3), 7));
+        assert_eq!((one.rating, one.color, one.play_count), (Some(4), Some(3), 7));
         assert_eq!(one.added, Some(1_740_355_200));
         let cues: Vec<_> = one.cues.iter().map(|c| (c.kind, c.start, c.end, c.color)).collect();
         assert_eq!(
@@ -702,7 +702,7 @@ pub(crate) mod tests {
     }
 
     /// Reads this computer's rekordbox library, fetching the key:
-    /// `cargo test -p deckhand-app real_library -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-app real_library -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_library() {

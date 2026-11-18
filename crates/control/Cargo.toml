@@ -1,5 +1,5 @@
 [package]
-name = "deckhand-control"
+name = "rofloxbox-control"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true

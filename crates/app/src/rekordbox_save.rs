@@ -1,4 +1,4 @@
-//! Saving deckhand's changes into rekordbox's library (`master.db`): track
+//! Saving RofLoxBox's changes into rekordbox's library (`master.db`): track
 //! tags, ratings and colours, hot cues, memory cues and loops, beat grids
 //! (in rekordbox's analysis files beside the database), and the playlists
 //! of the collection's `rekordbox` folder: made, renamed, moved, reordered
@@ -8,15 +8,15 @@
 //! Rows are written the way rekordbox writes them: each changed track or
 //! playlist takes the next number of the library's change count, and the
 //! playlists are listed in `masterPlaylists6.xml` too. Saving needs the
-//! library as deckhand last read it: when rekordbox changed it since, its
+//! library as RofLoxBox last read it: when rekordbox changed it since, its
 //! changes would be lost, so nothing is written.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use deckhand_formats::anlz::{AnlzFile, Section};
-use deckhand_library::{Cue, CueKind, Node, NodeKind, Track};
+use rofloxbox_formats::anlz::{AnlzFile, Section};
+use rofloxbox_library::{Cue, CueKind, Node, NodeKind, Track};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::deck::{KeyNotation, format_key, parse_key};
@@ -32,14 +32,14 @@ pub struct Snapshot {
     /// (the ones at its top without a parent); `None` without that folder,
     /// leaving rekordbox's playlists as they are.
     pub playlists: Option<Vec<Node>>,
-    /// rekordbox's change count when deckhand last read the library.
+    /// rekordbox's change count when RofLoxBox last read the library.
     read_count: i64,
 }
 
 impl Snapshot {
     /// What of `collection` goes into rekordbox; `None` if it was never
     /// read from rekordbox (saving would undo all of rekordbox's changes).
-    pub fn of(collection: &deckhand_library::Collection) -> Option<Self> {
+    pub fn of(collection: &rofloxbox_library::Collection) -> Option<Self> {
         Some(Self {
             read_count: collection.rekordbox_count?,
             tracks: collection.tracks.clone(),
@@ -59,6 +59,13 @@ pub struct Saved {
     pub grids: usize,
     /// Tracks new to rekordbox.
     pub added: usize,
+    /// Tracks whose entry in rekordbox moved to the converted file that
+    /// replaced the original (or had none to move): done with.
+    pub moved: Vec<u32>,
+    /// Tracks given RofLoxBox's analysis (waveforms, grid) in rekordbox.
+    pub analysed: usize,
+    /// Tracks put into rekordbox whose audio couldn't be read for it.
+    pub unanalysed: usize,
     /// Playlists and folders made, changed or deleted.
     pub playlists: usize,
     /// rekordbox's ids of the playlists and folders made, by node id.
@@ -69,7 +76,7 @@ pub struct Saved {
 
 impl Saved {
     pub fn is_empty(&self) -> bool {
-        self.tracks + self.cues + self.grids + self.added + self.playlists == 0
+        self.tracks + self.cues + self.grids + self.added + self.playlists + self.moved.len() == 0
     }
 }
 
@@ -100,8 +107,8 @@ pub fn save(
     let written = write(&closed, path, key, backups, |db, usn| {
         if usn.0 != snapshot.read_count {
             bail!(
-                "rekordbox changed its library since deckhand read it, and saving would undo \
-                 that. Read the rekordbox library again (deckhand's changes to it are replaced), \
+                "rekordbox changed its library since RofLoxBox read it, and saving would undo \
+                 that. Read the rekordbox library again (RofLoxBox's changes to it are replaced), \
                  then save"
             );
         }
@@ -116,10 +123,12 @@ pub fn save(
         if !plan.list.is_empty() && list.is_file() {
             update_playlist_list(&list, &plan.list, backup)?;
         }
-        for (dat, track) in &plan.grids {
+        // Side by side; the first that failed is told.
+        let written = parallel(&plan.grids, |(dat, track)| {
             write_grid(dat, track, &share, backup)
-                .with_context(|| format!("writing the beat grid of {}", track.title))?;
-        }
+                .with_context(|| format!("writing the beat grid of {}", track.title))
+        });
+        written.into_iter().collect::<Result<Vec<()>>>()?;
     }
     Ok(plan.saved)
 }
@@ -163,6 +172,11 @@ struct Library<'a> {
     /// Key ids with the key they stand for.
     keys: Vec<(String, (i32, bool))>,
     notation: KeyNotation,
+    /// Tracks added without analysis (their audio couldn't be read).
+    unanalysed: usize,
+    /// Analysis files to write (row id, UUID, the track, what), all at
+    /// once at the end, side by side.
+    analyses: Vec<(String, String, Track, AnalysisJob)>,
 }
 
 impl<'a> Library<'a> {
@@ -210,7 +224,18 @@ impl<'a> Library<'a> {
         }
         drop(rows);
         drop(statement);
-        Ok(Self { db, usn, now: now(), contents, paths, names, keys, notation })
+        Ok(Self {
+            db,
+            usn,
+            now: now(),
+            contents,
+            paths,
+            names,
+            keys,
+            notation,
+            unanalysed: 0,
+            analyses: Vec::new(),
+        })
     }
 
     fn save(&mut self, snapshot: &Snapshot, share: &Path) -> Result<Plan> {
@@ -225,6 +250,14 @@ impl<'a> Library<'a> {
                 }
             }
         }
+        // Entries moved to the converted files that replaced their originals,
+        // before anything is matched by file.
+        for track in &snapshot.tracks {
+            if let Some(old) = &track.rekordbox_path {
+                self.move_track(old, track)?;
+                plan.saved.moved.push(track.id);
+            }
+        }
         for id in wanted {
             let Some(track) = by_id.get(&id) else { continue };
             let path = track.path.to_string_lossy().into_owned();
@@ -233,8 +266,8 @@ impl<'a> Library<'a> {
                 plan.saved.added += 1;
             }
         }
-        // A file rekordbox has twice is unchanged when deckhand has it as
-        // either; changed, both get deckhand's.
+        // A file rekordbox has twice is unchanged when RofLoxBox has it as
+        // either; changed, both get RofLoxBox's.
         for track in &snapshot.tracks {
             let path = track.path.to_string_lossy();
             let Some(rows) = self.contents.get(path.as_ref()).cloned() else { continue };
@@ -258,6 +291,27 @@ impl<'a> Library<'a> {
                 }
                 plan.saved.cues += 1;
             }
+            // In rekordbox without analysis (added before RofLoxBox wrote
+            // it): it gets RofLoxBox's, so rekordbox shows its waveform.
+            if track.path.is_file() {
+                for row in &rows {
+                    let dat = share.join(row.analysis.trim_start_matches('/'));
+                    let job = if row.analysis.is_empty() {
+                        AnalysisJob::Missing
+                    } else if !dat.is_file() {
+                        // Its files are gone (deleted, or a library moved
+                        // without them): written again where they belong.
+                        AnalysisJob::Rewrite(row.analysis.clone())
+                    } else if !dat.with_extension("2EX").is_file() {
+                        // Analysed before RofLoxBox wrote 3-band waveforms
+                        // (rekordbox's own analyses have them).
+                        AnalysisJob::ThreeBand(row.analysis.clone())
+                    } else {
+                        continue;
+                    };
+                    self.analyses.push((row.id.clone(), row.uuid.clone(), track.clone(), job));
+                }
+            }
             let mut grids = Vec::new();
             let mut same = false;
             for row in &rows {
@@ -278,7 +332,64 @@ impl<'a> Library<'a> {
         if let Some(playlists) = &snapshot.playlists {
             self.save_playlists(playlists, &by_id, &mut plan)?;
         }
+        self.write_analyses(share, &mut plan)?;
         Ok(plan)
+    }
+
+    /// Writes the queued analysis files, several tracks at a time (each is
+    /// worked out from its audio); a track whose audio can't be read is
+    /// left for rekordbox to analyse, as before.
+    fn write_analyses(&mut self, share: &Path, plan: &mut Plan) -> Result<()> {
+        plan.saved.unanalysed += self.unanalysed;
+        let jobs = std::mem::take(&mut self.analyses);
+        let written = parallel(&jobs, |(_, uuid, track, job)| match job {
+            AnalysisJob::ThreeBand(analysis) => {
+                let name = track.path.file_name()?.to_string_lossy().into_owned();
+                crate::usb_export::write_three_band(share, analysis, &format!("?/{name}"), track)
+                    .ok()
+                    .map(|()| analysis.clone())
+            }
+            AnalysisJob::Rewrite(analysis) => {
+                let name = track.path.file_name()?.to_string_lossy().into_owned();
+                crate::usb_export::write_analysis(
+                    share,
+                    analysis,
+                    &format!("?/{name}"),
+                    track,
+                    crate::deck::AnalysisMethod::Rekordbox,
+                )
+                .ok()
+                .map(|()| analysis.clone())
+            }
+            _ => write_track_analysis(share, uuid, track),
+        });
+        for ((id, _, _, job), analysis) in jobs.iter().zip(written) {
+            match (analysis, job) {
+                (Some(_), AnalysisJob::Added) => {}
+                (Some(_), AnalysisJob::ThreeBand(_) | AnalysisJob::Rewrite(_)) => {
+                    plan.saved.analysed += 1;
+                }
+                // A track rekordbox had without analysis: pointed at it now.
+                (Some(analysis), AnalysisJob::Missing) => {
+                    self.db.execute(
+                        "UPDATE djmdContent SET AnalysisDataPath = ?2, Analysed = ?3,
+                            rb_local_usn = ?4, updated_at = ?5 WHERE ID = ?1",
+                        params![id, analysis, ANALYSED, self.usn.next(), self.now],
+                    )?;
+                    plan.saved.analysed += 1;
+                }
+                // Added just now: as before, without (rekordbox analyses it).
+                (None, AnalysisJob::Added) => {
+                    self.db.execute(
+                        "UPDATE djmdContent SET AnalysisDataPath = '', Analysed = 0 WHERE ID = ?1",
+                        [id],
+                    )?;
+                    plan.saved.unanalysed += 1;
+                }
+                (None, _) => {}
+            }
+        }
+        Ok(())
     }
 
     /// An id for a new row of `table`: a random number not taken yet, as
@@ -343,20 +454,55 @@ impl<'a> Library<'a> {
         Ok(Some(id))
     }
 
-    /// Adds a track to rekordbox's collection, as its import of a file does.
+    /// Moves rekordbox's entries of the file at `old` to `track`'s file (a
+    /// converted one that replaced it): its file's details change, nothing
+    /// else (cues, grid, analysis, playlists stay).
+    fn move_track(&mut self, old: &Path, track: &Track) -> Result<()> {
+        let old = old.to_string_lossy().into_owned();
+        let new = track.path.to_string_lossy().into_owned();
+        if old == new {
+            return Ok(());
+        }
+        let Some(rows) = self.contents.remove(&old) else { return Ok(()) };
+        let file_name = track.path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let file_size = std::fs::metadata(&track.path).map_or(track.file_size, |m| m.len());
+        // As the converted file is: its bitrate, sample rate, bit depth and
+        // length (the collection's where the file doesn't say).
+        let file = audio_properties(&track.path);
+        let bitrate = file.bitrate.or(track.bitrate).unwrap_or(0);
+        let sample_rate = file.sample_rate.or(track.sample_rate).unwrap_or(0);
+        let length = file.length.unwrap_or(track.duration).round() as i64;
+        for row in &rows {
+            self.db.execute(
+                "UPDATE djmdContent SET FolderPath = ?2, FileNameL = ?3, FileType = ?4,
+                    BitRate = ?5, SampleRate = ?6, BitDepth = ?7, Length = ?8, FileSize = ?9,
+                    rb_local_usn = ?10, updated_at = ?11 WHERE ID = ?1",
+                params![
+                    row.id,
+                    new,
+                    file_name,
+                    file_type(&track.path).unwrap_or(0),
+                    bitrate,
+                    sample_rate,
+                    file.bit_depth,
+                    length,
+                    file_size as i64,
+                    self.usn.next(),
+                    self.now
+                ],
+            )?;
+            self.paths.insert(row.id.clone(), new.clone());
+        }
+        self.contents.entry(new).or_default().extend(rows);
+        Ok(())
+    }
+
+    /// Adds a track to rekordbox's collection, as its import of a file does,
+    /// with its analysis (waveforms, grid, cues) to go into rekordbox's
+    /// `share` folder so rekordbox needn't analyse it again.
     fn add_track(&mut self, track: &Track) -> Result<()> {
         let path = track.path.to_string_lossy().into_owned();
-        let extension =
-            track.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let file_type = match extension.as_str() {
-            "mp3" => 1,
-            "mp4" => 3,
-            "m4a" | "aac" => 4,
-            "flac" => 5,
-            "wav" => 11,
-            "aif" | "aiff" => 12,
-            _ => return Ok(()),
-        };
+        let Some(file_type) = file_type(&track.path) else { return Ok(()) };
         let id = self.new_id("djmdContent", "ID")?;
         let file_id = self.new_id("djmdContent", "rb_file_id")?;
         let uuid = uuid()?;
@@ -380,6 +526,10 @@ impl<'a> Library<'a> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let file_name = track.path.file_name().map(|n| n.to_string_lossy().into_owned());
         let file_size = std::fs::metadata(&track.path).map_or(track.file_size, |m| m.len());
+        // Its analysis files are written at the end (see `write_analyses`).
+        let analysis = analysis_path(&uuid);
+        let analysed = if analysis.is_some() { ANALYSED } else { 0 };
+        self.unanalysed += usize::from(analysis.is_none());
         self.db.execute(
             "INSERT INTO djmdContent (ID, FolderPath, FileNameL, Title, ArtistID, AlbumID,
                 GenreID, LabelID, KeyID, BPM, Length, TrackNo, BitRate, Commnt, FileType,
@@ -387,10 +537,10 @@ impl<'a> Library<'a> {
                 FileSize, DiscNo, SampleRate, DateCreated, ContentLink, HotCueAutoLoad,
                 DeliveryControl, SamplerTrackInfo, SamplerPlayOffset, SamplerGain,
                 VideoAssociate, LyricStatus, ServiceID, ExtInfo, rb_file_id, DeviceID, UUID,
-                rb_local_usn, created_at, updated_at)
+                rb_local_usn, created_at, updated_at, AnalysisDataPath, Analysed, BitDepth)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                 ?18, ?19, 0, ?20, ?1, ?21, 0, ?22, ?18, ?23, 'on', 'on', 0, 0, 0.0, '0', 0, 0,
-                'null', ?24, ?25, ?26, ?27, ?28, ?28)",
+                'null', ?24, ?25, ?26, ?27, ?28, ?28, ?29, ?30, ?31)",
             params![
                 id,
                 path,
@@ -420,10 +570,17 @@ impl<'a> Library<'a> {
                 uuid,
                 self.usn.next(),
                 self.now,
+                analysis.as_deref().unwrap_or(""),
+                analysed,
+                audio_properties(&track.path).bit_depth,
             ],
         )?;
         self.paths.insert(id.clone(), path.clone());
-        self.contents.entry(path).or_default().push(Content { id, uuid, analysis: String::new() });
+        if analysis.is_some() {
+            self.analyses.push((id.clone(), uuid.clone(), track.clone(), AnalysisJob::Added));
+        }
+        let analysis = analysis.unwrap_or_default();
+        self.contents.entry(path).or_default().push(Content { id, uuid, analysis });
         Ok(())
     }
 
@@ -635,7 +792,7 @@ impl<'a> Library<'a> {
     }
 
     /// Makes rekordbox's playlist tree that of `nodes`: rekordbox's
-    /// intelligent playlists, which deckhand doesn't show, keep their place.
+    /// intelligent playlists, which RofLoxBox doesn't show, keep their place.
     fn save_playlists(
         &mut self,
         nodes: &[Node],
@@ -675,7 +832,7 @@ impl<'a> Library<'a> {
             }
         }
 
-        // Deleted in deckhand: gone from rekordbox, with what they hold.
+        // Deleted in RofLoxBox: gone from rekordbox, with what they hold.
         let mut doomed: Vec<String> = rows
             .iter()
             .filter(|r| matches!(r.4, 0 | 1) && !claimed.contains(&r.0))
@@ -838,7 +995,7 @@ impl<'a> Library<'a> {
     }
 
     /// Makes a playlist's entries `wanted` (file paths, in order), keeping
-    /// the rows of tracks that stay, and entries of tracks deckhand doesn't
+    /// the rows of tracks that stay, and entries of tracks RofLoxBox doesn't
     /// have (streamed ones) where they were; returns whether anything
     /// changed.
     fn save_entries(&mut self, playlist: &str, wanted: &[String]) -> Result<bool> {
@@ -933,9 +1090,9 @@ impl<'a> Library<'a> {
 /// file.
 enum Grid {
     Same,
-    /// Changed in deckhand: the analysis file to write it into.
+    /// Changed in RofLoxBox: the analysis file to write it into.
     Differs(PathBuf),
-    /// No grid of rekordbox's to change (the track's is deckhand's own).
+    /// No grid of rekordbox's to change (the track's is RofLoxBox's own).
     None,
 }
 
@@ -971,6 +1128,117 @@ fn frames(ms: i64) -> i64 {
 }
 
 /// A random UUID (version 4), as rekordbox gives its rows.
+/// What to write of a track's analysis for rekordbox.
+enum AnalysisJob {
+    /// All of it, for a track added just now.
+    Added,
+    /// All of it, for a track rekordbox has without any.
+    Missing,
+    /// Just the 3-band waveforms (`.2EX`) beside the analysis at this path.
+    ThreeBand(String),
+    /// All of it again at this path, where its files are missing.
+    Rewrite(String),
+}
+
+/// What an audio file says of itself.
+struct AudioProperties {
+    bitrate: Option<u32>,
+    sample_rate: Option<u32>,
+    /// 16 for lossy files (as rekordbox has them).
+    bit_depth: u32,
+    length: Option<f64>,
+}
+
+fn audio_properties(path: &Path) -> AudioProperties {
+    use lofty::prelude::*;
+    let read = lofty::read_from_path(path).ok();
+    let properties = read.as_ref().map(|f| f.properties());
+    AudioProperties {
+        bitrate: properties.and_then(|p| p.audio_bitrate()),
+        sample_rate: properties.and_then(|p| p.sample_rate()),
+        bit_depth: properties.and_then(|p| p.bit_depth()).map_or(16, u32::from),
+        length: properties.map(|p| p.duration().as_secs_f64()).filter(|&s| s > 0.0),
+    }
+}
+
+/// rekordbox's number for an audio file's type; `None` for one it doesn't
+/// take.
+fn file_type(path: &Path) -> Option<i64> {
+    let extension = path.extension()?.to_string_lossy().to_lowercase();
+    Some(match extension.as_str() {
+        "mp3" => 1,
+        "mp4" => 3,
+        "m4a" | "aac" => 4,
+        "flac" => 5,
+        "wav" => 11,
+        "aif" | "aiff" => 12,
+        _ => return None,
+    })
+}
+
+/// Where rekordbox keeps the analysis of the track with `uuid`:
+/// `/PIONEER/USBANLZ/<its first 3>/<the rest>/ANLZ0000.DAT`.
+fn analysis_path(uuid: &str) -> Option<String> {
+    (uuid.len() > 3 && uuid.is_ascii())
+        .then(|| format!("/PIONEER/USBANLZ/{}/{}/ANLZ0000.DAT", &uuid[..3], &uuid[3..]))
+}
+
+/// `f` of each item, several at a time (all cores but one, at most six:
+/// each may hold a decoded track); in the items' order.
+fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = std::thread::available_parallelism()
+        .map_or(2, |n| n.get().saturating_sub(1).clamp(1, 6))
+        .min(items.len().max(1));
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let result = f(item);
+                    if let Ok(mut results) = results.lock() {
+                        results[i] = Some(result);
+                    }
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .map(|r| r.expect("every item is done once the threads are"))
+        .collect()
+}
+
+/// What rekordbox's `Analysed` says of a track it analysed itself (every
+/// one in its libraries we've seen).
+const ANALYSED: i64 = 105;
+
+/// Writes a track's analysis (`.DAT`, `.EXT`) where rekordbox keeps it for
+/// the track with `uuid` (`share/PIONEER/USBANLZ/<3>/<rest>/ANLZ0000.DAT`,
+/// as rekordbox names them): rekordbox's own if the track came with it,
+/// otherwise worked out from the audio, rekordbox's way. Returns the path
+/// for `AnalysisDataPath`; `None` if it couldn't be written.
+fn write_track_analysis(share: &Path, uuid: &str, track: &Track) -> Option<String> {
+    let analysis = analysis_path(uuid)?;
+    // rekordbox's newer files give just the file's name.
+    let name = track.path.file_name().map(|n| n.to_string_lossy().into_owned())?;
+    let written = crate::usb_export::write_analysis(
+        share,
+        &analysis,
+        &format!("?/{name}"),
+        track,
+        crate::deck::AnalysisMethod::Rekordbox,
+    );
+    // Unreadable audio: rekordbox analyses it itself, as before.
+    written.ok().map(|()| analysis)
+}
+
 fn uuid() -> Result<String> {
     let mut b = [0u8; 16];
     getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("no random numbers: {e}"))?;
@@ -996,7 +1264,7 @@ fn update_playlist_list(path: &Path, changes: &[ListChange], backup: &Backup) ->
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let updated = changed_playlist_list(&text, changes, chrono::Utc::now().timestamp_millis());
-    let temporary = path.with_extension("xml.deckhand");
+    let temporary = path.with_extension("xml.RofLoxBox");
     std::fs::write(&temporary, updated)
         .with_context(|| format!("writing {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
@@ -1078,7 +1346,7 @@ fn write_grid(dat: &Path, track: &Track, share: &Path, backup: &Backup) -> Resul
 }
 
 fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temporary = path.with_extension("deckhand");
+    let temporary = path.with_extension("RofLoxBox");
     std::fs::write(&temporary, bytes)
         .with_context(|| format!("writing {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
@@ -1089,8 +1357,8 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::rekordbox_db::tests::library;
-    use deckhand_formats::anlz::{Beat, BeatGrid};
-    use deckhand_library::{Collection, ScannedFile};
+    use rofloxbox_formats::anlz::{Beat, BeatGrid};
+    use rofloxbox_library::{Collection, ScannedFile};
 
     const LIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\r\n\
         <MASTER_PLAYLIST Version=\"3.0.0\" AutomaticSync=\"0\">\r\n  <PLAYLISTS>\r\n\
@@ -1105,7 +1373,7 @@ mod tests {
     /// new audio file `New.mp3`.
     fn folder(name: &str) -> PathBuf {
         let root =
-            std::env::temp_dir().join(format!("deckhand-rbsave-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("rofloxbox-rbsave-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("share/PIONEER/USBANLZ/a")).unwrap();
         library(&root.join("master.db"), "secret");
@@ -1155,6 +1423,132 @@ mod tests {
 
     fn node(c: &Collection, name: &str) -> u32 {
         c.nodes.iter().find(|n| n.name == name).unwrap().id
+    }
+
+    /// A track new to rekordbox goes in with RofLoxBox's analysis where
+    /// rekordbox keeps its own (named by the track's UUID), so rekordbox
+    /// shows its waveform without analysing it again.
+    #[test]
+    fn added_tracks_come_with_their_analysis() {
+        use rofloxbox_formats::anlz::WaveformKind;
+        let root = folder("analysis");
+        let backups = root.join("backups");
+        let mut c = collection(&root);
+        // Two seconds of a 440 Hz tone, 16-bit mono.
+        let rate = 44_100u32;
+        let samples: Vec<i16> = (0..rate * 2)
+            .map(|i| {
+                let phase = i as f32 * 440.0 * std::f32::consts::TAU / rate as f32;
+                (phase.sin() * 12_000.0) as i16
+            })
+            .collect();
+        let mut wav = Vec::new();
+        let data_len = samples.len() as u32 * 2;
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        for v in [2u16, 16] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+        let path = root.join("Tone.wav");
+        std::fs::write(&path, wav).unwrap();
+        c.merge(vec![ScannedFile {
+            path: path.clone(),
+            title: "Tone".into(),
+            duration: 2.0,
+            bpm: Some(120.0),
+            sample_rate: Some(rate),
+            ..ScannedFile::default()
+        }]);
+        let tone = c.tracks.iter().find(|t| t.path == path).unwrap().id;
+        let list = c.create("With tone", NodeKind::Playlist, Some(node(&c, "Sets")));
+        c.add_to_playlist(list, &[tone]);
+
+        let saved =
+            save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        assert_eq!((saved.added, saved.unanalysed), (1, 0), "{saved:?}");
+        let (uuid, analysis, analysed): (String, String, i64) = plain(&root)
+            .query_row(
+                "SELECT UUID, AnalysisDataPath, Analysed FROM djmdContent WHERE FolderPath = ?1",
+                [path.to_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            analysis,
+            format!("/PIONEER/USBANLZ/{}/{}/ANLZ0000.DAT", &uuid[..3], &uuid[3..])
+        );
+        assert_eq!(analysed, ANALYSED);
+        let dat = root.join("share").join(analysis.trim_start_matches('/'));
+        let waveforms = |file: &AnlzFile| -> Vec<WaveformKind> {
+            file.sections
+                .iter()
+                .filter_map(|s| match s {
+                    Section::Waveform(w) => Some(w.kind),
+                    _ => None,
+                })
+                .collect()
+        };
+        let dat_file = AnlzFile::open(&dat).unwrap();
+        assert!(waveforms(&dat_file).contains(&WaveformKind::Preview));
+        assert!(matches!(&dat_file.sections[0], Section::Path(p) if p == "?/Tone.wav"));
+        let ext = AnlzFile::open(dat.with_extension("EXT")).unwrap();
+        assert!(waveforms(&ext).contains(&WaveformKind::ColorDetail));
+        // The 3-band waveforms too, so rekordbox 7 needn't work them out.
+        let two_ex = AnlzFile::open(dat.with_extension("2EX")).unwrap();
+        assert_eq!(
+            waveforms(&two_ex),
+            [WaveformKind::ThreeBandDetail, WaveformKind::ThreeBandPreview]
+        );
+        let detail = two_ex.waveform(WaveformKind::ThreeBandDetail).unwrap();
+        assert_eq!(detail.data.len(), 300 * 3, "150 columns a second");
+        assert!(detail.data.iter().all(|&v| v <= 127));
+        let pwvc = |s: &Section| matches!(s, Section::Unknown { tag, .. } if tag == b"PWVC");
+        assert!(two_ex.sections.iter().any(pwvc));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A converted file that replaced its original: rekordbox's entry
+    /// moves to it (same row, cues and all), no second one is added.
+    #[test]
+    fn a_replaced_track_moves_in_rekordbox() {
+        let root = folder("moved");
+        let backups = root.join("backups");
+        let mut c = collection(&root);
+        let one = c.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap().id;
+        c.update_track(one, |t| {
+            t.rekordbox_path = Some(t.path.clone());
+            t.path = PathBuf::from("/music/One.mp3");
+            (t.bitrate, t.sample_rate) = (Some(320), Some(44_100));
+        });
+        // In a playlist rekordbox gets, where it would be added if unknown.
+        let list = c.create("Moved", NodeKind::Playlist, Some(node(&c, "Sets")));
+        c.add_to_playlist(list, &[one]);
+        let saved =
+            save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        assert_eq!((saved.moved.clone(), saved.added), (vec![one], 0), "{saved:?}");
+        let (path, file_type, bitrate): (String, i64, i64) = plain(&root)
+            .query_row(
+                "SELECT FolderPath, FileType, BitRate FROM djmdContent WHERE ID = 't1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((path.as_str(), file_type, bitrate), ("/music/One.mp3", 1, 320));
+        c.moved_in_rekordbox(&saved.moved);
+        assert!(c.track(one).unwrap().rekordbox_path.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The active loop goes to rekordbox's ActiveLoop and comes back from
@@ -1400,7 +1794,7 @@ mod tests {
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
 
-        // Read back, the library is what deckhand had.
+        // Read back, the library is what RofLoxBox had.
         let reread = collection(&root);
         let one = reread.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap();
         assert_eq!(one.cues.len(), 4);
@@ -1434,14 +1828,14 @@ mod tests {
     }
 
     /// Saves into a copy of a real rekordbox library (`master.db`,
-    /// `masterPlaylists6.xml`, `share/`) with a copy of deckhand's collection
+    /// `masterPlaylists6.xml`, `share/`) with a copy of RofLoxBox's collection
     /// beside it: unchanged first (nothing may change), then with a few
-    /// edits. `DECKHAND_RB_COPY=folder cargo test -p deckhand-app
+    /// edits. `ROFLOXBOX_RB_COPY=folder cargo test -p rofloxbox-app
     /// real_copy_save -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_copy_save() {
-        let root = PathBuf::from(std::env::var("DECKHAND_RB_COPY").unwrap());
+        let root = PathBuf::from(std::env::var("ROFLOXBOX_RB_COPY").unwrap());
         let path = root.join("master.db");
         let key = crate::rekordbox_db::fetch_key().unwrap();
         let backups = root.join("backups");
@@ -1459,7 +1853,7 @@ mod tests {
         c.rekordbox_count = Some(opened.count);
         let saved = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
         println!("unchanged: {saved:?}");
-        // Only tags edited in deckhand go over.
+        // Only tags edited in RofLoxBox go over.
         let edited = c.tracks.iter().filter(|t| !t.edited.is_empty()).count();
         assert!(saved.tracks <= edited);
         assert_eq!((saved.cues, saved.grids, saved.added, saved.playlists), (0, 0, 0, 0));
@@ -1478,14 +1872,14 @@ mod tests {
                 start: 30.0,
                 end: None,
                 color: Some([230, 40, 40]),
-                name: "deckhand".into(),
+                name: "RofLoxBox".into(),
                 active: false,
             })
         });
-        c.rename(list, &format!("{name} (deckhand)"));
+        c.rename(list, &format!("{name} (RofLoxBox)"));
         c.move_in_playlist(list, &[0], 3);
         let top = c.nodes.iter().find(|n| n.name == "rekordbox" && n.parent.is_none()).unwrap().id;
-        let made = c.create("deckhand test", NodeKind::Playlist, Some(top));
+        let made = c.create("RofLoxBox test", NodeKind::Playlist, Some(top));
         // A track rekordbox doesn't have, and a beat grid moved.
         let new = c
             .tracks
@@ -1536,8 +1930,8 @@ mod tests {
             .find(|q| q.kind == CueKind::Hot(free))
             .cloned();
         println!("cue read back: {cue:?}");
-        assert_eq!(cue.map(|q| (q.start, q.name)), Some((30.0, "deckhand".into())));
-        let renamed = back.nodes.iter().find(|n| n.name == format!("{name} (deckhand)")).unwrap();
+        assert_eq!(cue.map(|q| (q.start, q.name)), Some((30.0, "RofLoxBox".into())));
+        let renamed = back.nodes.iter().find(|n| n.name == format!("{name} (RofLoxBox)")).unwrap();
         let original = c.node(list).unwrap();
         let paths = |c: &Collection, ids: &[u32]| -> Vec<PathBuf> {
             ids.iter().map(|i| c.track(*i).unwrap().path.clone()).collect()
@@ -1546,7 +1940,7 @@ mod tests {
         assert!(
             back.nodes
                 .iter()
-                .any(|n| n.name == "deckhand test"
+                .any(|n| n.name == "RofLoxBox test"
                     && n.tracks.len() == 1 + usize::from(new.is_some()))
         );
         let moved = c.track(gridded).unwrap();

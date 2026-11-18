@@ -21,8 +21,8 @@ if [ "${1:-}" = "--universal" ]; then
 fi
 BINARIES=""
 for target in $TARGETS; do
-    cargo build --release -p deckhand-app --target "$target"
-    BINARIES="$BINARIES target/$target/release/deckhand-app"
+    cargo build --release -p rofloxbox-app --target "$target"
+    BINARIES="$BINARIES target/$target/release/rofloxbox-app"
 done
 DIST=target/dist
 APP=$DIST/RofLoxBox.app

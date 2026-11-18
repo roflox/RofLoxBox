@@ -3,13 +3,13 @@
 
 use std::path::PathBuf;
 
-use deckhand_library::NodeKind;
+use rofloxbox_library::NodeKind;
 use eframe::egui::{self, Key, Modifiers};
 
-use super::{DeckhandApp, Focus, Source};
+use super::{RofLoxBoxApp, Focus, Source};
 use crate::browser::TrackDrag;
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// A row clicked: alone, or with Cmd/Ctrl added to (or taken out of)
     /// the selection, or with Shift the rows from the current one to it.
     pub(super) fn click_track(&mut self, id: u32, position: usize, modifiers: Modifiers) {
@@ -24,7 +24,7 @@ impl DeckhandApp {
                 .or_else(|| rows.iter().position(|r| r.0 == anchor));
             if let (Some(from), Some(to)) = (from, at((id, position))) {
                 let (a, b) = (from.min(to), from.max(to));
-                self.marked = rows[a..=b].iter().map(|r| r.0).collect();
+                self.marked = rows[a..=b].iter().map(|r| r.1).collect();
                 // The anchor stays where the range started.
                 self.focus = Focus::Tracks;
                 return;
@@ -32,12 +32,12 @@ impl DeckhandApp {
         }
         if modifiers.command {
             if self.marked.is_empty()
-                && let Some(current) = self.selected
+                && let Some(current) = self.selected_position
             {
                 self.marked.insert(current);
             }
-            if !self.marked.remove(&id) {
-                self.marked.insert(id);
+            if !self.marked.remove(&position) {
+                self.marked.insert(position);
             }
         } else {
             self.marked.clear();
@@ -54,15 +54,16 @@ impl DeckhandApp {
         let mut seen = std::collections::HashSet::new();
         self.visible_rows()
             .into_iter()
+            .filter(|r| self.marked.contains(&r.1))
             .map(|r| r.0)
-            .filter(|id| self.marked.contains(id) && seen.insert(*id))
+            .filter(|id| seen.insert(*id))
             .collect()
     }
 
     /// Every track of the list shown.
     pub(super) fn select_all(&mut self) {
         let rows = self.visible_rows();
-        self.marked = rows.iter().map(|r| r.0).collect();
+        self.marked = rows.iter().map(|r| r.1).collect();
         if let Some(&(id, position)) = rows.first() {
             (self.selected, self.selected_position) = (Some(id), Some(position));
         }
@@ -72,20 +73,21 @@ impl DeckhandApp {
     /// A row started being dragged: it carries the selection when the row
     /// is part of it, otherwise just itself (which becomes the selection).
     pub(super) fn start_track_drag(&mut self, ctx: &egui::Context, id: u32, position: usize) {
-        if !self.marked.contains(&id) && self.selected != Some(id) {
+        let selected = self.selected == Some(id) && self.selected_position == Some(position);
+        if !self.marked.contains(&position) && !selected {
             self.click_track(id, position, Modifiers::NONE);
         }
-        let ids = if self.marked.contains(&id) { self.selected_ids() } else { vec![id] };
+        let ids = if self.marked.contains(&position) { self.selected_ids() } else { vec![id] };
         // From a playlist, the entries can move within it too.
         let playlist = self.collection_view.node.filter(|n| {
             matches!(self.source, Source::Collection)
                 && self.collection.node(*n).is_some_and(|n| n.kind == NodeKind::Playlist)
         });
         self.collection_view.dragged_entries = playlist.map(|playlist| {
-            let entries = if self.marked.contains(&id) {
+            let entries = if self.marked.contains(&position) {
                 self.visible_rows()
                     .into_iter()
-                    .filter(|(row, _)| self.marked.contains(row))
+                    .filter(|(_, at)| self.marked.contains(at))
                     .map(|(_, position)| position)
                     .collect()
             } else {
@@ -154,7 +156,7 @@ impl DeckhandApp {
                 egui::StrokeKind::Inside,
             );
         }
-        if let Some(drag) = target.dnd_release_payload::<TrackDrag>()
+        if let Some(drag) = crate::widgets::dropped::<TrackDrag>(&target)
             && !own
         {
             let ctx = ui.ctx().clone();
@@ -182,14 +184,12 @@ impl DeckhandApp {
         match drag {
             TrackDrag::Collection(ids) if ids.len() == 1 => self.request_add(ids[0], playlist),
             TrackDrag::Collection(ids) => self.add_many(ids, playlist),
-            TrackDrag::Files(paths) => self.add_files_to_playlist(paths.clone(), playlist),
-            TrackDrag::Usb(..) => {
-                self.status = Some(
-                    "Tracks of a USB export go into playlists once imported into the collection \
-                     (right-click the stick)"
-                        .into(),
-                );
+            // Folders from the file manager: the audio files in them.
+            TrackDrag::Files(paths) => {
+                self.add_files_to_playlist(crate::os_drop::audio_files(paths), playlist);
             }
+            // Copied off the stick into the collection first.
+            TrackDrag::Usb(..) => self.transfer(drag, super::transfer::Target::Collection(playlist)),
         }
     }
 
@@ -215,7 +215,7 @@ impl DeckhandApp {
                 }
             }
             TrackDrag::Files(paths) => {
-                if let Some(path) = paths.first().cloned() {
+                if let Some(path) = crate::os_drop::audio_files(paths).into_iter().next() {
                     self.load_file(path, deck, ctx);
                 }
             }
@@ -242,8 +242,8 @@ impl DeckhandApp {
         if self.load_blocked(deck) {
             return;
         }
-        let file = deckhand_library::read_file(&path).unwrap_or_else(|_| {
-            deckhand_library::ScannedFile { path: path.clone(), ..Default::default() }
+        let file = rofloxbox_library::read_file(&path).unwrap_or_else(|_| {
+            rofloxbox_library::ScannedFile { path: path.clone(), ..Default::default() }
         });
         let id = super::explorer_view::file_id(&path);
         self.mark_double(deck, id, false);

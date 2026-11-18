@@ -1,8 +1,8 @@
 //! Prints the first track rows of an export as stored.
 //!
-//! `cargo run -p deckhand-formats --example track_row -- export.pdb [count]`
+//! `cargo run -p rofloxbox-formats --example track_row -- export.pdb [count]`
 
-use deckhand_formats::pdb::{Album, Artist, Database, Track};
+use rofloxbox_formats::pdb::{Album, Artist, Database, Track};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let artists: Vec<Artist> = db.read_all()?;
     let albums: Vec<Album> = db.read_all()?;
     println!("{:?}\n{:?}", artists.first(), albums.first());
-    let keys: Vec<deckhand_formats::pdb::Key> = db.read_all()?;
+    let keys: Vec<rofloxbox_formats::pdb::Key> = db.read_all()?;
     println!("keys: {:?}", keys.iter().map(|k| k.name.clone()).collect::<Vec<_>>());
     Ok(())
 }

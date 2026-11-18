@@ -1,7 +1,7 @@
 ; RofLoxBox installer for Windows 10/11 (64-bit). Built by
 ; scripts/build-windows.sh or the release workflow:
 ;   makensis -DVERSION=0.1.0 -DEXE=path\to\RofLoxBox.exe -DOUT=path\to\setup.exe RofLoxBox.nsi
-; Settings and the collection live in %APPDATA%\deckhand and are kept on
+; Settings and the collection live in %APPDATA%\RofLoxBox and are kept on
 ; uninstall.
 
 Unicode true
@@ -33,7 +33,12 @@ VIAddVersionKey "LegalCopyright" "GPL-3.0"
 
 !define MUI_ICON "..\icons\RofLoxBox.ico"
 !define MUI_UNICON "..\icons\RofLoxBox.ico"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\${NAME}.exe"
+; Started by way of Explorer: as the user, not with the installer's admin
+; rights (Windows lets nothing be dragged from Explorer onto a program
+; running as admin).
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "Start ${NAME}"
+!define MUI_FINISHPAGE_RUN_FUNCTION StartAsUser
 
 !insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -43,6 +48,10 @@ VIAddVersionKey "LegalCopyright" "GPL-3.0"
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
+
+Function StartAsUser
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\${NAME}.exe"'
+FunctionEnd
 
 Section "${NAME}" SecApp
   SectionIn RO

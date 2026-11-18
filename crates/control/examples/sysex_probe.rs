@@ -1,6 +1,6 @@
 //! Sends SysEx to a controller and prints everything it sends back.
 //!
-//! `cargo run -p deckhand-control --example sysex_probe -- PORT [HEX BYTES]`
+//! `cargo run -p rofloxbox-control --example sysex_probe -- PORT [HEX BYTES]`
 //! Without bytes it sends the universal identity request (F0 7E 7F 06 01 F7).
 
 use std::sync::mpsc;
@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
         vec![0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7]
     };
 
-    let mut input = midir::MidiInput::new("deckhand probe")?;
+    let mut input = midir::MidiInput::new("RofLoxBox probe")?;
     input.ignore(midir::Ignore::None);
     let in_port = input
         .ports()
@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         .connect(&in_port, "probe", move |_, message, _| drop(tx.send(message.to_vec())), ())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let output = midir::MidiOutput::new("deckhand probe")?;
+    let output = midir::MidiOutput::new("RofLoxBox probe")?;
     let out_port = output
         .ports()
         .into_iter()

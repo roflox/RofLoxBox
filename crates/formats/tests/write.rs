@@ -4,14 +4,14 @@
 
 use std::path::{Path, PathBuf};
 
-use deckhand_formats::anlz::AnlzFile;
-use deckhand_formats::pdb::{
+use rofloxbox_formats::anlz::AnlzFile;
+use rofloxbox_formats::pdb::{
     Album, Artist, Artwork, Color, ColumnEntry, Database, DatabaseWriter, FromRow, Genre,
     HistoryEntry, HistoryPlaylist, Key, Label, Library, PlaylistEntry, PlaylistTreeNode, Schema,
     TableType, Tag, TagTrack, Track, TrackExtras,
 };
-use deckhand_formats::settings::values::TempoRange;
-use deckhand_formats::settings::{Settings, SettingsFile, SettingsKind};
+use rofloxbox_formats::settings::values::TempoRange;
+use rofloxbox_formats::settings::{Settings, SettingsFile, SettingsKind};
 
 fn fixture(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(path)
@@ -299,13 +299,13 @@ fn edge_case_rows_round_trip() {
     assert!(db.table_pages(db.table(TableType::Genres).unwrap()).unwrap().len() > 3);
 }
 
-/// Playlist edits on a real export (`DECKHAND_TEST_PDB`, edited as a copy;
+/// Playlist edits on a real export (`ROFLOXBOX_TEST_PDB`, edited as a copy;
 /// skipped without it) keep every other row and read back as expected.
 #[test]
 fn playlist_edits_on_a_real_export() {
-    use deckhand_formats::pdb::{Library, PlaylistTables, TableType, edit_playlists};
-    let Some(original) = std::env::var_os("DECKHAND_TEST_PDB") else { return };
-    let dir = std::env::temp_dir().join(format!("deckhand-pdb-{}", std::process::id()));
+    use rofloxbox_formats::pdb::{Library, PlaylistTables, TableType, edit_playlists};
+    let Some(original) = std::env::var_os("ROFLOXBOX_TEST_PDB") else { return };
+    let dir = std::env::temp_dir().join(format!("rofloxbox-pdb-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let pdb = dir.join("export.pdb");
     std::fs::copy(&original, &pdb).unwrap();
@@ -331,13 +331,13 @@ fn playlist_edits_on_a_real_export() {
         new
     })
     .unwrap();
-    assert!(deckhand_formats::pdb::backup_path(&pdb).is_file(), "backup made");
+    assert!(rofloxbox_formats::pdb::backup_path(&pdb).is_file(), "backup made");
 
     let after = Database::open(&pdb).unwrap();
     // Every table but the playlist ones keeps its rows: the same values for
-    // the tables deckhand understands (rekordbox leaves stale bytes after
+    // the tables RofLoxBox understands (rekordbox leaves stale bytes after
     // some rows, which are not copied), the same bytes for the others.
-    fn same<T: deckhand_formats::pdb::FromRow + PartialEq + std::fmt::Debug>(
+    fn same<T: rofloxbox_formats::pdb::FromRow + PartialEq + std::fmt::Debug>(
         a: &Database,
         b: &Database,
     ) {
@@ -347,7 +347,7 @@ fn playlist_edits_on_a_real_export() {
             assert_eq!(x, y);
         }
     }
-    use deckhand_formats::pdb::{
+    use rofloxbox_formats::pdb::{
         Album, Artist, Artwork, Color, ColumnEntry, Genre, HistoryEntry, HistoryPlaylist, Key,
         Label, Track,
     };
@@ -397,7 +397,7 @@ fn playlist_edits_on_a_real_export() {
     }
     // Tracks no playlist uses go; everything else stays consistent.
     {
-        use deckhand_formats::pdb::{Track, remove_tracks};
+        use rofloxbox_formats::pdb::{Track, remove_tracks};
         // Leave one playlist, so that tracks become unused.
         edit_playlists(&pdb, |t| {
             let ids: Vec<u32> = t.nodes.iter().map(|n| n.id).collect();

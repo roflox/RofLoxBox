@@ -25,7 +25,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::action::{Action, Feedback};
+use crate::action::{Action, Feedback, PadMode};
 use crate::midi::MidiMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -96,8 +96,22 @@ mod action_name {
     }
 }
 
+/// Whether two bindings are on the same control.
+fn same_control(a: &Binding, b: &Binding) -> bool {
+    a.message == b.message && a.channel == b.channel && a.number == b.number
+}
+
+/// Where a light is: (message, channel, number).
+fn address(output: &Output) -> (MessageType, u8, u8) {
+    (output.message, output.channel, output.number)
+}
+
 /// A message the controller understands as display state: a note lights an
 /// LED with velocity 127 (0 = off); a CC carries a value (meters).
+///
+/// Several outputs may share one light (a button doing one thing, another
+/// with Shift held, and others in other pad modes): the light shows the
+/// one that applies now (see [`Mapping::lights`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
     #[serde(with = "feedback_name")]
@@ -105,6 +119,24 @@ pub struct Output {
     pub message: MessageType,
     pub channel: u8,
     pub number: u8,
+    /// Shown while a Shift button is held.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shift: bool,
+    /// Shown only while its deck's pads are in this mode (for a function
+    /// put on a pad of that mode); otherwise the mode its state belongs to,
+    /// if any (see [`Feedback::pad_mode`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PadMode>,
+}
+
+impl Output {
+    /// The deck and pad mode this light is shown in, if only in one.
+    fn shown_in(&self) -> Option<(usize, PadMode)> {
+        match (self.mode, self.feedback) {
+            (Some(mode), Feedback::Deck(deck, _)) => Some((deck, mode)),
+            _ => self.feedback.pad_mode(),
+        }
+    }
 }
 
 mod feedback_name {
@@ -164,7 +196,30 @@ impl Mapping {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut mapping: Mapping =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        mapping.upgrade();
+        Ok(mapping)
+    }
+
+    /// Brings a mapping saved by an older version up to date: LOOP IN / OUT
+    /// lights, once "loop active", show their own state now (they flash
+    /// while adjusting).
+    fn upgrade(&mut self) {
+        use crate::action::{DeckAction as D, DeckFeedback as F};
+        for output in &mut self.outputs {
+            let Feedback::Deck(deck, F::LoopActive) = output.feedback else { continue };
+            let button = self.bindings.iter().find(|b| {
+                !b.shift
+                    && (b.message, b.channel, b.number) == address(output)
+                    && matches!(b.action, Action::Deck(d, D::LoopIn | D::LoopOut) if d == deck)
+            });
+            output.feedback = match button.map(|b| b.action) {
+                Some(Action::Deck(_, D::LoopIn)) => Feedback::Deck(deck, F::LoopIn),
+                Some(Action::Deck(_, D::LoopOut)) => Feedback::Deck(deck, F::LoopOut),
+                _ => continue,
+            };
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -177,7 +232,54 @@ impl Mapping {
 
     /// Adds `binding`, replacing earlier bindings of the same action and of
     /// the same MIDI control in the same layer (with or without Shift).
+    /// Lights follow buttons: the bound button's light shows its new
+    /// function in that layer (and in the pad mode the light was showing),
+    /// and the lights of buttons the function leaves go dark.
     pub fn bind(&mut self, binding: Binding) {
+        if binding.encoding == Encoding::Button {
+            let layer = binding.shift;
+            let here = self.light_of(&binding);
+            let before = self.shown_by(&binding, layer);
+            // The light the button had in this layer (else without Shift):
+            // its pad mode carries over.
+            let unshifted = self.shown_by(&binding, false);
+            let replaced = self
+                .outputs
+                .iter()
+                .find(|o| address(o) == here && o.shift == layer && Some(o.feedback) == before)
+                .or_else(|| {
+                    self.outputs.iter().find(|o| {
+                        address(o) == here && !o.shift && Some(o.feedback) == unshifted
+                    })
+                });
+            let mode = replaced.and_then(|o| o.mode.or(o.feedback.pad_mode().map(|(_, m)| m)));
+            // The lights of the buttons the function had.
+            let left: Vec<(MessageType, u8, u8)> = self
+                .bindings
+                .iter()
+                .filter(|b| {
+                    b.action == binding.action && b.shift == layer && !same_control(b, &binding)
+                })
+                .map(|b| self.light_of(b))
+                .collect();
+            let shows = binding.action.feedback();
+            self.outputs.retain(|o| {
+                let shown = Some(o.feedback);
+                let gone = o.shift == layer
+                    && ((address(o) == here && (shown == before || shown == shows))
+                        || (left.contains(&address(o)) && shown == shows)
+                        // Shift lights are only ever a bound function's:
+                        // the function's old one goes (wherever it was).
+                        || (layer && shown == shows));
+                !gone
+            });
+            if let Some(feedback) = shows {
+                let (message, channel, number) = here;
+                let mode = mode.filter(|_| feedback.pad_mode().is_none());
+                let shift = layer;
+                self.outputs.push(Output { feedback, message, channel, number, shift, mode });
+            }
+        }
         self.bindings.retain(|b| {
             b.action != binding.action
                 && !(b.message == binding.message
@@ -186,6 +288,116 @@ impl Mapping {
                     && b.shift == binding.shift)
         });
         self.bindings.push(binding);
+    }
+
+    /// Removes `action`'s bindings; the lights of its buttons go dark.
+    pub fn unbind(&mut self, action: Action) {
+        let left: Vec<((MessageType, u8, u8), bool)> = self
+            .bindings
+            .iter()
+            .filter(|b| b.action == action && b.encoding == Encoding::Button)
+            .map(|b| (self.light_of(b), b.shift))
+            .collect();
+        if let Some(feedback) = action.feedback() {
+            self.outputs
+                .retain(|o| !(o.feedback == feedback && left.contains(&(address(o), o.shift))));
+        }
+        self.bindings.retain(|b| b.action != action);
+    }
+
+    /// What the control of `button` shows in a layer now: its function's
+    /// state there.
+    fn shown_by(&self, button: &Binding, shift: bool) -> Option<Feedback> {
+        self.bindings
+            .iter()
+            .filter(|b| b.shift == shift && same_control(b, button))
+            .find_map(|b| b.action.feedback())
+    }
+
+    /// The light of a button: where the light of what it does now is (a
+    /// controller may light a button by another message than it sends; a
+    /// Shift combination lights the button's own light), else the button's
+    /// own message, as most controllers have it.
+    fn light_of(&self, button: &Binding) -> (MessageType, u8, u8) {
+        let own = (button.message, button.channel, button.number);
+        let found = |shift: bool| {
+            let feedback = self.shown_by(button, shift)?;
+            let lights: Vec<_> = self
+                .outputs
+                .iter()
+                .filter(|o| o.feedback == feedback && o.shift == shift)
+                .map(address)
+                .collect();
+            // Buttons whose function shows the same (TAP BPM and LOAD
+            // both show "loaded"): a light of theirs isn't this one's.
+            let buttons = self
+                .bindings
+                .iter()
+                .filter(|b| b.shift == shift && b.action.feedback() == Some(feedback))
+                .count();
+            // Several lights show it (one per button doing it): this
+            // button's own, if one is; else the only one there is, when
+            // this is the only button showing it.
+            match lights.as_slice() {
+                _ if lights.contains(&own) => Some(own),
+                [only] if buttons <= 1 => Some(*only),
+                _ => None,
+            }
+        };
+        found(button.shift).or_else(|| found(false)).unwrap_or(own)
+    }
+
+    /// What each light shows now, by (message, channel, number): with
+    /// Shift held, the Shift layer's function where a light has one; the
+    /// function of the deck's current pad mode where a light shows several
+    /// modes' states; nothing where none applies (the light goes dark).
+    pub fn lights(
+        &self,
+        shift: bool,
+        pad_mode: impl Fn(usize) -> PadMode,
+    ) -> Vec<((MessageType, u8, u8), Option<Feedback>)> {
+        let mut addresses: Vec<(MessageType, u8, u8)> = Vec::new();
+        for output in &self.outputs {
+            if !addresses.contains(&address(output)) {
+                addresses.push(address(output));
+            }
+        }
+        addresses
+            .into_iter()
+            .map(|at| {
+                let here: Vec<&Output> =
+                    self.outputs.iter().filter(|o| address(o) == at).collect();
+                let in_mode = |o: &Output| {
+                    o.shown_in().is_some_and(|(deck, mode)| pad_mode(deck) == mode)
+                };
+                // A layer's function for now: the one of the current pad
+                // mode, else one of no mode; a light with one function
+                // shows it in any mode, unless it was put on a pad of
+                // another mode.
+                let pick = |shifted: bool| {
+                    let candidates: Vec<&Output> =
+                        here.iter().copied().filter(|o| o.shift == shifted).collect();
+                    match candidates.as_slice() {
+                        [only] if only.mode.is_none() || in_mode(only) => Some(only.feedback),
+                        _ => candidates
+                            .iter()
+                            .find(|o| in_mode(o))
+                            .or_else(|| candidates.iter().find(|o| o.shown_in().is_none()))
+                            .map(|o| o.feedback),
+                    }
+                };
+                // With Shift held, the Shift function, else the plain one.
+                // Without, the plain one; a light only Shift functions have
+                // still shows them (controllers that send another message
+                // with Shift held light that one themselves).
+                let shows = if shift || here.iter().all(|o| o.shift) {
+                    pick(true).or_else(|| pick(false))
+                } else {
+                    pick(false)
+                };
+                (at, shows)
+            })
+            .collect()
     }
 
     /// Adds what `other` has and this mapping lacks: bindings for functions
@@ -364,7 +576,7 @@ impl Translator {
                 (MidiMessage::PitchBend { channel: c, value }, MessageType::PitchBend)
                     if c == channel =>
                 {
-                    Value::Absolute(f32::from(value) / 16383.0)
+                    Value::Absolute(centred(value, 16383))
                 }
                 (MidiMessage::ControlChange { channel: c, control, value }, MessageType::Cc)
                     if c == channel =>
@@ -376,7 +588,7 @@ impl Translator {
                     }
                     match binding.encoding {
                         Encoding::Button => Value::Pressed(value > 0),
-                        Encoding::Absolute7 => Value::Absolute(f32::from(value) / 127.0),
+                        Encoding::Absolute7 => Value::Absolute(centred(value.into(), 127)),
                         Encoding::Absolute14 => {
                             let halves = self.halves.entry((c, binding.number)).or_insert((0, 0));
                             if is_msb {
@@ -384,9 +596,7 @@ impl Translator {
                             } else {
                                 halves.1 = value;
                             }
-                            Value::Absolute(
-                                f32::from(u16::from(halves.0) << 7 | u16::from(halves.1)) / 16383.0,
-                            )
+                            Value::Absolute(centred(u16::from(halves.0) << 7 | u16::from(halves.1), 16383))
                         }
                         Encoding::RelativeOffset64 => Value::Relative(i32::from(value) - 64),
                         Encoding::RelativeTwos => Value::Relative(if value < 64 {
@@ -437,8 +647,186 @@ impl Translator {
     }
 }
 
+/// A control's value `0..=max` as 0–1, its middle (64 of 127, 8192 of
+/// 16383) exactly 0.5: a tempo fader or EQ knob at its centre detent is
+/// then exactly ±0 (`value / max` would put it a step above).
+fn centred(value: u16, max: u16) -> f32 {
+    let middle = max / 2 + 1;
+    let value = value.min(max);
+    if value <= middle {
+        f32::from(value) / f32::from(2 * middle)
+    } else {
+        0.5 + f32::from(value - middle) / f32::from(2 * (max - middle))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn button(action: Action, channel: u8, number: u8) -> Binding {
+        Binding {
+            action,
+            message: MessageType::Note,
+            channel,
+            number,
+            encoding: Encoding::Button,
+            lsb: None,
+            invert: false,
+            shift: false,
+        }
+    }
+
+    fn light(feedback: Feedback, channel: u8, number: u8) -> Output {
+        Output { feedback, message: MessageType::Note, channel, number, shift: false, mode: None }
+    }
+
+    /// A rebound button lights for its new function, at its own light even
+    /// when that is another message than the button sends; the button the
+    /// function left goes dark.
+    #[test]
+    fn lights_follow_rebound_buttons() {
+        use crate::action::{DeckAction as D, DeckFeedback as F};
+        let deck = |a| Action::Deck(0, a);
+        let shows = |f| Feedback::Deck(0, f);
+        let mut mapping = Mapping {
+            bindings: vec![
+                button(deck(D::PlayPause), 1, 0x0b),
+                button(deck(D::Cue), 1, 0x0c),
+                // A pad lit by another message (channel 8).
+                button(deck(D::HotCue(0)), 8, 0x00),
+            ],
+            outputs: vec![
+                light(shows(F::Playing), 1, 0x0b),
+                light(shows(F::AtCue), 1, 0x0c),
+                light(shows(F::HotCueSet(0)), 9, 0x40),
+            ],
+            ..Mapping::default()
+        };
+        // PLAY onto the CUE button.
+        mapping.bind(button(deck(D::PlayPause), 1, 0x0c));
+        assert_eq!(mapping.outputs, [light(shows(F::HotCueSet(0)), 9, 0x40), light(shows(F::Playing), 1, 0x0c)]);
+        // SYNC onto the pad: its light is the pad's (channel 9).
+        mapping.bind(button(deck(D::Sync), 8, 0x00));
+        let sync = Output { mode: Some(PadMode::HotCue), ..light(shows(F::Sync), 9, 0x40) };
+        assert!(mapping.outputs.contains(&sync));
+        assert!(!mapping.outputs.iter().any(|o| o.feedback == shows(F::HotCueSet(0))));
+        // Gate mode onto hot cue B's pad: the pad shows gate mode.
+        mapping.bindings.push(button(deck(D::HotCue(1)), 8, 0x01));
+        mapping.outputs.push(light(shows(F::HotCueSet(1)), 9, 0x41));
+        mapping.bind(button(deck(D::HotCueGateMode), 8, 0x01));
+        let gate = light(shows(F::HotCueGateMode), 9, 0x41);
+        assert!(mapping.outputs.contains(&Output { mode: Some(PadMode::HotCue), ..gate }));
+        assert!(!mapping.outputs.iter().any(|o| o.feedback == shows(F::HotCueSet(1))));
+        // A button that did nothing: lit by its own message.
+        mapping.bind(button(deck(D::Slip), 2, 0x20));
+        assert!(mapping.outputs.contains(&light(shows(F::Slip), 2, 0x20)));
+        // Unbound: its button goes dark.
+        mapping.unbind(deck(D::Slip));
+        assert!(!mapping.outputs.iter().any(|o| o.feedback == shows(F::Slip)));
+        // A fader leaves the lights alone.
+        let before = mapping.outputs.clone();
+        mapping.bind(Binding {
+            encoding: Encoding::Absolute7,
+            ..button(deck(D::Volume), 1, 0x0c)
+        });
+        assert_eq!(mapping.outputs, before);
+    }
+
+    /// Shift + QUANTIZE as gate mode: QUANTIZE's light shows gate mode while
+    /// Shift is held, quantize otherwise.
+    #[test]
+    fn shift_functions_light_while_shift_is_held() {
+        use crate::action::{DeckAction as D, DeckFeedback as F};
+        let deck = |a| Action::Deck(0, a);
+        let shows = |f| Feedback::Deck(0, f);
+        let mut mapping = Mapping {
+            bindings: vec![button(deck(D::Quantize), 1, 0x30)],
+            outputs: vec![light(shows(F::Quantize), 1, 0x30)],
+            ..Mapping::default()
+        };
+        mapping.bind(Binding { shift: true, ..button(deck(D::HotCueGateMode), 1, 0x30) });
+        let at = (MessageType::Note, 1, 0x30);
+        let hot_cue = |_| PadMode::HotCue;
+        assert_eq!(mapping.lights(false, hot_cue), [(at, Some(shows(F::Quantize)))]);
+        assert_eq!(mapping.lights(true, hot_cue), [(at, Some(shows(F::HotCueGateMode)))]);
+        // Unbound: Shift shows quantize again.
+        mapping.unbind(deck(D::HotCueGateMode));
+        assert_eq!(mapping.lights(true, hot_cue), [(at, Some(shows(F::Quantize)))]);
+    }
+
+    /// A Shift combination that sends a note of its own (Shift + QUANTIZE
+    /// sends TAP BPM's on the GRV6) lights by that note, not by a light
+    /// elsewhere that shows the same state as TAP BPM.
+    #[test]
+    fn shift_note_lights_itself() {
+        use crate::action::{DeckAction as D, DeckFeedback as F};
+        let deck = |a| Action::Deck(0, a);
+        let shows = |f| Feedback::Deck(0, f);
+        let mut mapping = Mapping {
+            bindings: vec![
+                button(deck(D::Load), 7, 0x46),
+                button(deck(D::TapBpm), 1, 0x68),
+            ],
+            outputs: vec![light(shows(F::Loaded), 16, 0x00)],
+            ..Mapping::default()
+        };
+        // A stale light from before, on the load indicator.
+        mapping.outputs.push(Output { shift: true, ..light(shows(F::HotCueGateMode), 16, 0x00) });
+        mapping.bind(Binding { shift: true, ..button(deck(D::HotCueGateMode), 1, 0x68) });
+        let gate: Vec<_> =
+            mapping.outputs.iter().filter(|o| o.feedback == shows(F::HotCueGateMode)).collect();
+        assert_eq!(gate, [&Output { shift: true, ..light(shows(F::HotCueGateMode), 1, 0x68) }]);
+    }
+
+    /// One pad light for every pad mode (each mode's pad sending its own
+    /// note): it shows the current mode's function, with Shift its Shift one.
+    #[test]
+    fn pad_lights_follow_the_pad_mode() {
+        use crate::action::{DeckAction as D, DeckFeedback as F};
+        let deck = |a| Action::Deck(0, a);
+        let shows = |f| Feedback::Deck(0, f);
+        let mut mapping = Mapping {
+            bindings: vec![
+                button(deck(D::HotCue(0)), 8, 0x00),
+                button(deck(D::BeatLoop(0)), 8, 0x60),
+                button(deck(D::StemPart(0)), 8, 0x10),
+            ],
+            outputs: vec![
+                light(shows(F::HotCueSet(0)), 8, 0x00),
+                light(shows(F::PadLit(PadMode::BeatLoop, 0)), 8, 0x00),
+                light(shows(F::StemOn(0)), 8, 0x00),
+            ],
+            ..Mapping::default()
+        };
+        let at = (MessageType::Note, 8, 0x00);
+        let shown = |m: &Mapping, shift, mode| m.lights(shift, |_| mode)[0];
+        assert_eq!(shown(&mapping, false, PadMode::HotCue), (at, Some(shows(F::HotCueSet(0)))));
+        assert_eq!(shown(&mapping, false, PadMode::Stems), (at, Some(shows(F::StemOn(0)))));
+        assert_eq!(shown(&mapping, false, PadMode::Sampler), (at, None));
+        // The beat loop pad made gate mode: lit as gate mode in Beat Loop only.
+        mapping.bind(button(deck(D::HotCueGateMode), 8, 0x60));
+        let gate = Some(shows(F::HotCueGateMode));
+        assert_eq!(shown(&mapping, false, PadMode::BeatLoop), (at, gate));
+        assert_eq!(shown(&mapping, false, PadMode::HotCue), (at, Some(shows(F::HotCueSet(0)))));
+        // Shift + the stems pad as sync: in Stems mode with Shift held.
+        mapping.bind(Binding { shift: true, ..button(deck(D::Sync), 8, 0x10) });
+        assert_eq!(shown(&mapping, true, PadMode::Stems), (at, Some(shows(F::Sync))));
+        assert_eq!(shown(&mapping, false, PadMode::Stems), (at, Some(shows(F::StemOn(0)))));
+        // Shift held where the pad has no Shift function: its plain one.
+        assert_eq!(shown(&mapping, true, PadMode::BeatLoop), (at, gate));
+        assert_eq!(shown(&mapping, true, PadMode::Sampler), (at, None));
+    }
+
+    /// Ends at 0 and 1, the middle exactly 0.5, steady in between.
+    #[test]
+    fn controls_are_centred() {
+        for max in [127u16, 16383] {
+            assert_eq!(centred(0, max), 0.0);
+            assert_eq!(centred(max, max), 1.0);
+            assert_eq!(centred(max / 2 + 1, max), 0.5);
+            assert!((0..max).all(|v| centred(v, max) < centred(v + 1, max)));
+        }
+    }
+
     use super::*;
     use crate::action::{DeckAction, GlobalAction};
 

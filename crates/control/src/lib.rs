@@ -1,4 +1,4 @@
-//! Controller input for deckhand: MIDI ports, mappings from MIDI messages to
+//! Controller input for RofLoxBox: MIDI ports, mappings from MIDI messages to
 //! actions, and learning mappings by moving controls.
 
 mod action;

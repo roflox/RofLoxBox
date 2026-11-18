@@ -30,26 +30,64 @@ pub enum TrackColumn {
     Comment,
     /// The whole waveform, small, with the cues.
     Preview,
+    TrackNumber,
+    DiscNumber,
+    Composer,
+    Remixer,
+    OriginalArtist,
+    MixName,
+    /// rekordbox's colour label.
+    Color,
+    FileType,
+    FileName,
+    /// The folder the file is in.
+    Location,
+    Size,
+    SampleRate,
+    BitDepth,
+    ReleaseDate,
+    Message,
+    /// How many hot cues it has.
+    HotCues,
+    LastPlayed,
 }
 
 impl TrackColumn {
-    pub const ALL: [TrackColumn; 16] = [
+    /// In the order the column menu lists them.
+    pub const ALL: [TrackColumn; 33] = [
         Self::Number,
+        Self::Preview,
         Self::Title,
         Self::Artist,
         Self::Album,
         Self::Genre,
-        Self::Label,
-        Self::Bpm,
-        Self::Key,
-        Self::Time,
-        Self::Year,
-        Self::Rating,
-        Self::Plays,
-        Self::Added,
-        Self::Bitrate,
         Self::Comment,
-        Self::Preview,
+        Self::Size,
+        Self::DiscNumber,
+        Self::TrackNumber,
+        Self::Bpm,
+        Self::Rating,
+        Self::Composer,
+        Self::Time,
+        Self::FileType,
+        Self::Year,
+        Self::MixName,
+        Self::Remixer,
+        Self::Label,
+        Self::OriginalArtist,
+        Self::Key,
+        Self::ReleaseDate,
+        Self::SampleRate,
+        Self::Bitrate,
+        Self::BitDepth,
+        Self::FileName,
+        Self::Location,
+        Self::Added,
+        Self::HotCues,
+        Self::Message,
+        Self::Color,
+        Self::Plays,
+        Self::LastPlayed,
     ];
 
     pub fn default_set() -> Vec<TrackColumn> {
@@ -84,6 +122,23 @@ impl TrackColumn {
             Self::Bitrate => "Bitrate",
             Self::Comment => "Comment",
             Self::Preview => "Preview",
+            Self::TrackNumber => "Track number",
+            Self::DiscNumber => "Disc number",
+            Self::Composer => "Composer",
+            Self::Remixer => "Remixer",
+            Self::OriginalArtist => "Original artist",
+            Self::MixName => "Mix name",
+            Self::Color => "Color",
+            Self::FileType => "File type",
+            Self::FileName => "File name",
+            Self::Location => "Location",
+            Self::Size => "Size",
+            Self::SampleRate => "Sample rate",
+            Self::BitDepth => "Bit depth",
+            Self::ReleaseDate => "Release date",
+            Self::Message => "Message",
+            Self::HotCues => "Hot cues",
+            Self::LastPlayed => "Last played",
         }
     }
 
@@ -98,6 +153,13 @@ impl TrackColumn {
             Self::Bpm | Self::Time | Self::Bitrate => 58.0,
             Self::Key | Self::Year | Self::Plays => 46.0,
             Self::Preview => 160.0,
+            Self::Composer | Self::Remixer | Self::OriginalArtist | Self::MixName => 140.0,
+            Self::FileName | Self::Message => 170.0,
+            Self::Location => 220.0,
+            Self::ReleaseDate | Self::LastPlayed => 84.0,
+            Self::Color | Self::Size | Self::SampleRate => 70.0,
+            Self::TrackNumber | Self::DiscNumber | Self::FileType | Self::BitDepth => 58.0,
+            Self::HotCues => 58.0,
         }
     }
 
@@ -108,7 +170,10 @@ impl TrackColumn {
 
     /// Numbers start with the highest when first clicked, text with A.
     fn starts_descending(self) -> bool {
-        matches!(self, Self::Rating | Self::Plays | Self::Added)
+        matches!(
+            self,
+            Self::Rating | Self::Plays | Self::Added | Self::Size | Self::HotCues | Self::LastPlayed
+        )
     }
 }
 
@@ -151,10 +216,35 @@ pub struct Row {
     /// has its own (else the analysis's are shown).
     pub preview: Option<crate::preview::Source>,
     pub cues: Option<Vec<crate::preview::Mark>>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub composer: String,
+    pub remixer: String,
+    pub original_artist: String,
+    pub mix_name: String,
+    /// rekordbox's colour label, 1–8.
+    pub color: Option<u8>,
+    /// The audio file.
+    pub path: std::path::PathBuf,
+    /// Bytes; 0 when not known.
+    pub size: u64,
+    /// Hz.
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
+    pub release_date: String,
+    pub message: String,
+    pub hot_cues: Option<usize>,
+    /// `YYYY-MM-DD`.
+    pub last_played: String,
 }
+
+/// rekordbox's colour labels, 1–8.
+pub const COLOR_NAMES: [&str; 8] =
+    ["Pink", "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple"];
 
 impl Row {
     fn text(&self, column: TrackColumn) -> String {
+        let number = |n: Option<u32>| n.map_or_else(String::new, |n| n.to_string());
         match column {
             TrackColumn::Number => (self.position + 1).to_string(),
             TrackColumn::Title => self.title.clone(),
@@ -172,6 +262,37 @@ impl Row {
             TrackColumn::Bitrate => self.bitrate.map_or_else(String::new, |b| b.to_string()),
             TrackColumn::Comment => self.comment.clone(),
             TrackColumn::Preview => String::new(),
+            TrackColumn::TrackNumber => number(self.track_number),
+            TrackColumn::DiscNumber => number(self.disc_number),
+            TrackColumn::Composer => self.composer.clone(),
+            TrackColumn::Remixer => self.remixer.clone(),
+            TrackColumn::OriginalArtist => self.original_artist.clone(),
+            TrackColumn::MixName => self.mix_name.clone(),
+            TrackColumn::Color => self
+                .color
+                .and_then(|c| COLOR_NAMES.get(usize::from(c).checked_sub(1)?))
+                .map_or_else(String::new, |name| (*name).to_owned()),
+            TrackColumn::FileType => self
+                .path
+                .extension()
+                .map_or_else(String::new, |e| e.to_string_lossy().to_uppercase()),
+            TrackColumn::FileName => self
+                .path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            TrackColumn::Location => {
+                self.path.parent().map_or_else(String::new, |p| p.display().to_string())
+            }
+            TrackColumn::Size if self.size == 0 => String::new(),
+            TrackColumn::Size => format!("{:.1} MB", self.size as f64 / 1_000_000.0),
+            TrackColumn::SampleRate => self
+                .sample_rate
+                .map_or_else(String::new, |r| format!("{:.1} kHz", f64::from(r) / 1000.0)),
+            TrackColumn::BitDepth => number(self.bit_depth),
+            TrackColumn::ReleaseDate => self.release_date.clone(),
+            TrackColumn::Message => self.message.clone(),
+            TrackColumn::HotCues => self.hot_cues.map_or_else(String::new, |n| n.to_string()),
+            TrackColumn::LastPlayed => self.last_played.clone(),
         }
     }
 
@@ -200,6 +321,26 @@ impl Row {
             TrackColumn::Plays => self.plays.cmp(&other.plays),
             TrackColumn::Bitrate => {
                 number(self.bitrate.map(f64::from), other.bitrate.map(f64::from))
+            }
+            TrackColumn::TrackNumber => {
+                number(self.track_number.map(f64::from), other.track_number.map(f64::from))
+            }
+            TrackColumn::DiscNumber => {
+                number(self.disc_number.map(f64::from), other.disc_number.map(f64::from))
+            }
+            TrackColumn::SampleRate => {
+                number(self.sample_rate.map(f64::from), other.sample_rate.map(f64::from))
+            }
+            TrackColumn::BitDepth => {
+                number(self.bit_depth.map(f64::from), other.bit_depth.map(f64::from))
+            }
+            TrackColumn::Color => number(self.color.map(f64::from), other.color.map(f64::from)),
+            TrackColumn::Size => {
+                let size = |r: &Row| (r.size > 0).then_some(r.size as f64);
+                number(size(self), size(other))
+            }
+            TrackColumn::HotCues => {
+                number(self.hot_cues.map(|n| n as f64), other.hot_cues.map(|n| n as f64))
             }
             _ => text(&self.text(column), &other.text(column)),
         }
@@ -269,7 +410,9 @@ pub struct TableOptions<'a> {
     pub draggable: bool,
     /// Tracks selected together with `selected` (Cmd/Shift-click, select
     /// all); when not empty, these are the highlighted ones.
-    pub marked: &'a std::collections::HashSet<u32>,
+    /// The rows selected besides the current one, by position (copies of
+    /// a track in a playlist apart).
+    pub marked: &'a std::collections::HashSet<usize>,
     pub editable_rating: bool,
     /// Playlist entries being dragged can be dropped between rows: shown
     /// in playlist order, or reversed (`Some(true)`).
@@ -350,7 +493,7 @@ pub fn track_table(
                         let x = if after { cell.right() } else { cell.left() };
                         ui.painter().vline(x, cell.y_range(), egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill));
                     }
-                    if let Some(dragged) = target.dnd_release_payload::<TrackColumn>()
+                    if let Some(dragged) = crate::widgets::dropped::<TrackColumn>(&target)
                         && *dragged != column
                     {
                         columns.retain(|c| c != &*dragged);
@@ -389,13 +532,14 @@ pub fn track_table(
                 });
             }
         })
-        .body(|body| {
+        .body(|mut body| {
+            crate::widgets::scroll_while_dragging(body.ui_mut());
             body.rows(20.0, rows.len(), |mut table_row| {
                 let row = &rows[table_row.index()];
                 let highlighted = if options.marked.is_empty() {
                     selected_row == Some(table_row.index())
                 } else {
-                    options.marked.contains(&row.id)
+                    options.marked.contains(&row.position)
                 };
                 table_row.set_selected(highlighted);
                 table_row.col(|ui| {
@@ -483,7 +627,7 @@ pub fn track_table(
                             egui::Stroke::new(2.0_f32, color),
                         );
                     }
-                    if response.dnd_release_payload::<TrackDrag>().is_some() {
+                    if crate::widgets::dropped::<TrackDrag>(&response).is_some() {
                         output.moved_before =
                             Some(if upper != reversed { entry } else { entry + 1 });
                     }

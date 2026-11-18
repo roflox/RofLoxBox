@@ -1,5 +1,5 @@
 [package]
-name = "deckhand-app"
+name = "rofloxbox-app"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,11 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-deckhand-audio = { version = "0.1.0", path = "../audio" }
-deckhand-control = { version = "0.1.0", path = "../control" }
-deckhand-analysis = { version = "0.1.0", path = "../analysis" }
-deckhand-formats = { version = "0.1.0", path = "../formats" }
-deckhand-library = { version = "0.1.0", path = "../library" }
+rofloxbox-audio = { version = "0.1.0", path = "../audio" }
+rofloxbox-control = { version = "0.1.0", path = "../control" }
+rofloxbox-analysis = { version = "0.1.0", path = "../analysis" }
+rofloxbox-formats = { version = "0.1.0", path = "../formats" }
+rofloxbox-library = { version = "0.1.0", path = "../library" }
 eframe = "0.33.3"
 egui_extras = "0.33"
 png = "0.18.1"
@@ -23,10 +23,15 @@ serde_json = "1.0.154"
 toml = "1.1.8"
 flate2 = "1.1.10"
 getrandom = "0.3"
+lofty = "0.24.0"
 
 # macOS draws through Metal (wgpu); other systems keep OpenGL.
 [target.'cfg(target_os = "macos")'.dependencies]
 eframe = { version = "0.33.3", features = ["wgpu"] }
+# Where the pointer is while files are dragged in from Finder.
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent", "NSScreen"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSGeometry", "NSArray"] }
 
 # rekordbox's library is SQLCipher (encrypted SQLite): bundled, with the
 # system's crypto (CommonCrypto on macOS, libcrypto on Linux)...
@@ -37,7 +42,7 @@ rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher"] }
 # Ejecting drives without starting another program.
 [target.'cfg(windows)'.dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 [build-dependencies]
 embed-resource = "3.0.5"

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let port = std::env::args().nth(1).unwrap_or_else(|| "DDJ-GRV6".to_owned());
-    let mut input = midir::MidiInput::new("deckhand jog steps")?;
+    let mut input = midir::MidiInput::new("RofLoxBox jog steps")?;
     input.ignore(midir::Ignore::None);
     let in_port = input
         .ports()

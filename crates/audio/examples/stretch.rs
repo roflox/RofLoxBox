@@ -1,13 +1,13 @@
 //! Renders a track at another tempo with Master Tempo on, to a WAV file, for
 //! listening to the time-stretcher without the app.
 //!
-//! `cargo run --release -p deckhand-audio --example stretch -- IN OUT.wav TEMPO [SECONDS]`
+//! `cargo run --release -p rofloxbox-audio --example stretch -- IN OUT.wav TEMPO [SECONDS]`
 
 use std::io::Write;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use deckhand_audio::{Stretcher, decode_file};
+use rofloxbox_audio::{Stretcher, decode_file};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

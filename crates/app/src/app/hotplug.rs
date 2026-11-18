@@ -2,10 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use deckhand_control::input_ports;
+use rofloxbox_control::input_ports;
 use eframe::egui;
 
-use super::DeckhandApp;
+use super::RofLoxBoxApp;
 use crate::config::mapping_path;
 
 /// How often the MIDI ports are listed.
@@ -26,7 +26,7 @@ pub struct Hotplug {
     declined: Option<String>,
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// Connects a controller: quietly if it has a saved mapping, otherwise
     /// (a new controller) with the Controller window open to check it.
     pub(super) fn connect_controller(&mut self, port: &str, ctx: &egui::Context) {
@@ -55,11 +55,11 @@ impl DeckhandApp {
 
     /// Notices controllers being plugged in or out; call every frame.
     pub(super) fn check_controllers(&mut self, ctx: &egui::Context) {
-        if std::env::var_os("DECKHAND_MIDI_PORT").is_some() {
+        if std::env::var_os("ROFLOXBOX_MIDI_PORT").is_some() {
             return; // tests pick their port
         }
         // Test aid: only ports whose name contains this count.
-        let only = std::env::var("DECKHAND_PORT_FILTER").ok();
+        let only = std::env::var("ROFLOXBOX_PORT_FILTER").ok();
         if self.hotplug.checked.is_some_and(|t| t.elapsed() < CHECK_EVERY) {
             return;
         }

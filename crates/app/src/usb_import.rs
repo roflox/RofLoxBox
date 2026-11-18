@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
-use deckhand_formats::anlz::{AnlzFile, CueKind as AnlzCueKind, CueListKind, CueStatus};
-use deckhand_formats::pdb::{LibraryTrack, PlaylistKind, PlaylistNode};
-use deckhand_library::{
+use rofloxbox_formats::anlz::{AnlzFile, CueKind as AnlzCueKind, CueListKind, CueStatus};
+use rofloxbox_formats::pdb::{LibraryTrack, PlaylistKind, PlaylistNode};
+use rofloxbox_library::{
     Cue, CueKind, ScannedFile, TempoMarker, XmlLibrary, XmlNode, XmlTrack, file_stamp,
 };
 
@@ -162,7 +162,7 @@ fn import_track(request: &ImportRequest, track: &LibraryTrack) -> Result<Option<
         id: row.id.to_string(),
         location: audio.to_string_lossy().into_owned(),
         file,
-        rating: row.rating.min(5),
+        rating: Some(row.rating.min(5)),
         color: row.color_id,
         play_count: u32::from(row.play_count),
         added: added_seconds(&row.date_added),
@@ -227,7 +227,7 @@ fn cues_and_grid(dat: Option<&AnlzFile>, ext: Option<&AnlzFile>) -> (Vec<Cue>, V
 
 /// A beat grid as tempo markers: where it starts and wherever the tempo
 /// changes.
-pub fn grid_markers(grid: &deckhand_formats::anlz::BeatGrid) -> Vec<TempoMarker> {
+pub fn grid_markers(grid: &rofloxbox_formats::anlz::BeatGrid) -> Vec<TempoMarker> {
     let mut tempo: Vec<TempoMarker> = Vec::new();
     for beat in &grid.beats {
         if tempo.last().is_none_or(|m| (m.bpm - beat.bpm()).abs() > 1e-6) {
@@ -283,15 +283,15 @@ pub fn default_destination() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Imports the export in `DECKHAND_TEST_EXPORT` (skipped without it).
+    /// Imports the export in `ROFLOXBOX_TEST_EXPORT` (skipped without it).
     #[test]
     fn imports_an_export() {
-        let Some(root) = std::env::var_os("DECKHAND_TEST_EXPORT").map(PathBuf::from) else {
+        let Some(root) = std::env::var_os("ROFLOXBOX_TEST_EXPORT").map(PathBuf::from) else {
             return;
         };
         let library = crate::library::UsbLibrary::open(&root).unwrap();
         let destination =
-            std::env::temp_dir().join(format!("deckhand-import-{}", std::process::id()));
+            std::env::temp_dir().join(format!("rofloxbox-import-{}", std::process::id()));
         let request = ImportRequest {
             root,
             destination: destination.clone(),
@@ -313,7 +313,7 @@ mod tests {
                 track.analysis.is_some()
             );
         }
-        let mut collection = deckhand_library::Collection::default();
+        let mut collection = rofloxbox_library::Collection::default();
         let summary = collection.import_into(imported.library, "USB test", true);
         assert_eq!(summary.added, library.library.tracks.len() - imported.missing);
         println!("{summary:?}, playlists in collection: {}", collection.tree().len());

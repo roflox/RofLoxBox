@@ -1,12 +1,12 @@
-//! Prints the tags deckhand reads from the audio files in a folder.
+//! Prints the tags RofLoxBox reads from the audio files in a folder.
 //!
-//! `cargo run -p deckhand-library --example scan -- FOLDER`
+//! `cargo run -p rofloxbox-library --example scan -- FOLDER`
 
 use std::collections::HashMap;
 
 fn main() {
     let folder = std::env::args().nth(1).expect("folder");
-    let scan = deckhand_library::Scan::start(vec![folder.into()], HashMap::new());
+    let scan = rofloxbox_library::Scan::start(vec![folder.into()], HashMap::new());
     let files = loop {
         if let Some(files) = scan.finished() {
             break files;

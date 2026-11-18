@@ -58,6 +58,8 @@ pub enum Target {
     PrefsStems,
     PrefsLibrary,
     PrefsAppearance,
+    PrefsAnalysis,
+    PrefsEdit,
     PrefsAudio,
     StemModels,
     StemPresets,
@@ -87,7 +89,9 @@ impl Target {
             PrefsTab::Keyboard => Self::PrefsKeyboard,
             PrefsTab::Stems => Self::PrefsStems,
             PrefsTab::Library => Self::PrefsLibrary,
-            PrefsTab::Appearance => Self::PrefsAppearance,
+            PrefsTab::View => Self::PrefsAppearance,
+            PrefsTab::Analysis => Self::PrefsAnalysis,
+            PrefsTab::Edit => Self::PrefsEdit,
             PrefsTab::Audio => Self::PrefsAudio,
         }
     }
@@ -257,7 +261,7 @@ fn find(ctx: &egui::Context, target: Target) -> Option<(Rect, bool)> {
     (seen.pass + 1 >= pass).then_some((seen.rect, seen.clicked && seen.pass == pass))
 }
 
-/// Test aid (`DECKHAND_TARGETS`): outlines and names every live target.
+/// Test aid (`ROFLOXBOX_TARGETS`): outlines and names every live target.
 pub fn show_targets(ctx: &egui::Context) {
     let pass = ctx.cumulative_pass_nr();
     let Some(targets) = ctx.data(|d| d.get_temp::<Targets>(targets_id())) else { return };
@@ -388,7 +392,10 @@ fn spotlight(
     let gap = 70.0;
     let height = ctx.memory(|m| m.area_rect(id)).map_or(140.0, |r| r.height());
     let below = hole.max.y + gap + height <= screen.max.y - 8.0;
-    let left = (hole.center().x - width * 0.5).clamp(screen.min.x + 16.0, screen.max.x - width - 16.0);
+    // A window narrower than the note: from its left edge.
+    let lowest = screen.min.x + 16.0;
+    let highest = (screen.max.x - width - 16.0).max(lowest);
+    let left = (hole.center().x - width * 0.5).clamp(lowest, highest);
     let top = if below { hole.max.y + gap } else { (hole.min.y - gap - height).max(screen.min.y + 8.0) };
     let mut done = None;
     let note = egui::Area::new(id).order(egui::Order::Tooltip).fixed_pos(egui::pos2(left, top)).show(ctx, |ui| {

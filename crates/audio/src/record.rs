@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn float_wav_keeps_loud_samples() {
-        let path = std::env::temp_dir().join(format!("deckhand-float-{}.wav", std::process::id()));
+        let path = std::env::temp_dir().join(format!("rofloxbox-float-{}.wav", std::process::id()));
         let samples = vec![0.5, -1.5, 1.25, 0.0];
         write_float_wav_file(&path, 44_100, &samples).unwrap();
         let read = crate::decode_file(&path).unwrap();
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn writes_a_valid_24_bit_wav() {
-        let path = std::env::temp_dir().join(format!("deckhand-rec-{}.wav", std::process::id()));
+        let path = std::env::temp_dir().join(format!("rofloxbox-rec-{}.wav", std::process::id()));
         let (recording, mut tap) = Recording::start(&path, 48_000).unwrap();
         for i in 0..4_800 {
             let v = (i as f32 / 4_800.0) - 0.5;

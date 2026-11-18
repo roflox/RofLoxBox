@@ -46,7 +46,7 @@ impl MidiMessage {
 
 /// Names of the MIDI input ports present now.
 pub fn input_ports() -> Vec<String> {
-    let Ok(input) = midir::MidiInput::new("deckhand") else { return Vec::new() };
+    let Ok(input) = midir::MidiInput::new("RofLoxBox") else { return Vec::new() };
     input.ports().iter().filter_map(|port| input.port_name(port).ok()).collect()
 }
 
@@ -66,7 +66,7 @@ pub struct MidiInput {
 
 impl MidiInput {
     pub fn open(port_name: &str, wake: impl Fn() + Send + 'static) -> Result<Self> {
-        let mut input = midir::MidiInput::new("deckhand")?;
+        let mut input = midir::MidiInput::new("RofLoxBox")?;
         input.ignore(midir::Ignore::All);
         let port = input
             .ports()
@@ -79,7 +79,7 @@ impl MidiInput {
         let connection = input
             .connect(
                 &port,
-                "deckhand-in",
+                "rofloxbox-in",
                 move |_, bytes, tx: &mut Sender<MidiMessage>| {
                     if let Some(message) = MidiMessage::parse(bytes) {
                         let taken = hook
@@ -143,7 +143,7 @@ mod tests {
 
 /// Names of the MIDI output ports present now.
 pub fn output_ports() -> Vec<String> {
-    let Ok(output) = midir::MidiOutput::new("deckhand") else { return Vec::new() };
+    let Ok(output) = midir::MidiOutput::new("RofLoxBox") else { return Vec::new() };
     output.ports().iter().filter_map(|port| output.port_name(port).ok()).collect()
 }
 
@@ -156,7 +156,7 @@ impl MidiOutput {
     /// Opens the output port with `name`, or failing that, the first one
     /// whose name contains it (inputs and outputs are often named alike).
     pub fn open(name: &str) -> Result<Self> {
-        let output = midir::MidiOutput::new("deckhand")?;
+        let output = midir::MidiOutput::new("RofLoxBox")?;
         let ports = output.ports();
         let port = ports
             .iter()
@@ -169,7 +169,7 @@ impl MidiOutput {
             .ok_or_else(|| anyhow!("no MIDI output for {name}"))?
             .clone();
         let connection = output
-            .connect(&port, "deckhand-out")
+            .connect(&port, "rofloxbox-out")
             .map_err(|err| anyhow!("connecting to {name}: {err}"))?;
         Ok(Self { connection })
     }

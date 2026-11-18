@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used)] // tests: helpers outside #[test] functions too
 use std::path::{Path, PathBuf};
 
-use deckhand_formats::anlz::{
+use rofloxbox_formats::anlz::{
     AnlzFile, CueKind, CueListKind, CueStatus, HotCueColor, Mood, Section, WaveformKind,
 };
-use deckhand_formats::pdb::Library;
+use rofloxbox_formats::pdb::Library;
 
 fn export_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/complete_export/demo_tracks")

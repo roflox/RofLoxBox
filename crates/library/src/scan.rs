@@ -71,13 +71,14 @@ impl ScannedFile {
             analysis: None,
             derived: None,
             gain_db: None,
+            rekordbox_path: None,
         };
         self.apply_to(&mut track);
         track
     }
 
     /// Refreshes the tag fields of a track, leaving what the user set.
-    /// Fields the user edited in deckhand are kept.
+    /// Fields the user edited in RofLoxBox are kept.
     pub(crate) fn apply_to(self, track: &mut Track) {
         let keep = |field: EditedField| track.edited.contains(&field);
         let (title, artist, album) =
@@ -178,8 +179,16 @@ pub fn embedded_artwork(path: &Path) -> Option<Vec<u8>> {
     Some(front.data().to_vec())
 }
 
-/// Audio files below `folder`, recursively, skipping hidden entries.
+/// A file that keeps the folder it's in out of scans (where replaced
+/// originals of converted tracks go: never added back).
+pub const SKIP_MARKER: &str = ".rofloxbox-skip";
+
+/// Audio files below `folder`, recursively, skipping hidden entries and
+/// folders with a [`SKIP_MARKER`].
 fn audio_files(folder: &Path, out: &mut Vec<PathBuf>) {
+    if folder.join(SKIP_MARKER).exists() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(folder) else { return };
     for entry in entries.flatten() {
         let path = entry.path();

@@ -1,8 +1,8 @@
 //! Prints each track's file name, analysis date and date added.
 //!
-//! `cargo run -p deckhand-formats --example analysis_dates -- export.pdb`
+//! `cargo run -p rofloxbox-formats --example analysis_dates -- export.pdb`
 
-use deckhand_formats::pdb::{Database, Track};
+use rofloxbox_formats::pdb::{Database, Track};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(std::env::args().nth(1).expect("export.pdb"))?;

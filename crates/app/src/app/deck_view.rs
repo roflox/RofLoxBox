@@ -2,12 +2,12 @@
 //! layout-editing mode the elements can be dragged to other rows, into the
 //! side column, or onto "Hide".
 
-use deckhand_audio::Engine;
-use deckhand_control::{DeckAction, PadMode, Value};
+use rofloxbox_audio::Engine;
+use rofloxbox_control::{DeckAction, PadMode, Value};
 use eframe::egui::{self, Color32, RichText, Sense, Slider, Stroke, Ui, UiBuilder, vec2};
 
 use super::{
-    ACTIVE, CUE_COLOR, DECK_COLORS, DeckhandApp, PLAY_COLOR, WARN, beats_label, hot_cue_marks,
+    ACTIVE, CUE_COLOR, DECK_COLORS, RofLoxBoxApp, PLAY_COLOR, WARN, beats_label, hot_cue_marks,
     overview_time, pad_face, pad_mode_short, pad_parameter_caption,
 };
 use crate::widgets::{RoundIcon, round_button};
@@ -95,7 +95,7 @@ const ROW_HEIGHT: f32 = 28.0;
 /// multiple of it, so the same control is the same size everywhere.
 const UNIT: f32 = 34.0;
 
-/// The deck controls' size (Preferences → Appearance → Button size), as an
+/// The deck controls' size (Preferences → View → Button size), as an
 /// f32's bits: every size above is multiplied by it.
 static BUTTON_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000);
 
@@ -210,7 +210,7 @@ fn column_width(section: Section) -> f32 {
 /// The pads' width at most (four across), at the buttons' size.
 const PADS_WIDTH: f32 = 440.0;
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// One deck's controls; `mirror` (a deck in the right column) puts the
     /// side column on its left.
     pub(super) fn deck_ui(&mut self, ui: &mut Ui, index: usize, compact: bool, mirror: bool) {
@@ -239,7 +239,7 @@ impl DeckhandApp {
         // The line under the deck name's buttons set to one side.
         let mut align: Option<bool> = None;
         let stem_model = self.stem_model().is_some();
-        let other = (index + 2) % deckhand_audio::DECKS;
+        let other = (index + 2) % rofloxbox_audio::DECKS;
         let other_deck = (!four)
             .then(|| (other, self.engine.as_ref().is_some_and(|e| e.is_playing(other))));
         let Some(engine) = self.engine.as_mut() else { return };
@@ -790,7 +790,7 @@ fn place_section(
         let x = if after { response.rect.right() } else { response.rect.left() };
         ui.painter().vline(x, response.rect.y_range(), Stroke::new(3.0_f32, ACTIVE));
     }
-    if let Some(dragged) = response.dnd_release_payload::<Section>() {
+    if let Some(dragged) = crate::widgets::dropped::<Section>(&response) {
         *moved = Some((*dragged, Some(Place::Next { to: section, after })));
     }
     // Nothing shown in it: nothing to make bigger.
@@ -944,7 +944,7 @@ fn drop_zone(ui: &mut Ui, text: &str, width: f32, place: Option<Place>, moved: &
         egui::FontId::proportional(11.0),
         color,
     );
-    if let Some(dragged) = response.dnd_release_payload::<Section>() {
+    if let Some(dragged) = crate::widgets::dropped::<Section>(&response) {
         *moved = Some((*dragged, place));
     }
 }
@@ -1229,6 +1229,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 cue_point: deck.cue_point,
                 active_loop: deck.loop_region.map(|r| (r, deck.loop_active)),
                 grid_strength: 0.0,
+                slip: engine.slip_position_secs(index),
             };
             let shown = engine.display_position_secs(index);
             draw_overview(&ui.painter_at(rect), rect, &track.waveform, shown, track.duration, &markers);
@@ -1299,14 +1300,23 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
         }
         E::LoopInOut => {
             let looping = deck.loop_active;
+            // During a loop, IN / OUT adjust that end with the jog.
+            let adjusting = |edge| deck.loop_adjust.is_some_and(|(e, _)| e == edge);
+            let (in_adj, out_adj) =
+                (adjusting(crate::deck::LoopEdge::In), adjusting(crate::deck::LoopEdge::Out));
+            let adjust_tip = "During a loop: move this end with the jog; press again when done";
             split(ui, &[1.2, 1.2, 1.8], |ui, i| match i {
                 0 => {
-                    if toggle_in(ui, deck.loop_in.is_some() && !looping, "IN", CUE_COLOR).clicked() {
+                    let lit = in_adj || (deck.loop_in.is_some() && !looping);
+                    let label = if in_adj { "IN ADJ" } else { "IN" };
+                    if toggle_in(ui, lit, label, CUE_COLOR).on_hover_text(adjust_tip).clicked() {
                         deck.loop_in(engine);
                     }
                 }
                 1 => {
-                    if toggle_in(ui, looping, "OUT", CUE_COLOR).clicked() {
+                    let label = if out_adj { "OUT ADJ" } else { "OUT" };
+                    let lit = out_adj || (looping && !in_adj);
+                    if toggle_in(ui, lit, label, CUE_COLOR).on_hover_text(adjust_tip).clicked() {
                         deck.loop_out(engine);
                     }
                 }
@@ -1759,7 +1769,7 @@ fn hold_pad(
 
 /// A strip under the overview showing which parts of the track have their
 /// stems: lit where they play, dim where the deck still plays the original.
-fn stems_strip(ui: &Ui, rect: egui::Rect, layers: &deckhand_audio::StemLayers) {
+fn stems_strip(ui: &Ui, rect: egui::Rect, layers: &rofloxbox_audio::StemLayers) {
     let painter = ui.painter_at(rect);
     let lit = STEM_COLORS[1];
     painter.rect_filled(rect, 1.0, lit.gamma_multiply(0.25));
@@ -1812,7 +1822,7 @@ fn stems_pads(
     let ready = matches!(deck.stems, Stems::Ready(_));
     pads.show(ui, |ui| {
         ui.horizontal(|ui| {
-            for (part, label) in deckhand_control::STEM_PARTS.iter().enumerate() {
+            for (part, label) in rofloxbox_control::STEM_PARTS.iter().enumerate() {
                 let color = STEM_COLORS[part];
                 let on = deck.stem_on[part] && deck.has_part(part);
                 let text = RichText::new(*label).strong().size(size);
@@ -1878,8 +1888,8 @@ fn stems_pads(
 }
 
 /// Effect names in colours by kind, as on rekordbox's Pad FX pads.
-fn pad_fx_color(kind: deckhand_audio::BeatFxKind) -> Color32 {
-    use deckhand_audio::BeatFxKind as K;
+fn pad_fx_color(kind: rofloxbox_audio::BeatFxKind) -> Color32 {
+    use rofloxbox_audio::BeatFxKind as K;
     match kind {
         K::Roll => Color32::from_rgb(90, 205, 235),
         K::Echo | K::Delay | K::LowCutEcho | K::Spiral => Color32::from_rgb(95, 150, 235),
@@ -2158,7 +2168,7 @@ fn pad_fx_settings(
     row: f32,
     body: f32,
 ) {
-    use deckhand_audio::BeatFxKind;
+    use rofloxbox_audio::BeatFxKind;
     const LEVELS: [u32; 11] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
     let page = usize::from(deck.pad_fx_page) * 8;
     let shift = if shift_held { 8 } else { 0 };
@@ -2331,7 +2341,7 @@ mod tests {
     #[test]
     #[ignore]
     fn every_section_stretches() {
-        let mut engine = Engine::start(&deckhand_audio::AudioOptions::default()).expect("audio output");
+        let mut engine = Engine::start(&rofloxbox_audio::AudioOptions::default()).expect("audio output");
         let mut bad = vec![];
         for section in Section::ALL.into_iter().filter(|s| s.resizable()) {
             for side in [false, true] {

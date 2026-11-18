@@ -7,7 +7,7 @@
 //!
 //! A session file has one JSON object per line: a `start` line with the
 //! snapshot, then `block`, `command` and `jog` lines, and `end`. Tracks are
-//! named by their file, stems by where deckhand's stem cache keeps them.
+//! named by their file, stems by where RofLoxBox's stem cache keeps them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ const VERSION: u32 = 1;
 /// Events the audio thread can log before the writer takes them.
 const QUEUE: usize = 1 << 15;
 
-/// Where a track's stems are: the stem files deckhand keeps for `track`,
+/// Where a track's stems are: the stem files RofLoxBox keeps for `track`,
 /// in `dir`, made by a model with these `stems`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StemsSource {
@@ -4227,7 +4227,7 @@ mod tests {
 
     #[test]
     fn a_replay_plays_the_recording_again() {
-        let dir = std::env::temp_dir().join(format!("deckhand-session-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-session-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let rate = 48_000;
@@ -4410,11 +4410,11 @@ mod tests {
     }
 
     /// Records a few seconds from the audio device (nearly silent) and
-    /// replays them: `cargo test -p deckhand-audio device -- --ignored`
+    /// replays them: `cargo test -p rofloxbox-audio device -- --ignored`
     #[test]
     #[ignore]
     fn replays_a_recording_from_the_audio_device() {
-        let dir = std::env::temp_dir().join(format!("deckhand-device-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-device-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (track(44_100, 8.0, 3), track(48_000, 8.0, 4));
@@ -4454,14 +4454,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Replays the session `DECKHAND_SESSION` into `DECKHAND_REPLAY` and
+    /// Replays the session `ROFLOXBOX_SESSION` into `ROFLOXBOX_REPLAY` and
     /// compares it with its recording (read only):
-    /// `cargo test -p deckhand-audio --release real_session -- --ignored --nocapture`
+    /// `cargo test -p rofloxbox-audio --release real_session -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_session() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
-        let out = PathBuf::from(std::env::var("DECKHAND_REPLAY").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
+        let out = PathBuf::from(std::env::var("ROFLOXBOX_REPLAY").unwrap());
         let started = std::time::Instant::now();
         let session = Session::read(&path, Files).unwrap();
         eprintln!("read in {:?}; warnings {:?}", started.elapsed(), session.warnings());
@@ -4473,13 +4473,13 @@ mod tests {
     }
 
     /// Prints deck 1's clips, plays, edges and events in a real session
-    /// (read only): `DECKHAND_SESSION=… cargo test -p deckhand-audio
+    /// (read only): `ROFLOXBOX_SESSION=… cargo test -p rofloxbox-audio
     /// real_deck -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_deck() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
-        let deck: usize = std::env::var("DECKHAND_DECK").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
+        let deck: usize = std::env::var("ROFLOXBOX_DECK").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
         let session = Session::read(&path, Files).unwrap();
         let start = session.snapshot.clock;
         println!("length {} warnings {:?}", session.length(), session.warnings());
@@ -4509,7 +4509,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_shrink() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, Files).unwrap();
         let span = session.tracks().into_iter().find(|t| t.deck == 0 && !t.playing.is_empty()).unwrap();
         let play = span.playing[0];
@@ -4531,7 +4531,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_timing() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, Files).unwrap();
         println!("{} events", session.events.len());
         let time = |what: &str, f: &mut dyn FnMut()| {
@@ -4556,7 +4556,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_drift() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, Files).unwrap();
         let rate = f64::from(session.rate);
         let (played, _) = session.played_and_mix().unwrap();
@@ -4590,7 +4590,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_resize_timing() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, Files).unwrap();
         let rate = f64::from(session.rate);
         let span = session.tracks().into_iter().filter(|t| !t.playing.is_empty()).max_by_key(|t| t.from).unwrap();
@@ -4645,7 +4645,7 @@ mod tests {
                 Ok(())
             }
         }
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, Files).unwrap();
         let mut full = Every { quick: false, seen: Vec::new() };
         let mut quick = Every { quick: true, seen: Vec::new() };
@@ -4674,11 +4674,11 @@ mod tests {
     /// A grid of `bpm` from the start, `secs` long.
     /// Splits every clip with several plays in a real session and checks
     /// it sounds the same (but for cuts' fades as plays begin):
-    /// `DECKHAND_SESSION=… cargo test -p deckhand-audio --release real_split -- --ignored --nocapture`
+    /// `ROFLOXBOX_SESSION=… cargo test -p rofloxbox-audio --release real_split -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn real_split() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let mut session = Session::read(&path, Files).unwrap();
         let render = |s: &Session| {
             let mut out = Vec::new();
@@ -4725,7 +4725,7 @@ mod tests {
     /// [`record`], with `before` done before recording starts (in the
     /// session's snapshot).
     pub(super) fn record_after(name: &str, before: Vec<Command>, commands: Vec<Command>, secs: f64) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("deckhand-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let rate = 48_000;
@@ -4929,7 +4929,7 @@ mod tests {
         remember_track(&a, &pa);
         remember_track(&b, &pb);
         // Deck 1 plays A, then B from a second on, faded down at 1.5 s.
-        let dir = std::env::temp_dir().join(format!("deckhand-clip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rofloxbox-clip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let rate = 48_000;
@@ -6033,7 +6033,7 @@ mod tests {
             Command::Load { deck: 0, audio: t.clone() },
             Command::SetPlaying { deck: 0, playing: true },
         ], 2.5);
-        let song_dir = std::env::temp_dir().join(format!("deckhand-export-music-{}", std::process::id()));
+        let song_dir = std::env::temp_dir().join(format!("rofloxbox-export-music-{}", std::process::id()));
         std::fs::create_dir_all(&song_dir).unwrap();
         let song = song_dir.join("song.wav");
         std::fs::copy(made.with_extension("wav"), &song).unwrap();
@@ -6046,7 +6046,7 @@ mod tests {
         let session = Session::read(&file, Files).unwrap();
         let before = rendered(&session);
 
-        let out = std::env::temp_dir().join(format!("deckhand-exported-{}", std::process::id()));
+        let out = std::env::temp_dir().join(format!("rofloxbox-exported-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
         session.write(&out.join("set.session")).unwrap();

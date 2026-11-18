@@ -72,7 +72,7 @@ fn work(
 
 fn thumbnail(cover: &Cover) -> Option<ColorImage> {
     let bytes = match cover {
-        Cover::Embedded(path) => deckhand_library::embedded_artwork(path)?,
+        Cover::Embedded(path) => rofloxbox_library::embedded_artwork(path)?,
         Cover::File(path) => std::fs::read(path).ok()?,
     };
     let image = image::load_from_memory(&bytes).ok()?.thumbnail(SIZE, SIZE).to_rgba8();

@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used)] // tests: helpers outside #[test] functions too
 use std::path::{Path, PathBuf};
 
-use deckhand_formats::settings::values::*;
-use deckhand_formats::settings::{Settings, SettingsFile, SettingsKind};
+use rofloxbox_formats::settings::values::*;
+use rofloxbox_formats::settings::{Settings, SettingsFile, SettingsKind};
 
 fn settings_files() -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -10,13 +10,13 @@ set -eu
 cd "$(dirname "$0")/.."
 VERSION=$(scripts/version.sh)
 ARCH=$(uname -m)
-cargo build --release -p deckhand-app
+cargo build --release -p rofloxbox-app
 DIST=$(pwd)/target/dist
 APPDIR=$DIST/RofLoxBox.AppDir
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
     "$APPDIR/usr/share/icons/hicolor/256x256/apps" "$APPDIR/usr/share/icons/hicolor/512x512/apps"
-cp target/release/deckhand-app "$APPDIR/usr/bin/rofloxbox"
+cp target/release/rofloxbox-app "$APPDIR/usr/bin/rofloxbox"
 cp packaging/linux/rofloxbox.desktop "$APPDIR/usr/share/applications/"
 cp packaging/linux/rofloxbox.desktop "$APPDIR/"
 cp packaging/icons/RofLoxBox-256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/rofloxbox.png"

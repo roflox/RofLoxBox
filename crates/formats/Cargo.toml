@@ -1,5 +1,5 @@
 [package]
-name = "deckhand-formats"
+name = "rofloxbox-formats"
 version = "0.1.0"
 description = "Readers for Pioneer DJ USB export formats"
 edition.workspace = true

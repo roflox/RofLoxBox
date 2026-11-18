@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::DeckhandApp;
+use super::RofLoxBoxApp;
 
 /// Playing time (with the channel fader up) that makes a track played.
 const PLAYED_SECONDS: f64 = 30.0;
@@ -19,7 +19,7 @@ pub(super) struct Played {
     logged: bool,
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     pub(super) fn track_history(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.history_tick).as_secs_f64().min(0.5);
@@ -56,7 +56,7 @@ impl DeckhandApp {
             self.collection.add_to_playlist(playlist, &[id]);
             self.collection.update_track(id, |t| {
                 t.play_count += 1;
-                t.last_played = Some(super::collection_view::deckhand_now());
+                t.last_played = Some(super::collection_view::rofloxbox_now());
             });
         }
     }

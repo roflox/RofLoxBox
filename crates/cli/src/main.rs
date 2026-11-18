@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use deckhand_formats::anlz::{AnlzFile, CueKind, Section};
-use deckhand_formats::pdb::{
+use rofloxbox_formats::anlz::{AnlzFile, CueKind, Section};
+use rofloxbox_formats::pdb::{
     Database, DatabaseWriter, Library, PlaylistKind, PlaylistNode, Tag, TagTrack,
 };
-use deckhand_formats::settings::{Settings, SettingsFile};
+use rofloxbox_formats::settings::{Settings, SettingsFile};
 
 #[derive(Parser)]
 #[command(version, about = "Inspect Pioneer DJ USB exports")]
@@ -36,7 +36,7 @@ enum Command {
         #[command(subcommand)]
         command: UsbCommand,
     },
-    /// deckhand's own collection (the one the app shows).
+    /// RofLoxBox's own collection (the one the app shows).
     Collection {
         /// Collection file; defaults to the app's.
         #[arg(long)]
@@ -59,7 +59,7 @@ enum CollectionCommand {
 #[derive(Subcommand)]
 enum UsbCommand {
     /// Copy an export, rewriting every database, analysis and settings file
-    /// with deckhand's writers (audio and other files are copied as they are).
+    /// with RofLoxBox's writers (audio and other files are copied as they are).
     /// Use it to test the writers on a player.
     Rewrite {
         /// Root of the source medium (the directory containing `PIONEER`).
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
             usb_rewrite(&source, &destination)
         }
         Command::Collection { file, command } => {
-            collection(&file.unwrap_or_else(deckhand_library::collection_path), command)
+            collection(&file.unwrap_or_else(rofloxbox_library::collection_path), command)
         }
         Command::Settings { file } => settings(
             &SettingsFile::open(&file).with_context(|| format!("reading {}", file.display()))?,
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
 }
 
 fn collection(file: &Path, command: CollectionCommand) -> Result<()> {
-    let mut collection = deckhand_library::Collection::open(file)?;
+    let mut collection = rofloxbox_library::Collection::open(file)?;
     match command {
         CollectionCommand::Add { paths } => {
             for path in paths.iter().filter(|p| p.is_dir()) {
@@ -114,7 +114,7 @@ fn collection(file: &Path, command: CollectionCommand) -> Result<()> {
             }
             let paths: Vec<PathBuf> =
                 paths.iter().map(std::fs::canonicalize).collect::<std::io::Result<_>>()?;
-            let scan = deckhand_library::Scan::start(paths, collection.known_files());
+            let scan = rofloxbox_library::Scan::start(paths, collection.known_files());
             let files = loop {
                 if let Some(files) = scan.finished() {
                     break files;
@@ -130,7 +130,7 @@ fn collection(file: &Path, command: CollectionCommand) -> Result<()> {
             );
         }
         CollectionCommand::ImportXml { file: xml } => {
-            let s = collection.import_rekordbox(deckhand_library::XmlLibrary::open(&xml)?);
+            let s = collection.import_rekordbox(rofloxbox_library::XmlLibrary::open(&xml)?);
             collection.save()?;
             println!(
                 "{} added, {} updated, {} playlists, {} files not found; {} tracks in {}",

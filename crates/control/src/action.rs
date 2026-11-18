@@ -574,6 +574,85 @@ impl GlobalAction {
 }
 
 impl Action {
+    /// What a button doing this shows with its light, if anything: a
+    /// rebound button's light follows its new function.
+    pub fn feedback(self) -> Option<Feedback> {
+        use DeckAction as D;
+        use DeckFeedback as F;
+        match self {
+            Action::Deck(deck, action) => {
+                let shows = match action {
+                    D::PlayPause => F::Playing,
+                    D::Cue => F::AtCue,
+                    D::HotCue(n) | D::HotCueGate(n) | D::HotCueDelete(n) => F::HotCueSet(n),
+                    D::HotCueGateMode => F::HotCueGateMode,
+                    D::KeyLock => F::KeyLock,
+                    D::Sync => F::Sync,
+                    D::SyncMaster => F::SyncMaster,
+                    D::Quantize => F::Quantize,
+                    D::Vinyl => F::Vinyl,
+                    D::Slip => F::Slip,
+                    D::ReloopExit
+                    | D::ActiveLoop
+                    | D::AutoLoop
+                    | D::LoopHalf
+                    | D::LoopDouble
+                    | D::LoopResizeHalf
+                    | D::LoopResizeDouble
+                    | D::LoopMoveBack
+                    | D::LoopMoveForward => F::LoopActive,
+                    D::LoopIn => F::LoopIn,
+                    D::LoopOut => F::LoopOut,
+                    D::FaderStartPlay => F::Playing,
+                    D::FaderStartCue => F::AtCue,
+                    D::CrossfaderAssignA => F::CrossfaderSide(0),
+                    D::CrossfaderAssignThru => F::CrossfaderSide(1),
+                    D::CrossfaderAssignB => F::CrossfaderSide(2),
+                    D::Select => F::Selected,
+                    D::KeyReset | D::KeyUp | D::KeyDown => F::KeyShifted,
+                    D::PadFxPageDown | D::PadFxPageUp => F::PadFxPage,
+                    D::TempoRangeCycle => F::TempoRangeWide,
+                    // Buttons that do something once a track is in.
+                    D::JumpToStart
+                    | D::TapBpm
+                    | D::MemoryPrev
+                    | D::MemoryNext
+                    | D::MemorySet
+                    | D::MemoryDelete
+                    | D::BeatJumpBack
+                    | D::BeatJumpForward => F::Loaded,
+                    D::HeadphoneCue => F::HeadphoneCue,
+                    D::Load => F::Loaded,
+                    D::KeySync => F::KeySync,
+                    D::SamplerPlay(n) | D::SamplerStop(n) => F::SamplerPlaying(n),
+                    D::PadMode(mode) => F::PadMode(mode),
+                    D::Keyboard(n) => F::PadLit(PadMode::Keyboard, n),
+                    D::PadFx(n) => F::PadLit(PadMode::PadFx, n),
+                    D::BeatJump(n) => F::PadLit(PadMode::BeatJump, n),
+                    D::BeatLoop(n) => F::PadLit(PadMode::BeatLoop, n),
+                    D::KeyShift(n) => F::PadLit(PadMode::KeyShift, n),
+                    D::StemPart(n) => F::StemOn(n),
+                    D::PartIsolator => F::PartIsolator,
+                    _ => return None,
+                };
+                Some(Feedback::Deck(deck, shows))
+            }
+            Action::Global(action) => {
+                let shows = match action {
+                    GlobalAction::FxOn => GlobalFeedback::FxOn,
+                    GlobalAction::FxRelease => GlobalFeedback::FxRelease,
+                    GlobalAction::ColorFxOn => GlobalFeedback::ColorFxOn,
+                    GlobalAction::MasterCue => GlobalFeedback::MasterCue,
+                    GlobalAction::FxType(n) => GlobalFeedback::FxType(n),
+                    GlobalAction::FxAssign(n) => GlobalFeedback::FxAssign(n),
+                    GlobalAction::FxTap | GlobalAction::FxAutoBeat => GlobalFeedback::FxTapped,
+                    _ => return None,
+                };
+                Some(Feedback::Global(shows))
+            }
+        }
+    }
+
     /// Every action, deck by deck, then the global ones.
     pub fn all() -> Vec<Action> {
         (0..DECKS)
@@ -640,6 +719,21 @@ pub enum DeckFeedback {
     /// A stem part is playing (0 vocals … 3 drums).
     StemOn(u8),
     PartIsolator,
+    /// Lit while the hot cue pads are in gate mode.
+    HotCueGateMode,
+    /// Lit while the channel is on that crossfader side: 0 A, 1 THRU, 2 B.
+    CrossfaderSide(u8),
+    /// Lit while the deck is the one its side of the controller plays.
+    Selected,
+    /// Lit while the key is shifted from the track's own.
+    KeyShifted,
+    /// Lit while the Pad FX pads show effects I–P.
+    PadFxPage,
+    /// Lit while the tempo range is wider than the narrowest one chosen.
+    TempoRangeWide,
+    /// LOOP IN / OUT: lit during a loop; flashing while adjusting that end.
+    LoopIn,
+    LoopOut,
 }
 
 /// State of the mixer-wide sections.
@@ -652,19 +746,36 @@ pub enum GlobalFeedback {
     /// Beat FX beat length, as the value that lights the controller's beat
     /// indicator for it.
     FxBeat,
+    /// Lit while that Beat FX type 0–13 is chosen.
+    FxType(u8),
+    /// Lit while Beat FX work on channel 0–3, 4 the master, 5 the sampler.
+    FxAssign(u8),
+    /// Lit while the Beat FX follow a tapped BPM.
+    FxTapped,
 }
 
 impl GlobalFeedback {
-    const ALL: [GlobalFeedback; 5] =
-        [Self::FxOn, Self::FxRelease, Self::ColorFxOn, Self::MasterCue, Self::FxBeat];
+    fn all() -> Vec<GlobalFeedback> {
+        let mut all =
+            vec![Self::FxOn, Self::FxRelease, Self::ColorFxOn, Self::MasterCue, Self::FxBeat];
+        all.extend((0..14).map(Self::FxType));
+        all.extend((0..6).map(Self::FxAssign));
+        all.push(Self::FxTapped);
+        all
+    }
 
-    fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::FxOn => "fx_on",
-            Self::FxRelease => "fx_release",
-            Self::ColorFxOn => "color_fx_on",
-            Self::MasterCue => "master_cue",
-            Self::FxBeat => "fx_beat",
+            Self::FxOn => "fx_on".into(),
+            Self::FxRelease => "fx_release".into(),
+            Self::ColorFxOn => "color_fx_on".into(),
+            Self::MasterCue => "master_cue".into(),
+            Self::FxBeat => "fx_beat".into(),
+            Self::FxType(n) => format!("fx_type_{}_on", n + 1),
+            Self::FxAssign(n @ 0..=3) => format!("fx_assign_ch{}_on", n + 1),
+            Self::FxAssign(4) => "fx_assign_master_on".into(),
+            Self::FxAssign(_) => "fx_assign_sampler_on".into(),
+            Self::FxTapped => "fx_tapped".into(),
         }
     }
 }
@@ -673,6 +784,22 @@ impl GlobalFeedback {
 pub enum Feedback {
     Deck(usize, DeckFeedback),
     Global(GlobalFeedback),
+}
+
+impl Feedback {
+    /// The deck and pad mode whose pads show this state, if it is a pad's.
+    pub fn pad_mode(self) -> Option<(usize, PadMode)> {
+        use DeckFeedback as F;
+        let Feedback::Deck(deck, shows) = self else { return None };
+        let mode = match shows {
+            F::HotCueSet(_) => PadMode::HotCue,
+            F::PadLit(mode, _) => mode,
+            F::SamplerPlaying(_) => PadMode::Sampler,
+            F::StemOn(_) => PadMode::Stems,
+            _ => return None,
+        };
+        Some((deck, mode))
+    }
 }
 
 impl DeckFeedback {
@@ -695,7 +822,9 @@ impl DeckFeedback {
         ]);
         all.extend((0..8).map(SamplerPlaying));
         all.extend((0..4).map(StemOn));
-        all.push(PartIsolator);
+        all.extend([PartIsolator, HotCueGateMode]);
+        all.extend((0..3).map(CrossfaderSide));
+        all.extend([Selected, KeyShifted, PadFxPage, TempoRangeWide, LoopIn, LoopOut]);
         all.extend(self::PadMode::ALL.map(PadMode));
         for mode in [
             self::PadMode::Keyboard,
@@ -733,6 +862,14 @@ impl DeckFeedback {
             PadLit(mode, n) => format!("{}_pad_{}", mode.name(), n + 1),
             StemOn(n) => format!("stem_{}_on", STEM_PARTS[usize::from(n % 4)].to_lowercase()),
             PartIsolator => "part_isolator".into(),
+            HotCueGateMode => "hot_cue_gate_mode".into(),
+            CrossfaderSide(n) => format!("crossfader_{}", ["a", "thru", "b"][usize::from(n % 3)]),
+            Selected => "selected".into(),
+            KeyShifted => "key_shifted".into(),
+            PadFxPage => "pad_fx_page_2".into(),
+            TempoRangeWide => "tempo_range_wide".into(),
+            LoopIn => "loop_in".into(),
+            LoopOut => "loop_out".into(),
         }
     }
 }
@@ -741,7 +878,7 @@ impl fmt::Display for Feedback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Feedback::Deck(deck, what) => write!(f, "deck{}.{}", deck + 1, what.name()),
-            Feedback::Global(what) => f.write_str(what.name()),
+            Feedback::Global(what) => f.write_str(&what.name()),
         }
     }
 }
@@ -754,7 +891,7 @@ impl FromStr for Feedback {
             .flat_map(|deck| {
                 DeckFeedback::all().into_iter().map(move |what| Feedback::Deck(deck, what))
             })
-            .chain(GlobalFeedback::ALL.map(Feedback::Global))
+            .chain(GlobalFeedback::all().into_iter().map(Feedback::Global))
             .find(|f| f.to_string() == text)
             .ok_or_else(|| format!("unknown feedback {text:?}"))
     }
@@ -774,6 +911,16 @@ mod tests {
         let feedback = Feedback::Deck(1, DeckFeedback::HotCueSet(3));
         assert_eq!(feedback.to_string().parse(), Ok(feedback));
         assert_eq!("fx_on".parse(), Ok(Feedback::Global(GlobalFeedback::FxOn)));
+        let every = DeckFeedback::all().into_iter().map(|f| Feedback::Deck(2, f));
+        for feedback in every.chain(GlobalFeedback::all().into_iter().map(Feedback::Global)) {
+            assert_eq!(feedback.to_string().parse(), Ok(feedback));
+        }
+        // Every button's light shows something it can parse back.
+        for action in Action::all() {
+            if let Some(feedback) = action.feedback() {
+                assert_eq!(feedback.to_string().parse(), Ok(feedback), "{action}");
+            }
+        }
         assert_eq!("fx_assign_master".parse(), Ok(Action::Global(GlobalAction::FxAssign(4))));
     }
 

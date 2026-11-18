@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use deckhand_audio::TrackAudio;
+use rofloxbox_audio::TrackAudio;
 use eframe::egui::{Color32, Mesh, Rect, pos2};
 
 /// Frames per bin at the finest level; each level up is `FAN` times

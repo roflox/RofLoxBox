@@ -2,15 +2,15 @@
 
 use std::time::{Duration, Instant};
 
-use deckhand_audio::{BeatFxKind, ColorFxKind, CrossfaderSide, FxTarget};
+use rofloxbox_audio::{BeatFxKind, ColorFxKind, CrossfaderSide, FxTarget};
 
-use super::DeckhandApp;
+use super::RofLoxBoxApp;
 use crate::config::{DeckSession, FxSession, Session, Side};
 
 /// How often changed settings are written while running.
 const SAVE_EVERY: Duration = Duration::from_secs(3);
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// The current settings, as saved.
     fn capture_session(&self) -> Session {
         let decks = self
@@ -119,7 +119,7 @@ impl DeckhandApp {
             Some(ch) => ch
                 .strip_prefix("ch")
                 .and_then(|n| n.parse::<usize>().ok())
-                .filter(|n| (1..=deckhand_audio::DECKS).contains(n))
+                .filter(|n| (1..=rofloxbox_audio::DECKS).contains(n))
                 .map_or(FxTarget::Master, |n| FxTarget::Channel(n - 1)),
         };
         if let Some(color) = session.fx.color.and_then(|i| ColorFxKind::ALL.get(i)) {

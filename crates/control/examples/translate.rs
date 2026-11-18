@@ -1,9 +1,9 @@
 //! Prints what a mapping file turns MIDI messages into.
 //!
-//! `cargo run -p deckhand-control --example translate -- mapping.toml 94:4A:7F 84:4A:00`
+//! `cargo run -p rofloxbox-control --example translate -- mapping.toml 94:4A:7F 84:4A:00`
 //! (status:data1:data2 in hex).
 
-use deckhand_control::{Mapping, MidiMessage, Translator};
+use rofloxbox_control::{Mapping, MidiMessage, Translator};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

@@ -1,8 +1,8 @@
-# deckhand — plan
+# RofLoxBox — plan
 
 A DJ library and performance application written in Rust that is compatible
 with Pioneer DJ hardware (CDJ/XDJ players, USB exports, Pro DJ Link), without
-subscriptions, accounts, telemetry or ads. "deckhand" is a working name.
+subscriptions, accounts, telemetry or ads.
 
 ## Ground rules
 
@@ -33,8 +33,8 @@ subscriptions, accounts, telemetry or ads. "deckhand" is a working name.
 
 | Crate | Purpose |
 |---|---|
-| `crates/formats` (`deckhand-formats`) | Pioneer on-disk formats: `export.pdb`, `exportExt.pdb`, ANLZ, `*SETTING.DAT` |
-| `crates/cli` (`deckhand`) | Command-line tool to inspect and (later) build exports |
+| `crates/formats` (`rofloxbox-formats`) | Pioneer on-disk formats: `export.pdb`, `exportExt.pdb`, ANLZ, `*SETTING.DAT` |
+| `crates/cli` (`rofloxbox`) | Command-line tool to inspect and (later) build exports |
 | `crates/library` | Own library model and storage (SQLite), importers |
 | `crates/audio` | Decoding and output |
 | `crates/analysis` | BPM, beatgrid, key, waveforms |
@@ -57,7 +57,7 @@ Each step ends with tests passing; a phase ends with its acceptance check.
    artwork, playlist tree, playlist entries, history playlists/entries.
 5. ✅ High-level `Library` view: tracks with resolved names, playlist tree
    with ordered tracks.
-6. ✅ CLI: `deckhand pdb info|tracks|playlists`.
+6. ✅ CLI: `rofloxbox pdb info|tracks|playlists`.
 7. ✅ Tests: fixture assertions + cross-check against rekordcrate.
 
 **Acceptance:** ✅ reads every fixture; ✅ row counts and playlist names
@@ -82,7 +82,7 @@ reporting upstream.
    its field. Values no fixture shows (defaults, gaps in evenly spaced
    sequences) are marked *inferred* in the docs; unmapped bytes decode as
    `Unknown(byte)`.
-5. ✅ CLI: `deckhand anlz`, `deckhand settings`.
+5. ✅ CLI: `rofloxbox anlz`, `rofloxbox settings`.
 6. ✅ PQT2 (no public docs; own analysis): header repeats the first and
    last PQTZ beat and the beat count — verified on both fixtures. The
    2-byte-per-beat payload is exposed raw.
@@ -120,10 +120,10 @@ Carried forward (needs data we don't have yet):
      byte for byte;
    - every row of the fresh fixtures re-encodes byte for byte; rows of the
      edited fixture differ only in stale padding bytes.
-5. ✅ CLI: `deckhand usb rewrite <source> <destination>` copies an export,
+5. ✅ CLI: `rofloxbox usb rewrite <source> <destination>` copies an export,
    rewriting every database, analysis and settings file.
 
-**Acceptance:** ⏳ a stick produced by `deckhand usb rewrite` from a
+**Acceptance:** ⏳ a stick produced by `rofloxbox usb rewrite` from a
 rekordbox export browses and plays on a CDJ/XDJ (needs hardware).
 
 Unverified defaults (no fixture data; check on hardware or with a
@@ -141,7 +141,7 @@ self-made export):
    with tag reading (e.g. `lofty`).
 3. Exporters: rekordbox XML; USB export via phase 3 (copying audio files,
    path layout `/Contents/...`, `/PIONEER/USBANLZ/Pxxx/xxxxxxxx/`).
-4. CLI: `deckhand import`, `deckhand export usb <mount>`.
+4. CLI: `rofloxbox import`, `rofloxbox export usb <mount>`.
 
 **Acceptance:** first usable product — prepare USB sticks for club players
 from a local library without rekordbox.
@@ -188,7 +188,7 @@ Done (milestone 2, 2026-10-25):
   external commands, cached per track; Make → acapella / instrumental /
   without drums / single stems as new tracks with the original's cues and
   grid. Demucs htdemucs: 60 s for a 4.6 min track on an M1 CPU, stems
-  sample-aligned with deckhand's decoding.
+  sample-aligned with RofLoxBox's decoding.
 
 - Stems, part 2: live stems. Separation on load in its own queue; the engine
   mixes vocal/bass/drum layers (16-bit, resampled to the track) with INST as
@@ -200,7 +200,7 @@ Next:
 1. Stems part 3: a built-in ONNX runner; Drum Swap; waveforms that show
    muted parts.
 2. Beat FX and the sampler; stems (needs separation models).
-3. Save hot cues / cue points set in deckhand.
+3. Save hot cues / cue points set in RofLoxBox.
 4. Tune jog scratch resolution on hardware (`SCRATCH_SECONDS_PER_STEP`).
 
 ### Phase 5 — audio and analysis
@@ -229,7 +229,7 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
 ## Status log
 
 - 2026-10-25 — Phase 1 steps 1–7 done: `export.pdb` + `exportExt.pdb`
-  reader (`deckhand-formats`), CLI (`deckhand pdb …`), 14 tests passing.
+  reader (`rofloxbox-formats`), CLI (`rofloxbox pdb …`), 14 tests passing.
   Remaining for acceptance: a self-made USB export as fixture.
 - 2026-10-25 — Phase 2 steps 1–3 and 5 done: ANLZ reader (all documented
   sections), settings container + checksum, CLI commands, 27 tests passing.
@@ -238,7 +238,7 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   fixtures verified), PQT2 summary decoded, 31 tests passing. Next: phase 3
   (writers).
 - 2026-10-25 — Phase 3 done: pdb, ANLZ and settings writers; new exports
-  are byte-identical to rekordbox's; `deckhand usb rewrite`; 41 tests
+  are byte-identical to rekordbox's; `rofloxbox usb rewrite`; 41 tests
   passing. Waiting on hardware test.
 - 2026-10-25 — Priority changed to the playable app. Milestone 1 done:
   audio engine, controller mappings with learn mode, GUI; 51 tests.
@@ -256,7 +256,7 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   prefixes and picks MIDI-mode variants; all 69 installed files import
   (DDJ-1000/800/FLX10 went from ~120 to ~385 controls). rekordbox 6 files
   are used when rekordbox 6 is installed or placed in
-  `~/Library/Application Support/deckhand/rekordbox-mappings/`; any file
+  `~/Library/Application Support/RofLoxBox/rekordbox-mappings/`; any file
   can be imported directly.
 - 2026-10-25 — Verified against rekordbox 6.8.6's 63 mapping files: every
   rb6 controller is also in rb7 (rb7 adds FLX2, GRV6, DJM-V5, XDJ-AN,
@@ -273,7 +273,7 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   columns between decks and mixer, upcoming music from the top), show/hide
   waveforms, mixer and library. Next idea: keyboard shortcuts.
 - 2026-10-25 — Master Tempo (key lock): WSOLA time-stretcher in
-  `deckhand-audio` (40 ms grains, ±12 ms similarity search, ~300× real
+  `rofloxbox-audio` (40 ms grains, ±12 ms similarity search, ~300× real
   time per deck), MT button and controller Master Tempo button/LED;
   `--example stretch` renders a track to WAV for listening. Waveforms follow
   the mixer's channel order. Windows build: `scripts/build-windows.sh`
@@ -286,14 +286,14 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   (scratching and paused jogging), instead of per-UI-frame speed jumps and
   hard position jumps. Controllers get the Pioneer status request
   (`F0 00 40 05 00 00 <model> 00 03 01 F7`) on connect so faders and knobs
-  start at their physical positions; model IDs in `deckhand-control`'s
+  start at their physical positions; model IDs in `rofloxbox-control`'s
   `pioneer.rs` (GRV6 = 04 0C, untested on hardware yet;
   `--example sysex_probe` checks it). 73 tests.
 - 2026-10-25 — Controller functions: slip mode (shadow timeline in the
   engine for scratch, loops and held hot cues), key shift/sync/reset,
   Keyboard and Key Shift pad modes, TAP BPM (rewrites the grid), active
   loop, channel/crossfader fader start, Master Cue, browse page/top/bottom,
-  focus switch. Effects in `deckhand-audio/src/fx.rs` (own DSP): Beat FX
+  focus switch. Effects in `rofloxbox-audio/src/fx.rs` (own DSP): Beat FX
   Delay, Echo, Low Cut Echo, Spiral, Helix, Reverb, Flanger, Phaser, Filter,
   Trans, Pitch, Roll, Mobius Saw/Tri with beat values, tap, assign
   (CH/master/sampler) and Release FX; 16 momentary Pad FX presets; Color FX
@@ -318,7 +318,7 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   Jump, rekordbox's Parameter1/2), loop sizes ×½/×2 (Beat Loop, our own),
   sampler bank 1–4 (4 × 16 slots, folder holds up to 64 files). Importer maps
   Parameter1*_Sampler, *_PadFx and Parameter2*_BeatJump. 87 tests.
-- 2026-10-25 — Library, step 1 (own collection): `deckhand-library` with
+- 2026-10-25 — Library, step 1 (own collection): `rofloxbox-library` with
   tracks (tags via lofty: title/artist/album/genre/label/comment/year/BPM/key
   /artwork flag, rating, colour, play count, cues field for later), nested
   playlists and folders, rescannable folders, atomic JSON storage in the data
@@ -326,15 +326,15 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   rename/move/delete, add folder/files, drop files on the window, background
   scan with progress, track context menu (load, add to/remove from playlist,
   reveal, remove), drag tracks onto playlists, browse knob/LOAD work on it.
-  CLI: `deckhand collection add|list`. Next: track analysis (BPM, grid, key,
+  CLI: `rofloxbox collection add|list`. Next: track analysis (BPM, grid, key,
   coloured waveforms) for collection tracks, then USB export, then browser.
-- 2026-10-25 — rekordbox XML import (`deckhand-library/src/rekordbox_xml.rs`,
+- 2026-10-25 — rekordbox XML import (`rofloxbox-library/src/rekordbox_xml.rs`,
   quick-xml): COLLECTION tracks (Location URLs incl. Windows drive paths,
   tags, rating 0–255 → stars, colour labels, play count, date added), TEMPO
   beat-grid markers, POSITION_MARK hot/memory cues and loops with colours,
   PLAYLISTS tree (KeyType TrackID or location). Matched by file path; the
   playlists go in a top-level `rekordbox` folder that a re-import replaces.
-  Decks use the imported grid and cues. App button + `deckhand collection
+  Decks use the imported grid and cues. App button + `rofloxbox collection
   import-xml`. 93 tests.
 - 2026-10-25 — Shift as a modifier in mappings: `[[shift]]` controls (learned
   with "Learn Shift button", or the rekordbox file's `Shift` rows), bindings
@@ -356,7 +356,7 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
   Cue (level, per deck), Vinyl Speed Adjust (start-up and brake ramps in the
   engine), scratch sensitivity; crossfader curve (smooth/standard/sharp),
   channel fader curve (slow/standard/fast), Isolator vs EQ, master limiter.
-  `scripts/build-macos.sh` builds an Apple Silicon `deckhand.app` (ad-hoc
+  `scripts/build-macos.sh` builds an Apple Silicon `RofLoxBox.app` (ad-hoc
   signed, zipped; `--universal` adds Intel). 100 tests.
 - 2026-10-26 — Deck layout: every deck control is an element (`layout.rs`,
   28 of them: CUE, Play, SYNC, MASTER, Q, VINYL, SLIP, loop groups, memory,
@@ -379,4 +379,4 @@ UI over library + engine (toolkit to be chosen: egui, iced or slint).
 - 2026-10-26 — Waveforms without rekordbox colour data (collection tracks,
   monochrome analyses) are coloured from their own band energies like the
   RGB view (bass red, mids green, highs blue) instead of plain blue. App is
-  shown as RofLoxBox (window, RofLoxBox.app / .exe; code keeps deckhand).
+  shown as RofLoxBox (window, RofLoxBox.app / .exe).

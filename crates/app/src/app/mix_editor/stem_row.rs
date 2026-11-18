@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 
-use deckhand_audio::{PARTS, StemLayers, StemLevels, StemSpan, StemsSource, TrackSpan};
-use deckhand_control::STEM_PARTS;
+use rofloxbox_audio::{PARTS, StemLayers, StemLevels, StemSpan, StemsSource, TrackSpan};
+use rofloxbox_control::STEM_PARTS;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke, Ui, pos2, vec2};
 
-use super::{DECK_COLORS, DeckhandApp, Edit, FxGrip, GRAB, LABELS, MixEditor, pack, value_tag};
+use super::{DECK_COLORS, RofLoxBoxApp, Edit, FxGrip, GRAB, LABELS, MixEditor, pack, value_tag};
 use crate::app::deck_view::STEM_COLORS;
 
 /// The height of a deck's stems row.
@@ -79,7 +79,7 @@ fn is_off(level: f32) -> bool {
     level < 1e-3
 }
 
-/// The stretches of `changes` (as [`deckhand_audio::Session::stem_levels`]
+/// The stretches of `changes` (as [`rofloxbox_audio::Session::stem_levels`]
 /// gives them) with a part not as recorded.
 pub(super) fn stem_blocks(changes: &[StemLevels], length: u64) -> Vec<StemBlock> {
     let mut blocks = Vec::new();
@@ -410,11 +410,13 @@ impl MixEditor {
                 }
                 FxGrip::Start => {
                     snapped = self.stem_snap(ui, area, at);
-                    (snapped.unwrap_or(at).clamp(low, block.to.saturating_sub(1)), block.to)
+                    let high = block.to.saturating_sub(1).max(low);
+                    (snapped.unwrap_or(at).clamp(low, high), block.to)
                 }
                 FxGrip::End => {
                     snapped = self.stem_snap(ui, area, at);
-                    (block.from, snapped.unwrap_or(at).clamp(block.from + 1, high))
+                    let low = block.from + 1;
+                    (block.from, snapped.unwrap_or(at).clamp(low, high.max(low)))
                 }
             };
             self.snap_line = snapped;
@@ -679,7 +681,7 @@ impl MixEditor {
         let shared = self.session.clone();
         let Ok(mut session) = shared.lock() else { return };
         let Some(before) = pack(&session) else { return };
-        let spans: Vec<TrackSpan> = (0..deckhand_audio::DECKS)
+        let spans: Vec<TrackSpan> = (0..rofloxbox_audio::DECKS)
             .flat_map(|d| self.clips_without_stems(d))
             .filter(|t| t.path == path)
             .collect();
@@ -696,7 +698,7 @@ impl MixEditor {
     }
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// EDIT's stem separations: starts those asked for, takes in what the
     /// separator sends, and saves finished stems with the recording before
     /// the clips get them.
@@ -795,7 +797,7 @@ impl DeckhandApp {
             match (result, stems) {
                 (Ok(source), Some(stems)) => {
                     // The session names them by the recording's copy now.
-                    deckhand_audio::remember_stems(&stems, source);
+                    rofloxbox_audio::remember_stems(&stems, source);
                     editor.take_stems(&path, &stems, deck);
                     self.status = Some(format!(
                         "Stems ready for {}",
@@ -812,7 +814,7 @@ impl DeckhandApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deckhand_audio::Session;
+    use rofloxbox_audio::Session;
     use std::path::PathBuf;
 
     /// Clicks on deck 1's stems row (as wide as the window, labels and
@@ -852,14 +854,14 @@ mod tests {
         }
     }
 
-    /// On `DECKHAND_SESSION`, a set whose deck 1 had stems: a clip added,
+    /// On `ROFLOXBOX_SESSION`, a set whose deck 1 had stems: a clip added,
     /// then clicked (picked, unchanged), double-clicked (opened,
     /// unchanged) and right-clicked (gone):
-    /// `cargo test -p deckhand-app clicking_stem_clips -- --ignored`
+    /// `cargo test -p rofloxbox-app clicking_stem_clips -- --ignored`
     #[test]
     #[ignore]
     fn clicking_stem_clips() {
-        let path = PathBuf::from(std::env::var("DECKHAND_SESSION").unwrap());
+        let path = PathBuf::from(std::env::var("ROFLOXBOX_SESSION").unwrap());
         let session = Session::read(&path, crate::app::recording::Sources).unwrap();
         let mut editor = MixEditor::new(path, session);
         let span = editor.stem_spans[0][0];

@@ -7,10 +7,10 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
-use deckhand_library::{AUDIO_EXTENSIONS, ScannedFile, read_file};
+use rofloxbox_library::{AUDIO_EXTENSIONS, NodeKind, Place, ScannedFile, read_file};
 use eframe::egui::{self, RichText, Stroke, Ui};
 
-use super::{DeckhandApp, Focus, Source};
+use super::{RofLoxBoxApp, Focus, Source};
 use crate::browser::{Row, TableOptions, sort_rows, track_table};
 use crate::widgets::disclosure;
 
@@ -27,6 +27,9 @@ pub struct ExplorerView {
     files: Vec<ScannedFile>,
     /// Tags still being read for the folder.
     reading: Option<Receiver<ScannedFile>>,
+    /// "Add to playlist" asked for the folder shown: the playlist chosen
+    /// (`None`: a new one named like the folder).
+    adding: Option<Option<u32>>,
 }
 
 impl ExplorerView {
@@ -93,7 +96,7 @@ pub fn file_id(path: &Path) -> u32 {
     (hasher.finish() as u32) | 0x8000_0000
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// Shows a folder's audio files, reading their tags in the background.
     pub(super) fn open_explorer_folder(&mut self, folder: PathBuf) {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&folder)
@@ -196,10 +199,18 @@ impl DeckhandApp {
                     self.explorer.expanded.insert(path.to_path_buf());
                 }
             }
-            if ui.selectable_label(selected, format!("🗀 {label}")).clicked() {
+            let response = ui.selectable_label(selected, format!("🗀 {label}"));
+            if response.clicked() {
                 self.open_explorer_folder(path.to_path_buf());
                 self.focus = Focus::Playlists;
             }
+            response.context_menu(|ui| {
+                if ui.button("Add to playlist…").on_hover_text(ADD_HINT).clicked() {
+                    self.open_explorer_folder(path.to_path_buf());
+                    self.start_adding_folder();
+                    ui.close();
+                }
+            });
         });
         if !expanded {
             return;
@@ -268,6 +279,11 @@ impl DeckhandApp {
                 artwork: f.has_artwork.then(|| crate::artwork::Cover::Embedded(f.path.clone())),
                 preview: Some(crate::preview::Source { audio: f.path.clone(), analysis: None }),
                 cues: None,
+                track_number: f.track_number,
+                path: f.path.clone(),
+                size: f.file_size,
+                sample_rate: f.sample_rate,
+                ..Row::default()
             })
             .collect();
         sort_rows(&mut rows, self.config.sort);
@@ -321,6 +337,9 @@ impl DeckhandApp {
                 }
             }
             ui.separator();
+            if ui.button("Add to playlist…").on_hover_text(ADD_HINT).clicked() {
+                self.start_adding_folder();
+            }
             if ui
                 .button("Add folder to collection")
                 .on_hover_text("Add with subfolders, kept scanned")
@@ -361,7 +380,9 @@ impl DeckhandApp {
             compatible_with: self.compatible_key(),
         };
         let selection = self.selected_ids();
-        let group = |id: u32| if self.marked.contains(&id) { selection.clone() } else { vec![id] };
+        let group = |row: &Row| {
+            if self.marked.contains(&row.position) { selection.clone() } else { vec![row.id] }
+        };
         let mut add: Option<Vec<u32>> = None;
         let output = egui::Frame::new()
             .stroke(stroke)
@@ -380,7 +401,7 @@ impl DeckhandApp {
                             }
                         }
                         ui.separator();
-                        let ids = group(row.id);
+                        let ids = group(row);
                         let label = match ids.len() {
                             1 => "Add to collection".to_owned(),
                             n => format!("Add {n} tracks to collection"),
@@ -417,4 +438,133 @@ impl DeckhandApp {
             self.load_from_explorer(id, deck, ctx);
         }
     }
+
+    /// Opens "Add to playlist" for the folder shown, with the playlist of
+    /// the folder's name chosen if there is one.
+    fn start_adding_folder(&mut self) {
+        let Some(folder) = &self.explorer.folder else { return };
+        let wanted = name(folder);
+        let same = self.collection.tree().into_iter().find(|(_, n)| {
+            n.kind == NodeKind::Playlist && n.name.trim().eq_ignore_ascii_case(wanted.trim())
+        });
+        self.explorer.adding = Some(same.map(|(_, n)| n.id));
+    }
+
+    /// The folder's files that aren't in `playlist` yet (all of them for a
+    /// new one).
+    fn folder_files_missing_from(&self, playlist: Option<u32>) -> Vec<PathBuf> {
+        let inside: HashSet<&Path> = playlist
+            .and_then(|id| self.collection.node(id))
+            .map(|node| {
+                node.tracks
+                    .iter()
+                    .filter_map(|&t| self.collection.track(t))
+                    .map(|t| t.path.as_path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.explorer
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .filter(|p| !inside.contains(p.as_path()))
+            .collect()
+    }
+
+    /// "Add to playlist": the folder's tracks not in the chosen playlist
+    /// yet go into it.
+    pub(super) fn add_folder_dialog(&mut self, ctx: &egui::Context) {
+        let Some(chosen) = self.explorer.adding else { return };
+        let Some(folder) = self.explorer.folder.clone() else {
+            self.explorer.adding = None;
+            return;
+        };
+        let folder_name = name(&folder);
+        // Every playlist, with the folders it's in.
+        let playlists: Vec<(u32, String)> = self
+            .collection
+            .tree()
+            .into_iter()
+            .filter(|(_, n)| n.kind == NodeKind::Playlist)
+            .map(|(_, n)| {
+                let mut label = n.name.clone();
+                let mut parent = n.parent;
+                while let Some(p) = parent.and_then(|p| self.collection.node(p)) {
+                    label = format!("{} / {label}", p.name);
+                    parent = p.parent;
+                }
+                (n.id, label)
+            })
+            .collect();
+        let new_label = format!("New playlist \"{folder_name}\"");
+        let label_of = |id: Option<u32>| match id {
+            None => new_label.clone(),
+            Some(id) => playlists
+                .iter()
+                .find(|(p, _)| *p == id)
+                .map_or_else(String::new, |(_, l)| l.clone()),
+        };
+        let missing = self.folder_files_missing_from(chosen);
+        let total = self.explorer.files.len();
+        let (mut choice, mut answer) = (chosen, None);
+        egui::Window::new(format!("Add \"{folder_name}\" to a playlist"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::ComboBox::from_label("Playlist")
+                    .selected_text(label_of(choice))
+                    .width(320.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, &new_label);
+                        for (id, label) in &playlists {
+                            ui.selectable_value(&mut choice, Some(*id), label);
+                        }
+                    });
+                ui.label(match (missing.len(), total) {
+                    (_, 0) => "There are no audio files in this folder.".to_owned(),
+                    (0, n) => format!("All {n} tracks are in it already."),
+                    (m, n) if m == n => format!("None of the {n} tracks are in it yet."),
+                    (m, n) => format!("{m} of the {n} tracks aren't in it yet."),
+                });
+                ui.label(
+                    RichText::new("Only this folder's files, not its subfolders.").small().weak(),
+                );
+                ui.horizontal(|ui| {
+                    let add = format!("Add {} track(s)", missing.len());
+                    if ui.add_enabled(!missing.is_empty(), egui::Button::new(add)).clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        answer = Some(false);
+                    }
+                });
+            });
+        self.explorer.adding = Some(choice);
+        match answer {
+            Some(true) => {
+                self.explorer.adding = None;
+                let playlist = choice.unwrap_or_else(|| {
+                    let first = self.collection.tree().first().map(|(_, n)| n.id);
+                    let id = self.collection.create(&folder_name, NodeKind::Playlist, None);
+                    if let Some(first) = first {
+                        self.collection.move_nodes(&[id], Place::Before(first));
+                    }
+                    id
+                });
+                let count = missing.len();
+                self.add_files_to_playlist(missing, playlist);
+                let name =
+                    self.collection.node(playlist).map_or_else(String::new, |n| n.name.clone());
+                self.status = Some(format!("Adding {count} track(s) to {name}"));
+            }
+            Some(false) => self.explorer.adding = None,
+            None => {}
+        }
+    }
 }
+
+const ADD_HINT: &str = "Adds this folder's tracks that aren't in a playlist yet to it \
+                        (the playlist named like the folder, if there is one)";

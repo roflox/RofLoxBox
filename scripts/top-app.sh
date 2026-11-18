@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Like top, for RofLoxBox only: the app (deckhand-app / RofLoxBox, the
-# deckhand CLI) and everything it started (the demucs stem worker…), every
+# Like top, for RofLoxBox only: the app (rofloxbox-app / RofLoxBox, the
+# RofLoxBox CLI) and everything it started (the demucs stem worker…), every
 # few seconds, busiest first. Ctrl-C to stop.
 #
 #   scripts/top-app.sh        refresh every 2 s
@@ -9,7 +9,7 @@
 
 interval="${1:-2}"
 # What counts as the app: its binaries and its stem worker.
-pattern='deckhand-app|RofLoxBox|/deckhand( |$)|demucs_worker'
+pattern='rofloxbox-app|RofLoxBox|/rofloxbox( |$)|demucs_worker'
 
 # The app's processes and all their children, grandchildren…
 pids() {

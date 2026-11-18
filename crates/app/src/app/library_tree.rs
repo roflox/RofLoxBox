@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText, ScrollArea, Ui};
 
-use super::{DeckhandApp, Focus, Source};
+use super::{RofLoxBoxApp, Focus, Source};
 use crate::library::{UsbLibrary, eject, find_exports};
 use crate::usb_export::{ExportRequest, UsbExport};
 use crate::usb_import::{ImportRequest, UsbImport, default_destination, playlist_track_ids};
 use crate::widgets::disclosure;
-use deckhand_formats::pdb::{PlaylistKind, PlaylistNode};
+use rofloxbox_formats::pdb::{PlaylistKind, PlaylistNode};
 
 /// How often mounted drives are checked for exports.
 const USB_CHECK_EVERY: Duration = Duration::from_secs(2);
@@ -88,6 +88,8 @@ pub(super) struct LibraryTree {
     exporting: Option<Exporting>,
     cleanup: Option<Cleanup>,
     cleaning: Option<Cleaning>,
+    /// Tracks dropped on another library's playlist, on their way.
+    pub(super) transfer: Option<super::transfer::Transfer>,
 }
 
 impl Default for LibraryTree {
@@ -101,11 +103,12 @@ impl Default for LibraryTree {
             exporting: None,
             cleanup: None,
             cleaning: None,
+            transfer: None,
         }
     }
 }
 
-impl DeckhandApp {
+impl RofLoxBoxApp {
     /// The export selected in the tree.
     pub(super) fn usb(&self) -> Option<&UsbLibrary> {
         match &self.source {
@@ -151,6 +154,7 @@ impl DeckhandApp {
     pub(super) fn poll_usb(&mut self, ctx: &egui::Context) {
         self.poll_import(ctx);
         self.poll_export(ctx);
+        self.poll_transfer(ctx);
         self.poll_cleaning(ctx);
         if let Some(ejecting) = &self.tree.ejecting
             && let Ok(result) = ejecting.done.try_recv()
@@ -239,6 +243,7 @@ impl DeckhandApp {
         let tracks =
             node.tracks.iter().filter_map(|id| self.collection.track(*id).cloned()).collect();
         let request = ExportRequest {
+            add_to: None,
             root: root.clone(),
             playlist: node.name.clone(),
             tracks,
@@ -261,7 +266,7 @@ impl DeckhandApp {
             .flatten()
             .copied()
             .collect();
-        let unused: Vec<&deckhand_formats::pdb::LibraryTrack> =
+        let unused: Vec<&rofloxbox_formats::pdb::LibraryTrack> =
             library.library.tracks.iter().filter(|t| !used.contains(&t.track.id)).collect();
         if unused.is_empty() {
             self.status = Some(format!("Every track on {} is in a playlist.", library.name()));
@@ -419,7 +424,7 @@ impl DeckhandApp {
             .filter_map(|&i| library.playlists.get(i))
             .map(|r| r.id)
             .collect();
-        let result = deckhand_formats::pdb::edit_playlists(&pdb, |t| match edit {
+        let result = rofloxbox_formats::pdb::edit_playlists(&pdb, |t| match edit {
             UsbEdit::Create { parent, folder } => {
                 let name = if folder { "New folder" } else { "New playlist" };
                 Some((t.create(name, folder, parent), name))
@@ -567,6 +572,7 @@ impl DeckhandApp {
         }
         ScrollArea::vertical().id_salt("library tree").auto_shrink([false, false]).show(ui, |ui| {
             ui.set_width(230.0);
+            crate::widgets::scroll_while_dragging(ui);
             self.collection_section(ui);
             let roots: Vec<PathBuf> = self.libraries.iter().map(|l| l.root.clone()).collect();
             for root in roots {
@@ -598,6 +604,17 @@ impl DeckhandApp {
             ui.menu_button("…", |ui| self.collection_tools(ui))
                 .response
                 .on_hover_text("Add music, import, new playlist");
+            // How the playlists show; their own order stays as arranged.
+            let by_name = self.config.playlists_by_name;
+            let (label, hint) = if by_name {
+                ("A–Z", "Playlists by name (folders first). Click: in their own order again")
+            } else {
+                ("Own", "Playlists in their own order (drag them to rearrange). Click: by name")
+            };
+            if ui.small_button(label).on_hover_text(hint).clicked() {
+                self.config.playlists_by_name = !by_name;
+                self.config.save();
+            }
         });
         self.collection_status(ui);
         if !self.tree.collection_open {
@@ -605,17 +622,22 @@ impl DeckhandApp {
         }
         let selected = self.source == Source::Collection && self.collection_view.node.is_none();
         let all = format!("All tracks ({})", self.collection.tracks.len());
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             ui.add_space(14.0);
-            let response = ui.selectable_label(selected, all);
+            let response = ui
+                .selectable_label(selected, all)
+                .on_hover_text("Playlists and folders dropped here go to the top level");
             if selected && self.reveal_playlist {
                 response.scroll_to_me(Some(egui::Align::Center));
             }
             if response.clicked() {
+                self.clear_picked();
                 self.select_entry(TreeEntry::Collection(None));
                 self.focus = Focus::Playlists;
             }
         });
+        let rect = row.response.rect.with_max_x(ui.max_rect().right());
+        self.top_level_drop_target(ui, rect);
         self.collection_tree_rows(ui);
     }
 
@@ -734,6 +756,7 @@ impl DeckhandApp {
         let mut clicked: Option<Option<usize>> = None;
         let mut toggle_folder = None;
         let mut import_row = None;
+        let mut transfer = None;
         let mut edit = None;
         ui.horizontal(|ui| {
             ui.add_space(14.0);
@@ -778,8 +801,7 @@ impl DeckhandApp {
                 if let Some((_, _, name)) =
                     self.tree.renaming.as_mut().filter(|(r, id, _)| r == root && *id == row.id)
                 {
-                    let field = ui.add(egui::TextEdit::singleline(name).desired_width(150.0));
-                    field.request_focus();
+                    let field = crate::widgets::name_field(ui, name, 150.0);
                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         self.tree.renaming = None;
                     } else if field.lost_focus() {
@@ -832,19 +854,15 @@ impl DeckhandApp {
                     );
                 }
                 if !folder
-                    && let Some(drag) = response.dnd_release_payload::<crate::browser::TrackDrag>()
+                    && let Some(drag) =
+                        crate::widgets::dropped::<crate::browser::TrackDrag>(&response)
                 {
                     match &*drag {
                         crate::browser::TrackDrag::Usb(from, ids) if from.as_path() == root => {
                             edit = Some(UsbEdit::AddTracks(row.id, ids.clone()));
                         }
-                        _ => {
-                            self.status = Some(
-                                "Only tracks of this stick can be dropped on its playlists \
-                                 (export a collection playlist to put tracks on it)"
-                                    .into(),
-                            );
-                        }
+                        // From elsewhere: copied onto the stick.
+                        other => transfer = Some((other.clone(), row.id)),
                     }
                 }
                 if selected && self.reveal_playlist {
@@ -861,6 +879,9 @@ impl DeckhandApp {
         }
         if let Some(row) = import_row {
             self.start_import(root, Some(row));
+        }
+        if let Some((drag, playlist)) = transfer {
+            self.transfer(&drag, super::transfer::Target::Usb(root.to_path_buf(), playlist));
         }
         if let Some(edit) = edit {
             self.edit_usb(root, edit);
@@ -905,10 +926,10 @@ fn nth_node<'a>(
 /// tracks and bytes removed.
 fn remove_unused(root: &Path, ids: &[u32]) -> anyhow::Result<(usize, u64)> {
     let pdb = root.join("PIONEER/rekordbox/export.pdb");
-    let removed = deckhand_formats::pdb::remove_tracks(&pdb, ids)?;
+    let removed = rofloxbox_formats::pdb::remove_tracks(&pdb, ids)?;
     let kept =
-        deckhand_formats::pdb::Database::open(&pdb)?.read_all::<deckhand_formats::pdb::Track>()?;
-    let still_used = |path: &str, of: fn(&deckhand_formats::pdb::Track) -> &str| {
+        rofloxbox_formats::pdb::Database::open(&pdb)?.read_all::<rofloxbox_formats::pdb::Track>()?;
+    let still_used = |path: &str, of: fn(&rofloxbox_formats::pdb::Track) -> &str| {
         kept.iter().any(|t| of(t) == path)
     };
     let mut bytes = 0;
@@ -960,27 +981,28 @@ fn volume_name(root: &Path) -> String {
 mod tests {
     use super::*;
 
-    /// Exports the tracks of `DECKHAND_TEST_EXPORT` to a new stick, deletes
+    /// Exports the tracks of `ROFLOXBOX_TEST_EXPORT` to a new stick, deletes
     /// the playlist and removes the unused tracks (skipped without it).
     #[test]
     fn unused_tracks_and_their_files_go() {
-        let Some(source) = std::env::var_os("DECKHAND_TEST_EXPORT").map(PathBuf::from) else {
+        let Some(source) = std::env::var_os("ROFLOXBOX_TEST_EXPORT").map(PathBuf::from) else {
             return;
         };
-        let temp = std::env::temp_dir().join(format!("deckhand-cleanup-{}", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("rofloxbox-cleanup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         let library = UsbLibrary::open(&source).unwrap();
         let files = library
             .library
             .tracks
             .iter()
-            .filter_map(|t| deckhand_library::read_file(&library.resolve(&t.track.file_path)).ok())
+            .filter_map(|t| rofloxbox_library::read_file(&library.resolve(&t.track.file_path)).ok())
             .collect();
-        let mut collection = deckhand_library::Collection::default();
+        let mut collection = rofloxbox_library::Collection::default();
         collection.merge(files);
         let tracks = collection.tracks.clone();
         let stick = temp.join("stick");
         crate::usb_export::run_for_tests(&crate::usb_export::ExportRequest {
+            add_to: None,
             root: stick.clone(),
             playlist: "Gone".into(),
             tracks,
@@ -989,7 +1011,7 @@ mod tests {
         })
         .unwrap();
         let pdb = stick.join("PIONEER/rekordbox/export.pdb");
-        deckhand_formats::pdb::edit_playlists(&pdb, |t| {
+        rofloxbox_formats::pdb::edit_playlists(&pdb, |t| {
             let ids: Vec<u32> = t.nodes.iter().map(|n| n.id).collect();
             for id in ids {
                 t.delete(id);

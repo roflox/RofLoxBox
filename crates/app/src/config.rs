@@ -1,5 +1,5 @@
 //! Settings remembered between runs, in
-//! `~/Library/Application Support/deckhand/config.toml` (`%APPDATA%\deckhand`
+//! `~/Library/Application Support/RofLoxBox/config.toml` (`%APPDATA%\RofLoxBox`
 //! on Windows).
 
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ pub struct Config {
     pub library_detached: bool,
     #[serde(default = "yes")]
     pub show_fx: bool,
-    /// The browser showed deckhand's collection (rather than a USB export).
+    /// The browser showed RofLoxBox's collection (rather than a USB export).
     #[serde(default = "yes")]
     pub use_collection: bool,
     /// Track list columns, left to right.
@@ -60,10 +60,13 @@ pub struct Config {
     /// Collection folders shown closed in the sidebar.
     #[serde(default)]
     pub collapsed_folders: Vec<u32>,
+    /// The collection's playlists by name instead of in their own order.
+    #[serde(default)]
+    pub playlists_by_name: bool,
     /// Where recordings go; `None`: Music/RofLoxBox Recordings.
     #[serde(default)]
     pub recordings_dir: Option<PathBuf>,
-    /// Deck, mixer and FX settings as they were when deckhand last ran.
+    /// Deck, mixer and FX settings as they were when RofLoxBox last ran.
     #[serde(default)]
     pub session: Session,
     /// The decks' sections and where they are, and the controls hidden, for
@@ -131,7 +134,7 @@ pub struct DeckSession {
     /// it used to default to off.
     #[serde(rename = "hot_cue_hold")]
     pub hot_cue_gate: bool,
-    pub pad_mode: deckhand_control::PadMode,
+    pub pad_mode: rofloxbox_control::PadMode,
     pub jump_size: f64,
     pub jump_range: f64,
     pub loop_scale: f64,
@@ -152,7 +155,7 @@ impl Default for DeckSession {
             key_lock: false,
             slip: false,
             hot_cue_gate: true,
-            pad_mode: deckhand_control::PadMode::default(),
+            pad_mode: rofloxbox_control::PadMode::default(),
             jump_size: 4.0,
             jump_range: 1.0,
             loop_scale: 1.0,
@@ -208,9 +211,18 @@ pub struct Preferences {
     pub edit_track_row: f32,
     /// EDIT: EQ points can go above 0 dB without holding Option/Alt.
     pub edit_eq_boost: bool,
+    /// Playlists and folders are deleted without asking first.
+    pub delete_playlists_without_asking: bool,
+    /// Converting tracks: what they were last converted to.
+    pub convert_settings: crate::convert::Settings,
+    /// Converted tracks replace their originals in the collection (`true`)
+    /// or are added beside them (`false`); `None`: ask each time.
+    pub convert_replace: Option<bool>,
+    /// Where replaced originals go; `None`: Music/RofLoxBox Originals.
+    pub originals_dir: Option<std::path::PathBuf>,
     /// EDIT: what deleting a deck's audio takes along without asking
     /// (`None`: ask each time).
-    pub edit_delete: Option<deckhand_audio::DeleteOptions>,
+    pub edit_delete: Option<rofloxbox_audio::DeleteOptions>,
     pub theme: Theme,
     /// Text size in percent of the normal size.
     pub text_scale: u32,
@@ -238,7 +250,7 @@ pub struct Preferences {
     pub rekordbox_db: Option<PathBuf>,
     /// rekordbox's library is read again at every start.
     pub rekordbox_at_start: bool,
-    /// Changes made in deckhand may be written into rekordbox's library
+    /// Changes made in RofLoxBox may be written into rekordbox's library
     /// (asked for, after a warning to back it up).
     pub rekordbox_write: bool,
     /// With writing allowed, changes go into rekordbox's library on their
@@ -280,6 +292,9 @@ pub struct Preferences {
     pub call_resizes_loop: bool,
     /// GATE hot cues also stop on release while the deck is playing.
     pub gate_while_playing: bool,
+    /// Most memory cues and loops a track may have (rekordbox's 10); 0 is
+    /// no limit.
+    pub memory_points_limit: u32,
     /// A loaded track starts at its earliest memory or hot cue.
     pub start_at_first_cue: bool,
     /// Loading a track that plays on another deck picks it up there, in time.
@@ -320,12 +335,12 @@ pub struct Preferences {
     pub iso_high_hz: f32,
     pub limiter: bool,
     /// The Beat FX a controller's next / previous buttons step through.
-    pub beat_fx_cycle: Vec<deckhand_audio::BeatFxKind>,
+    pub beat_fx_cycle: Vec<rofloxbox_audio::BeatFxKind>,
 }
 
 impl Preferences {
-    pub fn eq_settings(&self) -> deckhand_audio::EqSettings {
-        deckhand_audio::EqSettings {
+    pub fn eq_settings(&self) -> rofloxbox_audio::EqSettings {
+        rofloxbox_audio::EqSettings {
             isolator: self.isolator,
             low_hz: self.eq_low_hz,
             mid_hz: self.eq_mid_hz,
@@ -351,7 +366,11 @@ impl Default for Preferences {
             edit_quantize: true,
             edit_track_row: 96.0,
             edit_eq_boost: false,
-            beat_fx_cycle: deckhand_audio::BeatFxKind::ALL.to_vec(),
+            delete_playlists_without_asking: false,
+            convert_settings: crate::convert::Settings::default(),
+            convert_replace: None,
+            originals_dir: None,
+            beat_fx_cycle: rofloxbox_audio::BeatFxKind::ALL.to_vec(),
             edit_delete: None,
             theme: Theme::Dark,
             text_scale: 100,
@@ -376,6 +395,7 @@ impl Default for Preferences {
             analyze_on_load: true,
             call_resizes_loop: false,
             gate_while_playing: false,
+            memory_points_limit: crate::deck::REKORDBOX_MEMORY_POINTS,
             start_at_first_cue: true,
             auto_master: true,
             tempo_ranges: crate::deck::TempoRange::DEFAULTS.to_vec(),
@@ -422,11 +442,11 @@ impl CrossfaderCurveSetting {
         }
     }
 
-    pub fn engine(self) -> deckhand_audio::CrossfaderCurve {
+    pub fn engine(self) -> rofloxbox_audio::CrossfaderCurve {
         match self {
-            Self::Smooth => deckhand_audio::CrossfaderCurve::Smooth,
-            Self::Standard => deckhand_audio::CrossfaderCurve::Standard,
-            Self::Sharp => deckhand_audio::CrossfaderCurve::Sharp,
+            Self::Smooth => rofloxbox_audio::CrossfaderCurve::Smooth,
+            Self::Standard => rofloxbox_audio::CrossfaderCurve::Standard,
+            Self::Sharp => rofloxbox_audio::CrossfaderCurve::Sharp,
         }
     }
 }
@@ -451,11 +471,11 @@ impl FaderCurveSetting {
         }
     }
 
-    pub fn engine(self) -> deckhand_audio::FaderCurve {
+    pub fn engine(self) -> rofloxbox_audio::FaderCurve {
         match self {
-            Self::Slow => deckhand_audio::FaderCurve::Slow,
-            Self::Standard => deckhand_audio::FaderCurve::Standard,
-            Self::Fast => deckhand_audio::FaderCurve::Fast,
+            Self::Slow => rofloxbox_audio::FaderCurve::Slow,
+            Self::Standard => rofloxbox_audio::FaderCurve::Standard,
+            Self::Fast => rofloxbox_audio::FaderCurve::Fast,
         }
     }
 }
@@ -469,10 +489,10 @@ pub enum AudioQuality {
 }
 
 impl AudioQuality {
-    pub fn engine(self) -> deckhand_audio::Quality {
+    pub fn engine(self) -> rofloxbox_audio::Quality {
         match self {
-            Self::Standard => deckhand_audio::Quality::Standard,
-            Self::High => deckhand_audio::Quality::High,
+            Self::Standard => rofloxbox_audio::Quality::Standard,
+            Self::High => rofloxbox_audio::Quality::High,
         }
     }
 }
@@ -515,6 +535,7 @@ impl Default for Config {
             prefs: Preferences::default(),
             recordings_dir: None,
             collapsed_folders: Vec::new(),
+            playlists_by_name: false,
             session: Session::default(),
             layout_two: crate::layout::DeckLayout::default(),
             layout_four: crate::layout::DeckLayout::four_decks(),
@@ -530,7 +551,7 @@ impl Default for Config {
 }
 
 pub fn data_dir() -> PathBuf {
-    deckhand_library::data_dir()
+    rofloxbox_library::data_dir()
 }
 
 /// Extra rekordbox `.midi.csv` mapping files (for example from rekordbox 6),
@@ -617,7 +638,7 @@ impl Config {
 
     pub fn save(&self) {
         // Screenshot runs (a developer aid) must not change the user's settings.
-        if std::env::var_os("DECKHAND_SCREENSHOT").is_some() {
+        if std::env::var_os("ROFLOXBOX_SCREENSHOT").is_some() {
             return;
         }
         let dir = data_dir();

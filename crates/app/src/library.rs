@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use deckhand_formats::pdb::{Library, LibraryTrack, PlaylistKind, PlaylistNode};
+use rofloxbox_formats::pdb::{Library, LibraryTrack, PlaylistKind, PlaylistNode};
 
 /// A playlist entry in the sidebar, flattened with its nesting depth.
 #[derive(Debug, Clone)]
@@ -91,7 +91,7 @@ impl UsbLibrary {
     }
 
     /// The stick also holds rekordbox's newer OneLibrary (Device Library
-    /// Plus), which deckhand cannot update.
+    /// Plus), which RofLoxBox cannot update.
     pub fn has_one_library(&self) -> bool {
         self.root.join("PIONEER/rekordbox/exportLibrary.db").is_file()
     }
