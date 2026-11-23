@@ -156,6 +156,54 @@ fn flac(samples: &[f32], rate: u32, bits: u16) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// How much later the music sits in `converted` than in `original`, in
+/// seconds: an MP3 encoder's delay (kept in when decoding) or a
+/// resampler's. Measured by lining up half a second of both
+/// from just after the music starts, within ±0.1 s; 0 when there's
+/// nothing to line up (silence, or too short).
+pub fn time_offset(original: &TrackAudio, converted: &TrackAudio) -> f64 {
+    let (from_rate, rate) = (f64::from(original.sample_rate), f64::from(converted.sample_rate));
+    if from_rate <= 0.0 || rate <= 0.0 {
+        return 0.0;
+    }
+    let mono = |audio: &TrackAudio, frame: usize| {
+        if frame < audio.frames() {
+            (audio.sample(2 * frame) + audio.sample(2 * frame + 1)) * 0.5
+        } else {
+            0.0
+        }
+    };
+    let Some(first) = (0..original.frames()).find(|&f| mono(original, f).abs() > 0.02) else {
+        return 0.0;
+    };
+    let start = first as f64 / from_rate + 0.25;
+    let (window, reach) = ((rate * 0.5) as usize, (rate * 0.1) as usize);
+    let at = (start * rate) as usize;
+    if at < reach || (at + window + reach) as f64 / rate > converted.duration_secs() {
+        return 0.0;
+    }
+    // The original at the converted file's rate (linear is close enough to
+    // find where they line up).
+    let reference: Vec<f32> = (0..window)
+        .map(|k| {
+            let t = (at + k) as f64 / rate * from_rate;
+            let (i, frac) = (t as usize, (t - t.floor()) as f32);
+            mono(original, i) * (1.0 - frac) + mono(original, i + 1) * frac
+        })
+        .collect();
+    let target: Vec<f32> = (at - reach..at + window + reach).map(|f| mono(converted, f)).collect();
+    let score = |lag: usize| -> f64 {
+        let (mut dot, mut energy) = (0.0f64, 0.0f64);
+        for (r, c) in reference.iter().zip(&target[lag..lag + window]) {
+            dot += f64::from(r * c);
+            energy += f64::from(c * c);
+        }
+        if energy > 0.0 { dot / energy.sqrt() } else { 0.0 }
+    };
+    let best = (0..=2 * reach).max_by(|&a, &b| score(a).total_cmp(&score(b))).unwrap_or(reach);
+    (best as f64 - reach as f64) / rate
+}
+
 fn mp3(samples: &[f32], rate: u32, kbps: u32) -> Result<Vec<u8>> {
     use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, Quality};
     let bitrate = match kbps {
@@ -193,6 +241,33 @@ fn mp3(samples: &[f32], rate: u32, kbps: u32) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Noise from 0.5 s on: as MP3 it comes back later by the encoder's
+    /// delay (1105 samples at 44.1 kHz) and the info frame read as a silent
+    /// one (1152), as WAV right where it was.
+    #[test]
+    fn offsets_of_converted_audio() {
+        let mut seed = 1u32;
+        let samples: Vec<f32> = (0..44_100 * 3)
+            .flat_map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let v = if i < 22_050 { 0.0 } else { (seed >> 8) as f32 / (1 << 24) as f32 - 0.5 };
+                [v, v]
+            })
+            .collect();
+        let audio = TrackAudio::new(44_100, samples);
+        let dir = std::env::temp_dir().join(format!("rofloxbox-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp3 = dir.join("t.mp3");
+        write_track(&audio, &mp3, Encoding::Mp3(320), None).unwrap();
+        let back = crate::decode_file(&mp3).unwrap();
+        let offset = time_offset(&audio, &back) * 44_100.0;
+        assert!((2200.0..2300.0).contains(&offset), "{offset} samples");
+        let wav = dir.join("t.wav");
+        write_track(&audio, &wav, Encoding::Wav(16), None).unwrap();
+        assert_eq!(time_offset(&audio, &crate::decode_file(&wav).unwrap()), 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn aiff_sample_rates_as_extended_floats() {

@@ -525,7 +525,7 @@ impl RofLoxBoxApp {
             .clicked()
             && let Some(path) = path.clone()
         {
-            self.save_to_rekordbox(path, false);
+            self.save_to_rekordbox(path, false, false);
         }
         if ui
             .add_enabled(
@@ -536,13 +536,17 @@ impl RofLoxBoxApp {
                 "Goes through the tracks rekordbox has that are in RofLoxBox's collection: those \
                  missing analysis files (saved by an older RofLoxBox, or with files lost) get \
                  them, worked out from the audio, so rekordbox shows their waveforms without \
-                 analysing them again. rekordbox's own files aren't changed. It's what every \
-                 save does as well; this runs it now.",
+                 analysing them again. And analysis files an older RofLoxBox wrote with cue \
+                 lists rekordbox refuses (it then shows no waveform, beat grid or cues for the \
+                 track) get those cue lists repaired, and ones missing a waveform (such as the \
+                 small one in the track list) are written again from the audio. A copy of each \
+                 file changed is kept with the rekordbox backups. rekordbox's own files aren't \
+                 changed.",
             )
             .clicked()
             && let Some(path) = path
         {
-            self.save_to_rekordbox(path, false);
+            self.save_to_rekordbox(path, false, true);
         }
     }
 
@@ -615,7 +619,7 @@ impl RofLoxBoxApp {
         }
         let Some(path) = self.rekordbox_db().filter(|p| p.is_file()) else { return };
         self.collection_view.rekordbox_due = None;
-        self.save_to_rekordbox(path, true);
+        self.save_to_rekordbox(path, true, false);
     }
 
     /// Whether quitting now would leave changes rekordbox's library doesn't
@@ -707,7 +711,7 @@ impl RofLoxBoxApp {
             && let Some(path) = self.rekordbox_db().filter(|p| p.is_file())
         {
             self.collection_view.rekordbox_due = None;
-            self.save_to_rekordbox(path, true);
+            self.save_to_rekordbox(path, true, false);
         }
         if self.collection_view.rekordbox_save.is_some() {
             self.collection_view.quit_after_save = true;
@@ -757,7 +761,10 @@ impl RofLoxBoxApp {
 
     /// Writes the collection's changes into rekordbox's library in the
     /// background; `auto`: started by itself, so quiet about it.
-    fn save_to_rekordbox(&mut self, path: PathBuf, auto: bool) {
+    /// Saves into rekordbox in the background; `repair` also repairs
+    /// analysis files an older RofLoxBox wrote wrong
+    /// ([`crate::rekordbox_save::repair_analysis`]).
+    fn save_to_rekordbox(&mut self, path: PathBuf, auto: bool, repair: bool) {
         let print = self.rekordbox_fingerprint();
         let Some(snapshot) = self.rekordbox_snapshot() else {
             let never_read = anyhow::anyhow!("read rekordbox's library into RofLoxBox first");
@@ -768,7 +775,7 @@ impl RofLoxBoxApp {
         let wait_closed = self.config.prefs.rekordbox_wait_closed;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(save_into_rekordbox(&path, &key, &snapshot, wait_closed));
+            let _ = tx.send(save_into_rekordbox(&path, &key, &snapshot, wait_closed, repair));
         });
         self.collection_view.rekordbox_save = Some((rx, print, auto));
         if !auto {
@@ -806,6 +813,8 @@ impl RofLoxBoxApp {
                     (saved.moved.len(), "moved to converted files"),
                     (saved.analysed, "given RofLoxBox's waveforms"),
                     (saved.unanalysed, "without waveforms (audio unreadable)"),
+                    (saved.repaired, "with analysis files repaired"),
+                    (saved.paths_fixed, "with their file path repaired"),
                     (saved.playlists, "playlist change(s)"),
                 ]
                 .iter()
@@ -1621,12 +1630,15 @@ impl RofLoxBoxApp {
                     color: Some([hot.color.r(), hot.color.g(), hot.color.b()]),
                     name: old.map(|c| c.name).unwrap_or_default(),
                     active: false,
+                    loop_beats: None,
                 });
             }
             let memory = loaded.memory_cues.iter().map(|&s| (s, None));
             let loops = loaded.memory_loops.iter().map(|&(s, e)| (s, Some(e)));
             for (start, end) in memory.chain(loops) {
                 let old = previous(CueKind::Memory, start);
+                let (old_end, old_loop_beats) =
+                    (old.as_ref().and_then(|c| c.end), old.as_ref().and_then(|c| c.loop_beats));
                 cues.push(Cue {
                     kind: CueKind::Memory,
                     start,
@@ -1634,6 +1646,13 @@ impl RofLoxBoxApp {
                     color: old.as_ref().and_then(|c| c.color),
                     name: old.map(|c| c.name).unwrap_or_default(),
                     active: end.is_some_and(|end| loaded.is_active_loop((start, end))),
+                    // A beat loop's length: as the deck knows it, else as stored
+                    // for this same loop.
+                    loop_beats: end.and_then(|end| {
+                        loaded.loop_beats_of((start, end)).or_else(|| {
+                            old_loop_beats.filter(|_| old_end.is_some_and(|e| (e - end).abs() < 0.001))
+                        })
+                    }),
                 });
             }
             // Grid edits always leave one straight grid: one marker.
@@ -2530,12 +2549,13 @@ fn save_into_rekordbox(
     saved: &str,
     snapshot: &crate::rekordbox_save::Snapshot,
     wait_closed: bool,
+    repair: bool,
 ) -> anyhow::Result<crate::rekordbox_save::Saved> {
     let key = match saved.trim() {
         "" => crate::rekordbox_db::fetch_key()?,
         key => key.to_owned(),
     };
-    crate::rekordbox_save::save(path, &key, snapshot, &rekordbox_backups(), wait_closed)
+    crate::rekordbox_save::save(path, &key, snapshot, &rekordbox_backups(), wait_closed, repair)
 }
 
 /// While playlists are dragged: how many, next to the pointer.

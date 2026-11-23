@@ -514,20 +514,21 @@ fn tempo_display(
         let next = deck.tempo_range.next(ranges);
         deck.set_tempo_range(next, engine);
     }
-    // − + under them, inside the ring.
-    let button = vec2(size * 0.18, size * 0.14);
-    let y = center.y + size * 0.31;
+    // − + under them, small and well inside the ring.
+    let button = vec2(size * 0.12, size * 0.09).max(vec2(18.0, 15.0));
+    let y = center.y + size * 0.27;
+    let small = |text: &str| egui::Button::new(egui::RichText::new(text).size((size * 0.06).clamp(10.0, 14.0))).small();
     let step = (TEMPO_NUDGE_STEP / deck.tempo_range.fraction()) as f32;
     let hover = if deck.tempo_fader_active() { "Tempo −0.02 %" } else { "Follows the master (SYNC)" };
     // + on the left when mirrored.
     let side = if mirrored(ui) { -1.0 } else { 1.0 };
-    let minus = egui::Rect::from_center_size(egui::pos2(center.x - side * button.x * 0.65, y), button);
-    if ui.put(minus, egui::Button::new("−")).on_hover_text(hover).clicked() {
+    let minus = egui::Rect::from_center_size(egui::pos2(center.x - side * button.x * 0.6, y), button);
+    if ui.put(minus, small("−")).on_hover_text(hover).clicked() {
         deck.set_tempo_fader(deck.tempo_fader - step, engine);
     }
     let hover = if deck.tempo_fader_active() { "Tempo +0.02 %" } else { "Follows the master (SYNC)" };
-    let plus = egui::Rect::from_center_size(egui::pos2(center.x + side * button.x * 0.65, y), button);
-    if ui.put(plus, egui::Button::new("+")).on_hover_text(hover).clicked() {
+    let plus = egui::Rect::from_center_size(egui::pos2(center.x + side * button.x * 0.6, y), button);
+    if ui.put(plus, small("+")).on_hover_text(hover).clicked() {
         deck.set_tempo_fader(deck.tempo_fader + step, engine);
     }
     // The BPM being typed, where it shows: Enter sets it, Esc (or clicking
@@ -1229,6 +1230,7 @@ fn draw_element(ui: &mut Ui, element: DeckElement, p: &mut Parts<'_>) {
                 cue_point: deck.cue_point,
                 active_loop: deck.loop_region.map(|r| (r, deck.loop_active)),
                 grid_strength: 0.0,
+                cue_size: 1.0,
                 slip: engine.slip_position_secs(index),
             };
             let shown = engine.display_position_secs(index);

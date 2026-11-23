@@ -120,18 +120,25 @@ fn loop_end(cue: &Cue) -> u32 {
 
 fn basic_cues(list: &CueList) -> Vec<u8> {
     let count = list.cues.len();
+    // Without stored values, link the entries as a list (0xffff marks the ends).
+    let links: Vec<(u16, u16)> = list
+        .cues
+        .iter()
+        .enumerate()
+        .map(|(i, cue)| {
+            cue.order.unwrap_or((
+                if i == 0 { 0xffff } else { i as u16 - 1 },
+                if i + 1 == count { 0xffff } else { i as u16 + 1 },
+            ))
+        })
+        .collect();
     let mut header = list_kind(list.kind).to_be_bytes().to_vec();
     header.extend([0, 0]);
     header.extend((count as u16).to_be_bytes());
-    header.extend(list.memory_count.to_be_bytes());
+    header.extend(list_ends(list, &links).to_be_bytes());
 
     let mut payload = Vec::with_capacity(count * 0x38);
-    for (i, cue) in list.cues.iter().enumerate() {
-        // Without stored values, link the entries as a list (0xffff marks the ends).
-        let (previous, next) = cue.order.unwrap_or((
-            if i == 0 { 0xffff } else { i as u16 - 1 },
-            if i + 1 == count { 0xffff } else { i as u16 + 1 },
-        ));
+    for (cue, &(previous, next)) in list.cues.iter().zip(&links) {
         let status = match cue.status.unwrap_or(CueStatus::Enabled) {
             CueStatus::Disabled => 0,
             CueStatus::Enabled => 1,
@@ -156,26 +163,58 @@ fn extended_cues(list: &CueList) -> Vec<u8> {
 
     let mut payload = Vec::new();
     for cue in &list.cues {
-        let comment = cue.comment.as_deref().map(utf16be_nul).unwrap_or_default();
+        // No comment is written as none at all (not an empty string).
+        let comment = cue
+            .comment
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .map(utf16be_nul)
+            .unwrap_or_default();
         let color = cue.hot_cue_color.map_or([0; 4], |c| [c.code, c.rgb[0], c.rgb[1], c.rgb[2]]);
-        let len_entry = 0x2c + comment.len() + 4 + cue.trailer.len();
+        // Every entry ends with 40 bytes after the color (zeros in every
+        // file seen); players and rekordbox expect them.
+        let trailer: &[u8] =
+            if cue.trailer.is_empty() { &[0; EXTENDED_TRAILER_LEN] } else { &cue.trailer };
+        let len_entry = 0x2c + comment.len() + 4 + trailer.len();
 
         payload.extend(b"PCP2");
         payload.extend(be32(&[0x10, len_entry as u32, cue.hot_cue.unwrap_or(0)]));
         payload.extend([cue_kind(cue.kind), 0x00, 0x03, 0xe8]);
         payload.extend(be32(&[cue.time_ms, loop_end(cue)]));
         payload.push(cue.color_id.unwrap_or(0));
-        payload.extend([0; 7]);
+        // 1 in every entry rekordbox writes; with 0 there it refuses the
+        // whole analysis file (no waveform, beat grid or cues).
+        payload.push(EXTENDED_FLAG);
+        payload.extend([0; 6]);
         let (numerator, denominator) = cue.loop_beats.unwrap_or((0, 0));
         payload.extend(numerator.to_be_bytes());
         payload.extend(denominator.to_be_bytes());
         payload.extend((comment.len() as u32).to_be_bytes());
         payload.extend(comment);
         payload.extend(color);
-        payload.extend(&cue.trailer);
+        payload.extend(trailer);
     }
     section(*b"PCO2", &header, &payload)
 }
+
+/// A `PCOB` header's last field. For memory cues: the first entry of the
+/// linked list (high half) and the last (low half). rekordbox reads the
+/// memory cues from that first entry and refuses the whole analysis file
+/// (no waveform, beat grid or cues) when it is not one of the entries.
+/// Hot cue lists and empty lists have `0xffffffff`.
+fn list_ends(list: &CueList, links: &[(u16, u16)]) -> u32 {
+    if list.kind != CueListKind::Memory || links.is_empty() {
+        return list.memory_count;
+    }
+    let first = links.iter().position(|l| l.0 == 0xffff).unwrap_or(0) as u32;
+    let last = links.iter().position(|l| l.1 == 0xffff).unwrap_or(links.len() - 1) as u32;
+    (first << 16) | last
+}
+
+/// The byte after a `PCP2` entry's color id: 1 in every file seen.
+const EXTENDED_FLAG: u8 = 1;
+/// Bytes after the hot cue color of a `PCP2` entry.
+const EXTENDED_TRAILER_LEN: usize = 40;
 
 fn song_structure(structure: &SongStructure) -> Vec<u8> {
     const ENTRY_LEN: usize = 24;

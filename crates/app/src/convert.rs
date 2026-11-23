@@ -93,8 +93,10 @@ pub fn free_path(dir: &Path, stem: &str, extension: &str) -> PathBuf {
 }
 
 /// Converts `input` into a new file next to it, "<name> (<settings>).<ext>",
-/// with its tags and cover picture.
-fn convert(input: &Path, settings: &Settings) -> Result<PathBuf> {
+/// with its tags and cover picture. Returns it, and how much later (seconds)
+/// the music sits in it: an MP3's encoder delay, which cues and the beat
+/// grid have to move by to stay on the music.
+fn convert(input: &Path, settings: &Settings) -> Result<(PathBuf, f64)> {
     let dir = input.parent().context("the file has no folder")?;
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let extension = settings.format.extension();
@@ -102,18 +104,22 @@ fn convert(input: &Path, settings: &Settings) -> Result<PathBuf> {
     // Written under a name of its own until done, so a stopped one leaves
     // nothing that looks finished.
     let partial = output.with_extension(format!("partial.{extension}"));
-    let written = (|| -> Result<()> {
+    let written = (|| -> Result<f64> {
         let audio = rofloxbox_audio::decode_file(input)?;
         rofloxbox_audio::write_track(&audio, &partial, settings.encoding(), settings.sample_rate)?;
         copy_tags(input, &partial);
-        Ok(())
+        let converted = rofloxbox_audio::decode_file(&partial)?;
+        Ok(rofloxbox_audio::time_offset(&audio, &converted))
     })();
-    if let Err(err) = written {
-        let _ = std::fs::remove_file(&partial);
-        return Err(err);
-    }
+    let offset = match written {
+        Ok(offset) => offset,
+        Err(err) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(err);
+        }
+    };
     std::fs::rename(&partial, &output).context("naming the converted file")?;
-    Ok(output)
+    Ok((output, offset))
 }
 
 /// The tags (title, artist, … and the cover picture) of `from`, written
@@ -133,7 +139,26 @@ fn copy_tags(from: &Path, to: &Path) {
 /// One track converted, or not.
 pub struct Converted {
     pub id: u32,
-    pub result: Result<PathBuf, String>,
+    /// The new file and how much later the music sits in it (seconds).
+    pub result: Result<(PathBuf, f64), String>,
+}
+
+/// Moves cues, loops and the beat grid `by` seconds, to stay on the music
+/// of a converted file.
+pub fn shift_times(
+    cues: &mut [rofloxbox_library::Cue],
+    tempo: &mut [rofloxbox_library::TempoMarker],
+    by: f64,
+) {
+    for cue in cues {
+        cue.start += by;
+        if let Some(end) = &mut cue.end {
+            *end += by;
+        }
+    }
+    for marker in tempo {
+        marker.start += by;
+    }
 }
 
 /// Conversions running in the background.
@@ -265,7 +290,7 @@ mod tests {
     }
 
     /// A tagged 24-bit 96 kHz WAV to MP3 320: next to it, playable, at
-    /// 48 kHz, with its title; the original then moved to a folder scans
+    /// 48 kHz, later by the encoder's delay, with its title; the original then moved to a folder scans
     /// skip.
     #[test]
     fn converts_and_keeps_the_tags() {
@@ -273,10 +298,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.join("Tone.wav");
-        let tone: Vec<f32> = (0..96_000)
-            .flat_map(|i| {
-                let v = (std::f64::consts::TAU * 440.0 * f64::from(i) / 96_000.0).sin() as f32;
-                [v * 0.5, v * 0.5]
+        // Noise (a steady tone lines up at every period, so no offset).
+        let mut seed = 7u32;
+        let tone: Vec<f32> = (0..96_000 * 2)
+            .flat_map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let v = (seed >> 8) as f32 / (1 << 24) as f32 - 0.5;
+                [v, v]
             })
             .collect();
         let audio = rofloxbox_audio::TrackAudio::new(96_000, tone);
@@ -288,8 +316,10 @@ mod tests {
             tag.set_artist("Someone".into());
             tag.save_to_path(&input, lofty::config::WriteOptions::default()).unwrap();
         }
-        let out = convert(&input, &Settings::default()).unwrap();
+        let (out, offset) = convert(&input, &Settings::default()).unwrap();
         assert_eq!(out, dir.join("Tone (MP3 320).mp3"));
+        // The encoder's delay and the info frame, at 48 kHz.
+        assert!((0.04..0.06).contains(&offset), "{offset}");
         let back = rofloxbox_audio::decode_file(&out).unwrap();
         assert_eq!(back.sample_rate, 48_000, "MP3 holds at most 48 kHz");
         let read = rofloxbox_library::read_file(&out).unwrap();

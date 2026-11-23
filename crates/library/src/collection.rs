@@ -233,6 +233,27 @@ pub struct Cue {
     /// there (one per track, like rekordbox's).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub active: bool,
+    /// A loop made as a beat loop: its length in beats as numerator and
+    /// denominator (32/1, 1/2), as rekordbox keeps it; `None` for a loop set
+    /// by hand (or not known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_beats: Option<(u16, u16)>,
+}
+
+impl Cue {
+    /// A beat loop's length in beats as numerator / denominator.
+    pub fn beats_fraction(beats: f64) -> Option<(u16, u16)> {
+        if beats.is_nan() || beats <= 0.0 {
+            return None;
+        }
+        if beats >= 1.0 {
+            let n = beats.round();
+            ((beats - n).abs() < 1e-6 && n <= f64::from(u16::MAX)).then_some((n as u16, 1))
+        } else {
+            let d = (1.0 / beats).round();
+            ((1.0 / beats - d).abs() < 1e-6 && d <= f64::from(u16::MAX)).then_some((1, d as u16))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1069,7 +1090,7 @@ mod tests {
         c.merge(vec![scanned("/song.mp3", "Song")]);
         c.update_track(c.tracks[0].id, |t| {
             t.rating = 4;
-            t.cues = vec![Cue { kind: CueKind::Hot(0), start: 1.0, end: None, color: None, name: "A".into(), active: false }];
+            t.cues = vec![Cue { kind: CueKind::Hot(0), start: 1.0, end: None, color: None, name: "A".into(), active: false , loop_beats: None}];
             t.tempo = vec![TempoMarker { start: 0.1, bpm: 128.0, beat: 1 }];
         });
         let original = c.tracks[0].clone();
@@ -1095,6 +1116,7 @@ mod tests {
             color: Some([1, 2, 3]),
             name: "Drop".into(),
             active: false,
+            loop_beats: None,
         };
         c.update_track(song, |t| {
             t.cues = vec![cue.clone()];

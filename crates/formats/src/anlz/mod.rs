@@ -7,10 +7,12 @@
 //! fill the rest of the header and the payload follows it.
 
 mod cues;
+mod repair;
 mod song_structure;
 mod write;
 
 pub use cues::{Cue, CueKind, CueList, CueListKind, CueStatus, HotCueColor};
+pub use repair::{Repaired, repair_cue_lists};
 pub use song_structure::{Mood, Phrase, SongStructure};
 
 use std::path::Path;

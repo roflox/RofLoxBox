@@ -219,6 +219,7 @@ fn cues_and_grid(dat: Option<&AnlzFile>, ext: Option<&AnlzFile>) -> (Vec<Cue>, V
                 active: kind == CueKind::Memory
                     && end.is_some()
                     && active.is_some_and(|t| t.abs_diff(cue.time_ms) <= 1),
+                loop_beats: end.and(cue.loop_beats),
             });
         }
     }

@@ -147,8 +147,8 @@ impl RofLoxBoxApp {
                     self.log(format!("Convert {n}/{total}: {title} — {err}"), true);
                     continue;
                 }
-                Ok(new) if replace => {
-                    match self.replace_with(converted.id, &new) {
+                Ok((new, offset)) if replace => {
+                    match self.replace_with(converted.id, &new, offset) {
                         Ok(moved) => {
                             let to = moved.display();
                             format!("{title} — now {label}; the original is in {to}")
@@ -162,8 +162,8 @@ impl RofLoxBoxApp {
                         }
                     }
                 }
-                Ok(new) => {
-                    self.add_converted(converted.id, &new);
+                Ok((new, offset)) => {
+                    self.add_converted(converted.id, &new, offset);
                     format!("{title} — {label} added: {}", new.display())
                 }
             };
@@ -182,9 +182,16 @@ impl RofLoxBoxApp {
 
     /// A converted file as a track of its own, with the original's tags,
     /// cues and grid.
-    fn add_converted(&mut self, original: u32, new: &std::path::Path) {
+    fn add_converted(&mut self, original: u32, new: &std::path::Path, offset: f64) {
         let Some(track) = self.collection.track(original) else { return };
         let mut xml = XmlTrack::from_track(track);
+        crate::convert::shift_times(&mut xml.cues, &mut xml.tempo, offset);
+        // The analysis files are the original file's: its waveform would
+        // be off by the offset too. Worked out from the new file instead
+        // (the grid is kept in the collection).
+        if !xml.tempo.is_empty() {
+            xml.analysis = None;
+        }
         let key = new.to_string_lossy().into_owned();
         (xml.id, xml.location) = (key.clone(), key);
         xml.file.path = new.to_path_buf();
@@ -199,7 +206,12 @@ impl RofLoxBoxApp {
 
     /// The converted file takes the track's place under the original's
     /// name; the original goes to the originals folder. Returns where.
-    fn replace_with(&mut self, id: u32, new: &std::path::Path) -> anyhow::Result<PathBuf> {
+    fn replace_with(
+        &mut self,
+        id: u32,
+        new: &std::path::Path,
+        offset: f64,
+    ) -> anyhow::Result<PathBuf> {
         let Some(original) = self.collection.track(id).map(|t| t.path.clone()) else {
             anyhow::bail!("the track is no longer in the collection");
         };
@@ -219,6 +231,12 @@ impl RofLoxBoxApp {
                 t.rekordbox_path = Some(t.path.clone());
             }
             t.path = place.clone();
+            // Cues and grid stay on the music (also in the library saved to,
+            // on the next save), and the original's analysis goes.
+            crate::convert::shift_times(&mut t.cues, &mut t.tempo, offset);
+            if !t.tempo.is_empty() {
+                t.analysis = None;
+            }
             if let Some(read) = &read {
                 (t.bitrate, t.sample_rate, t.has_artwork) =
                     (read.bitrate, read.sample_rate, read.has_artwork);

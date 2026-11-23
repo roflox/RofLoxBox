@@ -19,8 +19,13 @@ pub struct Config {
     pub four_decks: bool,
     #[serde(default)]
     pub waveform_style: crate::waveform::WaveformStyle,
+    #[serde(default)]
+    pub waveform_drawing: crate::waveform::WaveformDrawing,
     #[serde(default = "default_grid_strength")]
     pub grid_strength: f32,
+    /// Size of the cue markers on the scrolling waveforms, 0.6 … 2.5.
+    #[serde(default = "default_cue_size")]
+    pub cue_size: f32,
     /// Mixer channel order in 4-deck mode when no controller says otherwise.
     #[serde(default = "default_channel_order")]
     pub channel_order: [usize; 4],
@@ -87,6 +92,10 @@ pub struct Config {
     /// Deck layouts saved under a name.
     #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "deck_section_presets")]
     pub layout_presets: Vec<crate::layout::LayoutPreset>,
+    /// The view before a connected controller's preset took over: back when
+    /// it disconnects (or at the next start without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_before_controller: Option<crate::layout::SavedView>,
     /// Output sample rate; `None` uses the device's current rate.
     #[serde(default)]
     pub sample_rate: Option<u32>,
@@ -267,8 +276,8 @@ pub struct Preferences {
     pub key_bindings: std::collections::BTreeMap<String, String>,
     /// How tracks without rekordbox's analysis are analysed.
     pub analysis: crate::deck::AnalysisMethod,
-    /// How finely the decks' waveforms are drawn.
-    pub waveform_detail: crate::waveform::WaveformDetail,
+    /// The scrolling waveforms' gradients and colours.
+    pub waveform_look: crate::waveform_look::WaveformLook,
     /// A loaded track without a beat grid or key gets them detected.
     pub analyze_on_load: bool,
     /// No loading onto a playing deck.
@@ -323,6 +332,8 @@ pub struct Preferences {
     pub eq_waveforms: bool,
     /// Scrolling (or pinching) over a scrolling waveform zooms it.
     pub scroll_zoom: bool,
+    /// Look for a newer release when the app starts.
+    pub check_updates: bool,
     /// How far scrolling over a knob turns it: 1.0 turns it fully in about
     /// 4 wheel notches' worth (200 points); 0 doesn't turn knobs.
     pub knob_scroll: f32,
@@ -391,7 +402,7 @@ impl Default for Preferences {
             keyboard_mixing: true,
             key_bindings: Default::default(),
             analysis: Default::default(),
-            waveform_detail: Default::default(),
+            waveform_look: Default::default(),
             analyze_on_load: true,
             call_resizes_loop: false,
             gate_while_playing: false,
@@ -411,6 +422,7 @@ impl Default for Preferences {
             isolator: true,
             eq_waveforms: true,
             scroll_zoom: true,
+            check_updates: true,
             knob_scroll: 1.0,
             eq_low_hz: 70.0,
             eq_mid_hz: 1_000.0,
@@ -509,6 +521,10 @@ fn default_grid_strength() -> f32 {
     1.0
 }
 
+fn default_cue_size() -> f32 {
+    1.4
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -518,7 +534,9 @@ impl Default for Config {
             midi_port: None,
             four_decks: false,
             waveform_style: crate::waveform::WaveformStyle::default(),
+            waveform_drawing: crate::waveform::WaveformDrawing::default(),
             grid_strength: default_grid_strength(),
+            cue_size: default_cue_size(),
             channel_order: default_channel_order(),
             vertical_waveforms: false,
             show_waveforms: true,
@@ -540,6 +558,7 @@ impl Default for Config {
             layout_two: crate::layout::DeckLayout::default(),
             layout_four: crate::layout::DeckLayout::four_decks(),
             layout_presets: Vec::new(),
+            view_before_controller: None,
             hidden_mixer_parts: Vec::new(),
             hidden_fx_parts: Vec::new(),
             screen_layout: Default::default(),
@@ -677,6 +696,7 @@ mod tests {
             name: "Club".into(),
             layout: DeckLayout::everything(),
             view: Some(view.clone()),
+            controller: Some(crate::layout::ControllerLink::Port("DDJ-GRV6".into())),
         });
         let text = toml::to_string_pretty(&config).unwrap();
         let read: Config = toml::from_str(&text).unwrap();

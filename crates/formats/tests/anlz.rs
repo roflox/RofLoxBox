@@ -2,7 +2,8 @@
 use std::path::{Path, PathBuf};
 
 use rofloxbox_formats::anlz::{
-    AnlzFile, CueKind, CueListKind, CueStatus, HotCueColor, Mood, Section, WaveformKind,
+    AnlzFile, Cue, CueKind, CueList, CueListKind, CueStatus, HotCueColor, Mood, Section,
+    WaveformKind,
 };
 use rofloxbox_formats::pdb::Library;
 
@@ -219,9 +220,45 @@ fn extended_cue_list() {
         (memory.kind, memory.loop_end_ms, memory.loop_beats),
         (CueKind::Loop, Some(9875), Some((4, 1)))
     );
-    // An empty comment is stored as a lone NUL and kept, so it can be written back.
+    // An empty comment stored as a lone NUL reads as one.
     assert_eq!((memory.comment.as_deref(), memory.hot_cue_color), (Some(""), None));
-    assert_eq!(AnlzFile::from_bytes(&parsed.to_bytes()).unwrap(), parsed);
+    // Written back as no comment at all, as rekordbox writes it; otherwise
+    // the same.
+    let mut expected = parsed.clone();
+    if let Some(Section::Cues(list)) = expected.sections.first_mut() {
+        list.cues[1].comment = None;
+    }
+    assert_eq!(AnlzFile::from_bytes(&parsed.to_bytes()).unwrap(), expected);
+}
+
+/// `PCP2` entries are written as rekordbox writes them: 88 bytes without
+/// a comment, a 1 after the color id, 40 bytes after the color. With a 0
+/// there rekordbox refuses the whole analysis file (no waveform, beat
+/// grid or cues).
+#[test]
+fn extended_cues_are_written_as_rekordbox_writes_them() {
+    let cue = Cue {
+        hot_cue: Some(1),
+        kind: CueKind::Cue,
+        time_ms: 345,
+        loop_end_ms: None,
+        status: None,
+        color_id: None,
+        loop_beats: None,
+        comment: Some(String::new()),
+        hot_cue_color: Some(HotCueColor { code: 0x3c, rgb: [0x4d, 0x00, 0xff] }),
+        order: None,
+        trailer: Vec::new(),
+    };
+    let list = CueList { kind: CueListKind::Hot, extended: true, memory_count: 0, cues: vec![cue] };
+    let bytes = AnlzFile { sections: vec![Section::Cues(list)] }.to_bytes();
+    let at = bytes.windows(4).position(|w| w == b"PCP2").unwrap();
+    let entry = &bytes[at..];
+    assert_eq!(u32::from_be_bytes(entry[8..12].try_into().unwrap()), 0x58);
+    assert_eq!(entry[0x1d], 1);
+    assert_eq!(u32::from_be_bytes(entry[0x28..0x2c].try_into().unwrap()), 0);
+    assert_eq!(&entry[0x2c..0x30], &[0x3c, 0x4d, 0x00, 0xff]);
+    assert!(entry[0x30..0x58].iter().all(|&b| b == 0));
 }
 
 #[test]
@@ -295,4 +332,106 @@ fn corrupt_input_does_not_panic() {
             let _ = AnlzFile::from_bytes(&bytes);
         }
     }
+}
+
+/// A memory cue list's header names its first and last entry (as in
+/// rekordbox's files: 7 cues → 0x0000_0006). rekordbox reads the memory
+/// cues from that first entry and refuses the whole analysis file when it
+/// is not one of them, so it must not be left at 0xffffffff.
+#[test]
+fn memory_cue_list_header_names_its_ends() {
+    let cue = |time_ms| Cue {
+        hot_cue: None,
+        kind: CueKind::Cue,
+        time_ms,
+        loop_end_ms: None,
+        status: None,
+        color_id: None,
+        loop_beats: None,
+        comment: None,
+        hot_cue_color: None,
+        order: None,
+        trailer: Vec::new(),
+    };
+    let header_of = |list: CueList| {
+        let bytes = AnlzFile { sections: vec![Section::Cues(list)] }.to_bytes();
+        let at = bytes.windows(4).position(|w| w == b"PCOB").unwrap();
+        u32::from_be_bytes(bytes[at + 0x14..at + 0x18].try_into().unwrap())
+    };
+    let memory = |cues| CueList { kind: CueListKind::Memory, extended: false, memory_count: u32::MAX, cues };
+    let seven: Vec<Cue> = (0..7).map(|i| cue(i * 1000)).collect();
+    assert_eq!(header_of(memory(seven)), 0x0000_0006);
+    assert_eq!(header_of(memory(Vec::new())), u32::MAX);
+    let hot = CueList { kind: CueListKind::Hot, extended: false, memory_count: u32::MAX, cues: vec![cue(5)] };
+    assert_eq!(header_of(hot), u32::MAX);
+}
+
+/// Cue lists older RofLoxBox versions wrote are repaired: the memory
+/// list's header, extended entries' layout, and hot cues A–C / D on in the
+/// basic lists. Other sections are kept as they were, and a repaired pair
+/// needs nothing more.
+#[test]
+fn broken_cue_lists_are_repaired() {
+    use rofloxbox_formats::anlz::repair_cue_lists;
+    let cue = |hot: Option<u32>, time_ms| Cue {
+        hot_cue: hot,
+        kind: CueKind::Cue,
+        time_ms,
+        loop_end_ms: None,
+        status: None,
+        color_id: None,
+        loop_beats: None,
+        comment: None,
+        hot_cue_color: None,
+        order: None,
+        trailer: Vec::new(),
+    };
+    let list = |kind, extended, cues| Section::Cues(CueList { kind, extended, memory_count: u32::MAX, cues });
+    let unknown = Section::Unknown { tag: *b"PXYZ", bytes: section(b"PXYZ", &[1, 2, 3, 4], &[9; 7]) };
+    let dat = AnlzFile {
+        sections: vec![
+            unknown.clone(),
+            list(CueListKind::Hot, false, Vec::new()),
+            list(CueListKind::Memory, false, vec![cue(None, 100), cue(None, 200)]),
+        ],
+    };
+    let hot = vec![cue(Some(1), 1000), cue(Some(2), 2000), cue(Some(5), 5000)];
+    let ext = AnlzFile {
+        sections: vec![
+            list(CueListKind::Hot, false, Vec::new()),
+            list(CueListKind::Hot, true, hot),
+            unknown.clone(),
+        ],
+    };
+    let mut dat_bytes = dat.to_bytes();
+    let mut ext_bytes = ext.to_bytes();
+    // As the old writer left them: the memory list's header at 0xffffffff,
+    // the extended entries with a 0 after the color id.
+    let memory = dat_bytes.windows(4).rposition(|w| w == b"PCOB").unwrap();
+    dat_bytes[memory + 0x14..memory + 0x18].copy_from_slice(&[0xff; 4]);
+    let mut at = 0;
+    while let Some(i) = ext_bytes[at..].windows(4).position(|w| w == b"PCP2") {
+        ext_bytes[at + i + 0x1d] = 0;
+        at += i + 4;
+    }
+
+    let repaired = repair_cue_lists(&dat_bytes, Some(&ext_bytes)).unwrap();
+    let (new_dat, new_ext) = (repaired.dat.expect("dat repaired"), repaired.ext.expect("ext repaired"));
+    let dat = AnlzFile::from_bytes(&new_dat).unwrap();
+    let ext = AnlzFile::from_bytes(&new_ext).unwrap();
+    let hot_numbers = |file: &AnlzFile| -> Vec<u32> {
+        file.cue_lists()
+            .filter(|l| !l.extended && l.kind == CueListKind::Hot)
+            .flat_map(|l| l.cues.iter().filter_map(|c| c.hot_cue))
+            .collect()
+    };
+    assert_eq!(hot_numbers(&dat), [1, 2]);
+    assert_eq!(hot_numbers(&ext), [5]);
+    let memory = new_dat.windows(4).rposition(|w| w == b"PCOB").unwrap();
+    assert_eq!(&new_dat[memory + 0x14..memory + 0x18], &[0, 0, 0, 1]);
+    let entry = new_ext.windows(4).position(|w| w == b"PCP2").unwrap();
+    assert_eq!(new_ext[entry + 0x1d], 1);
+    assert_eq!(dat.sections[0], unknown);
+    assert_eq!(ext.sections[2], unknown);
+    assert!(repair_cue_lists(&new_dat, Some(&new_ext)).unwrap().is_empty());
 }

@@ -231,6 +231,8 @@ pub struct RofLoxBoxApp {
     /// Test aid (`ROFLOXBOX_AUTOPLAY`): start every loaded deck once its
     /// track is in.
     autoplay: bool,
+    /// Looking for a newer release.
+    update: crate::update::UpdateCheck,
 }
 
 /// Developer aid: `ROFLOXBOX_SCREENSHOT=out.png` loads tracks, saves an image
@@ -310,7 +312,9 @@ impl RofLoxBoxApp {
             show_controller: std::env::var_os("ROFLOXBOX_SHOW_CONTROLLER").is_some(),
             show_prefs: std::env::var_os("ROFLOXBOX_SHOW_AUDIO").is_some()
                 || std::env::var_os("ROFLOXBOX_SHOW_PREFS").is_some()
-                || std::env::var_os("ROFLOXBOX_SHOW_LIBRARY_PREFS").is_some(),
+                || std::env::var_os("ROFLOXBOX_SHOW_LIBRARY_PREFS").is_some()
+                || std::env::var_os("ROFLOXBOX_SHOW_VIEW_PREFS").is_some()
+                || std::env::var_os("ROFLOXBOX_SHOW_WAVEFORM_PREFS").is_some(),
             prefs_tab: if std::env::var_os("ROFLOXBOX_SHOW_MIXER_PREFS").is_some() {
                 PrefsTab::Mixer
             } else if std::env::var_os("ROFLOXBOX_SHOW_KEYBOARD_PREFS").is_some() {
@@ -321,6 +325,10 @@ impl RofLoxBoxApp {
                 PrefsTab::Library
             } else if std::env::var_os("ROFLOXBOX_SHOW_AUDIO").is_some() {
                 PrefsTab::Audio
+            } else if std::env::var_os("ROFLOXBOX_SHOW_VIEW_PREFS").is_some() {
+                PrefsTab::View
+            } else if std::env::var_os("ROFLOXBOX_SHOW_WAVEFORM_PREFS").is_some() {
+                PrefsTab::Waveforms
             } else {
                 PrefsTab::default()
             },
@@ -385,6 +393,7 @@ impl RofLoxBoxApp {
                 }
             }),
             autoplay: std::env::var_os("ROFLOXBOX_AUTOPLAY").is_some(),
+            update: Default::default(),
             preset_name: String::new(),
             preset_note: None,
             config,
@@ -466,6 +475,12 @@ impl RofLoxBoxApp {
         if let Some(folder) = std::env::var_os("ROFLOXBOX_EXPLORER") {
             app.explorer.open = true;
             app.open_explorer_folder(folder.into());
+        }
+        // Not on test runs (screenshots, autoplay): no network then.
+        // (Test aid ROFLOXBOX_UPDATE_AS=<version>: checks as that version.)
+        let test_update = std::env::var_os("ROFLOXBOX_UPDATE_AS").is_some();
+        if test_update || (app.config.prefs.check_updates && app.screenshot.is_none() && !app.autoplay) {
+            app.update.start();
         }
         if app.config.prefs.rekordbox_at_start {
             app.rekordbox_at_start();
@@ -708,6 +723,7 @@ impl RofLoxBoxApp {
             self.config.prefs.tempo_ranges = crate::deck::TempoRange::DEFAULTS.to_vec();
         }
         let p = self.config.prefs.clone();
+        let drawing = self.config.waveform_drawing;
         crate::widgets::set_knob_scroll(p.knob_scroll);
         self.effects.set_pad_slots(&p.pad_fx);
         // A range taken off the list: stopped decks move to the nearest one;
@@ -737,7 +753,7 @@ impl RofLoxBoxApp {
                 analysis: p.analysis,
                 analyze_on_load: p.analyze_on_load,
                 auto_gain: p.auto_gain,
-                waveform_detail: p.waveform_detail,
+                waveform_detail: drawing.detail(),
             };
         }
         let Some(engine) = self.engine.as_mut() else { return };
@@ -766,6 +782,16 @@ impl RofLoxBoxApp {
             }
         }
         let mut delete = None;
+        let mut relink = None;
+        // Controllers to link presets to: connected now, used before, linked.
+        let mut ports: Vec<String> = self.controller.port().map(str::to_owned).into_iter().collect();
+        ports.extend(self.config.midi_port.clone());
+        ports.extend(self.config.layout_presets.iter().filter_map(|p| match &p.controller {
+            Some(crate::layout::ControllerLink::Port(port)) => Some(port.clone()),
+            _ => None,
+        }));
+        ports.sort();
+        ports.dedup();
         if !self.config.layout_presets.is_empty() {
             ui.separator();
         }
@@ -774,6 +800,26 @@ impl RofLoxBoxApp {
                 if ui.selectable_label(is_current(preset), &preset.name).clicked() {
                     chosen = Some(preset.clone());
                 }
+                use crate::layout::ControllerLink;
+                let (icon, hover) = match &preset.controller {
+                    None => ("🎛", "Not switched to by a controller: click to link".to_owned()),
+                    Some(ControllerLink::Any) => ("🎛 any", "Switched to when any controller connects".to_owned()),
+                    Some(ControllerLink::Port(p)) => ("🎛 ✓", format!("Switched to when {p} connects")),
+                };
+                ui.menu_button(icon, |ui| {
+                    ui.label(RichText::new("Switch to this view when…").small().weak());
+                    let mut link = preset.controller.clone();
+                    ui.radio_value(&mut link, None, "No controller link");
+                    ui.radio_value(&mut link, Some(ControllerLink::Any), "Any controller connects");
+                    for port in &ports {
+                        ui.radio_value(&mut link, Some(ControllerLink::Port(port.clone())), format!("{port} connects"));
+                    }
+                    if link != preset.controller {
+                        relink = Some((i, link));
+                    }
+                })
+                .response
+                .on_hover_text(hover);
                 if ui.small_button("×").on_hover_text("Delete this preset").clicked() {
                     delete = Some(i);
                 }
@@ -790,10 +836,19 @@ impl RofLoxBoxApp {
             if ui.add_enabled(!name.is_empty(), egui::Button::new("Save current")).clicked() {
                 // Saving under an existing name replaces that preset.
                 self.config.layout_presets.retain(|p| p.name != name);
+                // Keeping its controller link when replaced.
+                let controller = self
+                    .config
+                    .layout_presets
+                    .iter()
+                    .find(|p| p.name == name)
+                    .and_then(|p| p.controller.clone());
+                self.config.layout_presets.retain(|p| p.name != name);
                 self.config.layout_presets.push(LayoutPreset {
                     name,
                     layout: current.clone(),
                     view: Some(view.clone()),
+                    controller,
                 });
                 self.preset_name.clear();
                 self.config.save();
@@ -833,6 +888,10 @@ impl RofLoxBoxApp {
         });
         if let Some(note) = &self.preset_note {
             ui.label(RichText::new(note).small().weak());
+        }
+        if let Some((i, link)) = relink {
+            self.config.layout_presets[i].controller = link;
+            self.config.save();
         }
         if let Some(i) = delete {
             self.config.layout_presets.remove(i);
@@ -1709,6 +1768,7 @@ impl eframe::App for RofLoxBoxApp {
         // Mixing keys only when performing; changing keys in Preferences
         // works in EDIT mode too.
         self.mixing_keys(ctx, performing);
+        self.poll_update(ctx);
         if performing {
             self.library_keys(ctx);
         }
@@ -1768,6 +1828,7 @@ impl eframe::App for RofLoxBoxApp {
         self.poll_usb(ctx);
         self.poll_replay(ctx);
         self.check_controllers(ctx);
+        self.follow_controller_views();
         self.save_session(false);
         self.finish_doubles();
         self.update_sync();
@@ -2029,6 +2090,7 @@ impl RofLoxBoxApp {
             Target::PrefsAnalysis => Some(PrefsTab::Analysis),
             Target::PrefsEdit => Some(PrefsTab::Edit),
             Target::PrefsAudio => Some(PrefsTab::Audio),
+            Target::PrefsWaveforms => Some(PrefsTab::Waveforms),
             _ => None,
         };
         if let Some(tab) = page {
@@ -2080,11 +2142,40 @@ impl RofLoxBoxApp {
         }
     }
 
+    /// A finished update check: in the log, and the top bar offers a newer
+    /// release.
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        if self.update.checking() {
+            // Look again soon without waiting for input.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        use crate::update::Outcome;
+        let as_version = std::env::var("ROFLOXBOX_UPDATE_AS").ok();
+        let line = match self.update.poll(as_version.as_deref().unwrap_or(crate::VERSION)) {
+            Some(Outcome::Newer(r)) => (format!("Update: {} is out (this is {})", r.version, crate::VERSION), false),
+            Some(Outcome::UpToDate(_)) => (format!("Up to date ({})", crate::VERSION), false),
+            Some(Outcome::Failed(err)) => (format!("Couldn't check for updates: {err}"), false),
+            None => return,
+        };
+        self.log(line.0, line.1);
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         let mut start = None;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(crate::APP_NAME).on_hover_text(format!("Version {}", crate::VERSION));
+                if let Some(release) = self.update.offer.clone() {
+                    let open = ui
+                        .button(RichText::new(format!("Update {} available", release.version)).color(Color32::from_rgb(110, 200, 110)))
+                        .on_hover_text(format!("This is {}. Opens the release page to download it.", crate::VERSION));
+                    if open.clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&release.url));
+                    }
+                    if ui.small_button("×").on_hover_text("Hide until the next start").clicked() {
+                        self.update.offer = None;
+                    }
+                }
                 ui.separator();
                 use mix_editor::Mode;
                 ui.selectable_value(&mut self.mode, Mode::Performance, "PERFORMANCE")
@@ -2333,6 +2424,7 @@ impl RofLoxBoxApp {
                     cue_point: deck.cue_point,
                     active_loop: deck.loop_region.map(|r| (r, deck.loop_active)),
                     grid_strength: self.config.grid_strength,
+                    cue_size: self.config.cue_size,
                     slip: engine.slip_position_secs(index),
                 };
                 draw_detail(
@@ -2343,6 +2435,8 @@ impl RofLoxBoxApp {
                     position,
                     visible,
                     self.config.waveform_style,
+                    self.config.waveform_drawing,
+                    &self.config.prefs.waveform_look,
                     if self.config.prefs.eq_waveforms { deck.eq_gains() } else { [1.0; 3] },
                     &markers,
                 );
@@ -2402,12 +2496,40 @@ impl RofLoxBoxApp {
                 self.config.waveform_style = style;
                 self.config.save();
             }
+            if style == WaveformStyle::Rgb {
+                let before = self.config.waveform_drawing;
+                egui::ComboBox::from_id_salt("waveform drawing")
+                    .selected_text(before.label())
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for drawing in crate::waveform::WaveformDrawing::ALL {
+                            ui.selectable_value(&mut self.config.waveform_drawing, drawing, drawing.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "How the RGB waveform is drawn (Simplest: rekordbox's own detail, the \
+                         lightest); also in Preferences → Waveforms",
+                    );
+                if self.config.waveform_drawing != before {
+                    self.config.save();
+                    // The detail tracks are worked out in follows it.
+                    self.apply_preferences();
+                }
+            }
             ui.separator();
             ui.label("Grid");
             let grid = ui
                 .add(Slider::new(&mut self.config.grid_strength, 0.0..=1.5).show_value(false))
                 .on_hover_text("Beat grid brightness");
             if grid.drag_stopped() || (grid.changed() && !grid.dragged()) {
+                self.config.save();
+            }
+            ui.label("Cues");
+            let cues = ui
+                .add(Slider::new(&mut self.config.cue_size, 0.6..=2.5).show_value(false))
+                .on_hover_text("Size of the hot cue, memory cue and cue markers");
+            if cues.drag_stopped() || (cues.changed() && !cues.dragged()) {
                 self.config.save();
             }
             if self.config.prefs.eq_waveforms {
@@ -3430,7 +3552,8 @@ impl RofLoxBoxApp {
         let mut prefs_changed = false;
         let decks = self.deck_count();
         egui::Window::new("Preferences").open(&mut open).default_width(560.0).show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                // Wrapped: every page's tab stays in sight in a narrow window.
+                ui.horizontal_wrapped(|ui| {
                     for tab in PrefsTab::ALL {
                         ui.selectable_value(
                             &mut self.prefs_tab,
@@ -3478,8 +3601,36 @@ impl RofLoxBoxApp {
                         prefs_changed |= edit_prefs(ui, &mut self.config.prefs);
                         return;
                     }
+                    PrefsTab::Waveforms => {
+                        prefs_changed |= crate::prefs_view::waveform_prefs(
+                            ui,
+                            &mut self.config.prefs,
+                            &mut self.config.waveform_drawing,
+                        );
+                        return;
+                    }
                     PrefsTab::View => {
                         prefs_changed |= view_prefs(ui, &mut self.config.prefs);
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Updates").strong());
+                        ui.horizontal(|ui| {
+                            prefs_changed |= ui
+                                .checkbox(&mut self.config.prefs.check_updates, "Check for updates at start")
+                                .changed();
+                            let checking = self.update.checking();
+                            if ui.add_enabled(!checking, egui::Button::new("Check now")).clicked() {
+                                self.update.start();
+                            }
+                            use crate::update::Outcome;
+                            let text = match &self.update.outcome {
+                                _ if checking => "Checking…".to_owned(),
+                                Some(Outcome::Newer(r)) => format!("{} is out (this is {})", r.version, crate::VERSION),
+                                Some(Outcome::UpToDate(_)) => format!("Up to date ({})", crate::VERSION),
+                                Some(Outcome::Failed(err)) => format!("Couldn't check: {err}"),
+                                None => format!("This is {}", crate::VERSION),
+                            };
+                            ui.label(RichText::new(text).small().weak());
+                        });
                         // The View menu too, so both are the same.
                         ui.add_space(8.0);
                         ui.separator();

@@ -16,8 +16,10 @@ pub struct CueList {
     pub kind: CueListKind,
     /// Read from a `PCO2` section.
     pub extended: bool,
-    /// `PCOB` header value of unknown meaning ("memory count" in the
-    /// crate-digger notes); `0xffffffff` in every file seen so far.
+    /// The `PCOB` header's last field ("memory count" in the crate-digger
+    /// notes). For a memory cue list: its first entry (high half) and last
+    /// entry (low half), which the writer works out from the entries'
+    /// links; `0xffffffff` for hot cue lists and empty lists.
     pub memory_count: u32,
     pub cues: Vec<Cue>,
 }

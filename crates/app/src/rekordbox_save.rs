@@ -66,6 +66,11 @@ pub struct Saved {
     pub analysed: usize,
     /// Tracks put into rekordbox whose audio couldn't be read for it.
     pub unanalysed: usize,
+    /// Analysis files whose cue lists were repaired ([`repair_analysis`]).
+    pub repaired: usize,
+    /// Tracks whose file path in rekordbox was repaired (written with
+    /// Windows's backslashes by an older RofLoxBox).
+    pub paths_fixed: usize,
     /// Playlists and folders made, changed or deleted.
     pub playlists: usize,
     /// rekordbox's ids of the playlists and folders made, by node id.
@@ -95,15 +100,23 @@ impl std::error::Error for RekordboxRunning {}
 /// Writes `snapshot` into rekordbox's library at `path` where it differs.
 /// With `wait_closed`, rekordbox must be closed ([`RekordboxRunning`]
 /// otherwise); the library is copied into `backups` first.
+///
+/// With `repair`, also repairs analysis files an older RofLoxBox wrote
+/// wrong: cue lists rekordbox refuses ([`repair_analysis`]) and missing
+/// waveforms (written again from the audio). What is changed is kept in a
+/// dated folder in `backups`.
 pub fn save(
     path: &Path,
     key: &str,
     snapshot: &Snapshot,
     backups: &Path,
     wait_closed: bool,
+    repair: bool,
 ) -> Result<Saved> {
     let closed = rekordbox_closed(wait_closed).ok_or(RekordboxRunning)?;
     let share = path.parent().unwrap_or(Path::new("")).join("share");
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+    let repair_backup = repair.then(|| backups.join(format!("analysis-repair-{stamp}")));
     let written = write(&closed, path, key, backups, |db, usn| {
         if usn.0 != snapshot.read_count {
             bail!(
@@ -113,6 +126,7 @@ pub fn save(
             );
         }
         let mut library = Library::open(db, usn)?;
+        library.repair = repair_backup.clone();
         let plan = library.save(snapshot, &share)?;
         Ok(plan)
     })?;
@@ -129,6 +143,9 @@ pub fn save(
                 .with_context(|| format!("writing the beat grid of {}", track.title))
         });
         written.into_iter().collect::<Result<Vec<()>>>()?;
+    }
+    if let Some(backup) = &repair_backup {
+        plan.saved.repaired += repair_analysis(&share.join("PIONEER/USBANLZ"), backup)?;
     }
     Ok(plan.saved)
 }
@@ -177,12 +194,20 @@ struct Library<'a> {
     /// Analysis files to write (row id, UUID, the track, what), all at
     /// once at the end, side by side.
     analyses: Vec<(String, String, Track, AnalysisJob)>,
+    /// Repairing ([`save`]'s `repair`): where analysis files written again
+    /// are kept as they were.
+    repair: Option<PathBuf>,
+    /// Tracks whose file path an older RofLoxBox wrote with Windows's
+    /// backslashes (rekordbox can play them but not analyse them), with the
+    /// path as rekordbox writes it: (row id, path).
+    backslashed: Vec<(String, String)>,
 }
 
 impl<'a> Library<'a> {
     fn open(db: &'a Connection, usn: &'a mut Usn) -> Result<Self> {
         let mut contents = HashMap::new();
         let mut paths = HashMap::new();
+        let mut backslashed = Vec::new();
         let mut statement = db.prepare(
             "SELECT FolderPath, ID, UUID, AnalysisDataPath FROM djmdContent
              WHERE rb_local_deleted = 0",
@@ -193,9 +218,13 @@ impl<'a> Library<'a> {
                 Ok(row.get::<_, Option<String>>(i)?.unwrap_or_default())
             };
             let path = text(0)?;
-            paths.insert(text(1)?, path.clone());
+            let key = path_key(&path);
+            if backslashed_windows_path(&path) {
+                backslashed.push((text(1)?, rekordbox_path_text(&path)));
+            }
+            paths.insert(text(1)?, key.clone());
             let content = Content { id: text(1)?, uuid: text(2)?, analysis: text(3)? };
-            contents.entry(path).or_insert_with(Vec::new).push(content);
+            contents.entry(key).or_insert_with(Vec::new).push(content);
         }
         let mut names = HashMap::new();
         for table in ["djmdArtist", "djmdAlbum", "djmdGenre", "djmdLabel"] {
@@ -235,6 +264,8 @@ impl<'a> Library<'a> {
             notation,
             unanalysed: 0,
             analyses: Vec::new(),
+            repair: None,
+            backslashed,
         })
     }
 
@@ -260,7 +291,7 @@ impl<'a> Library<'a> {
         }
         for id in wanted {
             let Some(track) = by_id.get(&id) else { continue };
-            let path = track.path.to_string_lossy().into_owned();
+            let path = path_key(&track.path.to_string_lossy());
             if !self.contents.contains_key(&path) && track.path.is_file() {
                 self.add_track(track)?;
                 plan.saved.added += 1;
@@ -268,9 +299,20 @@ impl<'a> Library<'a> {
         }
         // A file rekordbox has twice is unchanged when RofLoxBox has it as
         // either; changed, both get RofLoxBox's.
+        // Repairing: paths written with backslashes as rekordbox writes them.
+        if self.repair.is_some() {
+            for (id, path) in std::mem::take(&mut self.backslashed) {
+                self.db.execute(
+                    "UPDATE djmdContent SET FolderPath = ?2, rb_local_usn = ?3, updated_at = ?4
+                     WHERE ID = ?1",
+                    params![id, path, self.usn.next(), self.now],
+                )?;
+                plan.saved.paths_fixed += 1;
+            }
+        }
         for track in &snapshot.tracks {
-            let path = track.path.to_string_lossy();
-            let Some(rows) = self.contents.get(path.as_ref()).cloned() else { continue };
+            let path = path_key(&track.path.to_string_lossy());
+            let Some(rows) = self.contents.get(&path).cloned() else { continue };
             let mut differs = true;
             for row in &rows {
                 differs &= self.update_track(&row.id, track, false)?;
@@ -302,6 +344,13 @@ impl<'a> Library<'a> {
                         // Its files are gone (deleted, or a library moved
                         // without them): written again where they belong.
                         AnalysisJob::Rewrite(row.analysis.clone())
+                    } else if self.repair.is_some()
+                        && lacks_waveforms(&dat, track.duration > EMPTY_OVERVIEW_MIN_SECS)
+                    {
+                        // Written by an older RofLoxBox without a waveform
+                        // rekordbox shows (rekordbox's own files have them
+                        // all): written again, the old files kept.
+                        AnalysisJob::Refresh(row.analysis.clone())
                     } else if !dat.with_extension("2EX").is_file() {
                         // Analysed before RofLoxBox wrote 3-band waveforms
                         // (rekordbox's own analyses have them).
@@ -342,7 +391,33 @@ impl<'a> Library<'a> {
     fn write_analyses(&mut self, share: &Path, plan: &mut Plan) -> Result<()> {
         plan.saved.unanalysed += self.unanalysed;
         let jobs = std::mem::take(&mut self.analyses);
+        let kept = self.repair.clone();
         let written = parallel(&jobs, |(_, uuid, track, job)| match job {
+            AnalysisJob::Refresh(analysis) => {
+                let name = track.path.file_name()?.to_string_lossy().into_owned();
+                let dat = share.join(analysis.trim_start_matches('/'));
+                if let Some(kept) = &kept {
+                    for extension in ["DAT", "EXT", "2EX"] {
+                        let file = dat.with_extension(extension);
+                        let to = kept.join(file.strip_prefix(share).unwrap_or(&file));
+                        if file.is_file() {
+                            std::fs::create_dir_all(to.parent()?).ok()?;
+                            std::fs::copy(&file, &to).ok()?;
+                        }
+                    }
+                }
+                // From the audio: the files it has now are what is lacking.
+                let from_audio = Track { analysis: None, ..track.clone() };
+                crate::usb_export::write_analysis(
+                    share,
+                    analysis,
+                    &format!("?/{name}"),
+                    &from_audio,
+                    crate::deck::AnalysisMethod::Rekordbox,
+                )
+                .ok()
+                .map(|()| analysis.clone())
+            }
             AnalysisJob::ThreeBand(analysis) => {
                 let name = track.path.file_name()?.to_string_lossy().into_owned();
                 crate::usb_export::write_three_band(share, analysis, &format!("?/{name}"), track)
@@ -369,6 +444,7 @@ impl<'a> Library<'a> {
                 (Some(_), AnalysisJob::ThreeBand(_) | AnalysisJob::Rewrite(_)) => {
                     plan.saved.analysed += 1;
                 }
+                (Some(_), AnalysisJob::Refresh(_)) => plan.saved.repaired += 1,
                 // A track rekordbox had without analysis: pointed at it now.
                 (Some(analysis), AnalysisJob::Missing) => {
                     self.db.execute(
@@ -458,9 +534,10 @@ impl<'a> Library<'a> {
     /// converted one that replaced it): its file's details change, nothing
     /// else (cues, grid, analysis, playlists stay).
     fn move_track(&mut self, old: &Path, track: &Track) -> Result<()> {
-        let old = old.to_string_lossy().into_owned();
-        let new = track.path.to_string_lossy().into_owned();
-        if old == new {
+        let old = path_key(&old.to_string_lossy());
+        let new = rekordbox_path(&track.path);
+        let new_key = path_key(&new);
+        if old == new_key {
             return Ok(());
         }
         let Some(rows) = self.contents.remove(&old) else { return Ok(()) };
@@ -491,9 +568,9 @@ impl<'a> Library<'a> {
                     self.now
                 ],
             )?;
-            self.paths.insert(row.id.clone(), new.clone());
+            self.paths.insert(row.id.clone(), new_key.clone());
         }
-        self.contents.entry(new).or_default().extend(rows);
+        self.contents.entry(new_key).or_default().extend(rows);
         Ok(())
     }
 
@@ -501,7 +578,7 @@ impl<'a> Library<'a> {
     /// with its analysis (waveforms, grid, cues) to go into rekordbox's
     /// `share` folder so rekordbox needn't analyse it again.
     fn add_track(&mut self, track: &Track) -> Result<()> {
-        let path = track.path.to_string_lossy().into_owned();
+        let path = rekordbox_path(&track.path);
         let Some(file_type) = file_type(&track.path) else { return Ok(()) };
         let id = self.new_id("djmdContent", "ID")?;
         let file_id = self.new_id("djmdContent", "rb_file_id")?;
@@ -575,12 +652,12 @@ impl<'a> Library<'a> {
                 audio_properties(&track.path).bit_depth,
             ],
         )?;
-        self.paths.insert(id.clone(), path.clone());
+        self.paths.insert(id.clone(), path_key(&path));
         if analysis.is_some() {
             self.analyses.push((id.clone(), uuid.clone(), track.clone(), AnalysisJob::Added));
         }
         let analysis = analysis.unwrap_or_default();
-        self.contents.entry(path).or_default().push(Content { id, uuid, analysis });
+        self.contents.entry(path_key(&path)).or_default().push(Content { id, uuid, analysis });
         Ok(())
     }
 
@@ -667,12 +744,14 @@ impl<'a> Library<'a> {
     /// and loops (only tells, without `write`); returns whether they
     /// changed. rekordbox's other cue kinds stay.
     fn save_cues(&mut self, id: &str, uuid: &str, cues: &[Cue], write: bool) -> Result<bool> {
-        // (row id, kind, in, out, colour index, comment, active loop)
+        // (row id, kind, in, out, colour index, comment, active loop, beat
+        // loop size)
         let mut statement = self.db.prepare(
-            "SELECT ID, Kind, InMsec, OutMsec, ColorTableIndex, Comment, ActiveLoop FROM djmdCue
-             WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec",
+            "SELECT ID, Kind, InMsec, OutMsec, ColorTableIndex, Comment, ActiveLoop, BeatLoopSize
+             FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec",
         )?;
-        let mut existing: Vec<(String, i64, i64, i64, i64, String, bool)> = statement
+        type Row = (String, i64, i64, i64, i64, String, bool, i64);
+        let mut existing: Vec<Row> = statement
             .query_map([id], |row| {
                 Ok((
                     row.get(0)?,
@@ -682,15 +761,21 @@ impl<'a> Library<'a> {
                     integer(row, 4)?,
                     row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     integer(row, 6)? != 0,
+                    integer(row, 7)?,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         drop(statement);
-        existing.retain(|c| c.1 == 0 || crate::rekordbox_db::hot_cue_slot(c.1).is_some());
+        existing.retain(|c| {
+            crate::rekordbox_db::is_memory_kind(c.1) || crate::rekordbox_db::hot_cue_slot(c.1).is_some()
+        });
         let mut changed = false;
         let mut used = vec![false; existing.len()];
-        for cue in cues {
+        // rekordbox marks the active memory loop by its kind (one a track).
+        let active = cues.iter().position(|c| c.kind == CueKind::Memory && c.active && c.end.is_some());
+        for (index, cue) in cues.iter().enumerate() {
             let kind = match cue.kind {
+                CueKind::Memory if Some(index) == active => crate::rekordbox_db::ACTIVE_LOOP_KIND,
                 CueKind::Memory => 0,
                 CueKind::Hot(slot @ 0..=2) => i64::from(slot) + 1,
                 CueKind::Hot(slot @ 3..=7) => i64::from(slot) + 2,
@@ -705,22 +790,42 @@ impl<'a> Library<'a> {
             let found = existing
                 .iter()
                 .enumerate()
-                .position(|(i, c)| !used[i] && c.1 == kind && (c.2 - start).abs() <= 1);
+                // A memory loop may be kind 4 in rekordbox's library: the
+                // same cue, kept as it is.
+                .position(|(i, c)| {
+                    let both_memory = crate::rekordbox_db::is_memory_kind(kind)
+                        && crate::rekordbox_db::is_memory_kind(c.1);
+                    !used[i] && (c.1 == kind || both_memory) && (c.2 - start).abs() <= 1
+                });
             match found {
                 Some(i) => {
                     used[i] = true;
                     let row = &existing[i];
                     let out = if row.3 > 0 { row.3 } else { -1 };
                     let color = color.unwrap_or(row.4);
-                    if out != end || row.4 != color || row.5 != cue.name || row.6 != cue.active {
+                    // A beat loop's length: the collection's where it knows
+                    // it, else rekordbox's as it is (a plain cue's too).
+                    let size = match cue.loop_beats {
+                        Some(beats) if end > start => crate::rekordbox_db::beat_loop_size(Some(beats)),
+                        _ => row.7,
+                    };
+                    let same = out == end
+                        && row.4 == color
+                        && row.5 == cue.name
+                        && row.1 == kind
+                        && !row.6
+                        && row.7 == size;
+                    if !same {
                         if !write {
                             return Ok(true);
                         }
+                        // rekordbox keeps its ActiveLoop column at 0.
                         self.db.execute(
                             "UPDATE djmdCue SET OutMsec = ?2, OutFrame = ?3, ColorTableIndex = ?4,
-                                Comment = ?5, BeatLoopSize = 0, ActiveLoop = ?7, updated_at = ?6
+                                Comment = ?5, BeatLoopSize = ?8, ActiveLoop = 0, Kind = ?7,
+                                updated_at = ?6
                              WHERE ID = ?1",
-                            params![row.0, end, frames(end), color, cue.name, self.now, i64::from(cue.active)],
+                            params![row.0, end, frames(end), color, cue.name, self.now, kind, size],
                         )?;
                         changed = true;
                     }
@@ -737,7 +842,7 @@ impl<'a> Library<'a> {
                             ColorTableIndex, ActiveLoop, Comment, BeatLoopSize, CueMicrosec,
                             InPointSeekInfo, OutPointSeekInfo, ContentUUID, UUID, created_at,
                             updated_at)
-                         VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6, 0, 0, ?7, ?8, ?9, ?14, ?10, 0, 0,
+                         VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6, 0, 0, ?7, ?8, ?9, ?14, ?10, ?15, 0,
                             '', '', ?11, ?12, ?13, ?13)",
                         params![
                             cue_id,
@@ -754,7 +859,8 @@ impl<'a> Library<'a> {
                             uuid,
                             self::uuid()?,
                             self.now,
-                            i64::from(cue.active),
+                            0,
+                            if looped { crate::rekordbox_db::beat_loop_size(cue.loop_beats) } else { 0 },
                         ],
                     )?;
                     changed = true;
@@ -979,7 +1085,7 @@ impl<'a> Library<'a> {
                 .tracks
                 .iter()
                 .filter_map(|t| tracks.get(t))
-                .map(|t| t.path.to_string_lossy().into_owned())
+                .map(|t| path_key(&t.path.to_string_lossy()))
                 .filter(|path| self.contents.contains_key(path))
                 .collect();
             if self.save_entries(id, &wanted)? && !made.contains(id) {
@@ -1138,6 +1244,104 @@ enum AnalysisJob {
     ThreeBand(String),
     /// All of it again at this path, where its files are missing.
     Rewrite(String),
+    /// All of it again at this path, where its files lack a waveform; the
+    /// old files are kept first.
+    Refresh(String),
+}
+
+/// Whether `path` is a Windows drive path (`C:\…` or `C:/…`).
+fn windows_drive_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+/// A file path as rekordbox writes it: on Windows with `/` between the
+/// folders (`C:/Users/…`), as rekordbox's own rows have them. rekordbox
+/// plays a file given with backslashes but can't analyse it.
+fn rekordbox_path(path: &Path) -> String {
+    rekordbox_path_text(&path.to_string_lossy())
+}
+
+fn rekordbox_path_text(path: &str) -> String {
+    if windows_drive_path(path) { path.replace('\\', "/") } else { path.to_owned() }
+}
+
+/// What a file path is looked up by: Windows paths with either slash and
+/// in any case (Windows doesn't tell them apart) are the same file.
+fn path_key(path: &str) -> String {
+    if windows_drive_path(path) { path.replace('\\', "/").to_lowercase() } else { path.to_owned() }
+}
+
+/// A Windows path rekordbox has with backslashes (written so by an older
+/// RofLoxBox).
+fn backslashed_windows_path(path: &str) -> bool {
+    windows_drive_path(path) && path.contains('\\')
+}
+
+/// The waveform sections every analysis rekordbox writes has: in the
+/// `.DAT` the overview and its small version, in the `.EXT` the scrolling
+/// and colour waveforms with their overview, in the `.2EX` (when there is
+/// one) the 3-band waveform and its overview.
+const WAVEFORMS: [(&str, &[&[u8; 4]]); 3] = [
+    ("DAT", &[b"PWAV", b"PWV2"]),
+    ("EXT", &[b"PWV3", b"PWV5", b"PWV4"]),
+    ("2EX", &[b"PWV7", b"PWV6"]),
+];
+
+/// The overviews rekordbox draws in its track list, by file.
+const OVERVIEWS: [(&str, &[u8; 4]); 3] = [("DAT", b"PWAV"), ("EXT", b"PWV4"), ("2EX", b"PWV6")];
+
+/// A track shorter than this may well have an empty overview (rekordbox's
+/// own one-second `silent.mp3`, for one).
+const EMPTY_OVERVIEW_MIN_SECS: f64 = 10.0;
+
+/// Whether the analysis at `dat` lacks one of rekordbox's waveforms, or
+/// (`long`: the track isn't one that may be silent) has an overview for
+/// the track list that is empty (all zeros).
+fn lacks_waveforms(dat: &Path, long: bool) -> bool {
+    let missing = WAVEFORMS.iter().any(|(extension, wanted)| {
+        let path = dat.with_extension(extension);
+        match section_tags(&path) {
+            Some(tags) => wanted.iter().any(|w| !tags.contains(*w)),
+            // No .2EX is done apart ([`AnalysisJob::ThreeBand`]).
+            None => *extension != "2EX",
+        }
+    });
+    missing
+        || long && OVERVIEWS.iter().any(|(extension, tag)| {
+            let Ok(file) = rofloxbox_formats::anlz::AnlzFile::open(dat.with_extension(extension)) else {
+                return false;
+            };
+            file.sections.iter().any(|s| match s {
+                Section::Waveform(w) if s.tag() == **tag => w.data.iter().all(|&b| b == 0),
+                _ => false,
+            })
+        })
+}
+
+/// The tags of an analysis file's sections; `None` if it can't be read.
+fn section_tags(path: &Path) -> Option<Vec<[u8; 4]>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut head = [0u8; 12];
+    file.read_exact(&mut head).ok()?;
+    if &head[..4] != b"PMAI" {
+        return None;
+    }
+    let mut at = u64::from(u32::from_be_bytes([head[4], head[5], head[6], head[7]]));
+    let mut tags = Vec::new();
+    while at + 12 <= length {
+        file.seek(SeekFrom::Start(at)).ok()?;
+        file.read_exact(&mut head).ok()?;
+        let len = u64::from(u32::from_be_bytes([head[8], head[9], head[10], head[11]]));
+        if len == 0 {
+            break;
+        }
+        tags.push([head[0], head[1], head[2], head[3]]);
+        at += len;
+    }
+    Some(tags)
 }
 
 /// What an audio file says of itself.
@@ -1345,6 +1549,46 @@ fn write_grid(dat: &Path, track: &Track, share: &Path, backup: &Backup) -> Resul
     Ok(())
 }
 
+/// Repairs the analysis files below `dir` (a `PIONEER/USBANLZ` folder:
+/// rekordbox's `share`, or a stick's) whose cue lists an older RofLoxBox
+/// wrote so that rekordbox refuses them — without waveform, beat grid or
+/// cues. Only those cue lists change; each file repaired is copied into
+/// `backup` first (at its place below `dir`). Returns how many tracks were
+/// repaired.
+pub fn repair_analysis(dir: &Path, backup: &Path) -> Result<usize> {
+    let mut repaired = 0;
+    let Ok(outer) = std::fs::read_dir(dir) else { return Ok(0) };
+    for folder in outer.flatten() {
+        let Ok(inner) = std::fs::read_dir(folder.path()) else { continue };
+        for track in inner.flatten() {
+            let dat = track.path().join("ANLZ0000.DAT");
+            let Ok(dat_bytes) = std::fs::read(&dat) else { continue };
+            let ext = dat.with_extension("EXT");
+            let ext_bytes = std::fs::read(&ext).ok();
+            // A file that can't be read is left as it is.
+            let Ok(fixed) = rofloxbox_formats::anlz::repair_cue_lists(&dat_bytes, ext_bytes.as_deref())
+            else {
+                continue;
+            };
+            if fixed.is_empty() {
+                continue;
+            }
+            for (path, new) in [(&dat, &fixed.dat), (&ext, &fixed.ext)] {
+                let Some(new) = new else { continue };
+                let relative = path.strip_prefix(dir).unwrap_or(path);
+                let kept = backup.join(relative);
+                if let Some(parent) = kept.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(path, &kept).with_context(|| format!("backing up {}", path.display()))?;
+                replace_file(path, new)?;
+            }
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
 fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("RofLoxBox");
     std::fs::write(&temporary, bytes)
@@ -1367,6 +1611,52 @@ mod tests {
         \x20   <NODE Id=\"p2\" ParentId=\"0\" Attribute=\"0\" Timestamp=\"0\" Lib_Type=\"0\" CheckType=\"0\"/>\r\n\
         \x20   <NODE Id=\"s1\" ParentId=\"0\" Attribute=\"4\" Timestamp=\"0\" Lib_Type=\"0\" CheckType=\"0\"/>\r\n\
         \x20 </PLAYLISTS>\r\n</MASTER_PLAYLIST>\r\n";
+
+    /// Analysis files with the memory cue list header an older RofLoxBox
+    /// wrote are repaired in place, a copy kept; healthy ones aren't
+    /// touched.
+    #[test]
+    fn broken_analysis_files_are_repaired_with_a_copy_kept() {
+        use rofloxbox_formats::anlz::{Cue, CueKind, CueList, CueListKind};
+        let root = std::env::temp_dir().join(format!("rofloxbox-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("USBANLZ");
+        let cue = |time_ms| Cue {
+            hot_cue: None,
+            kind: CueKind::Cue,
+            time_ms,
+            loop_end_ms: None,
+            status: None,
+            color_id: None,
+            loop_beats: None,
+            comment: None,
+            hot_cue_color: None,
+            order: None,
+            trailer: Vec::new(),
+        };
+        let file = AnlzFile {
+            sections: vec![Section::Cues(CueList {
+                kind: CueListKind::Memory,
+                extended: false,
+                memory_count: u32::MAX,
+                cues: vec![cue(100), cue(200)],
+            })],
+        };
+        let healthy = file.to_bytes();
+        let mut broken = healthy.clone();
+        broken[28 + 0x14..28 + 0x18].copy_from_slice(&[0xff; 4]);
+        for (name, bytes) in [("bad", &broken), ("good", &healthy)] {
+            std::fs::create_dir_all(dir.join("P001").join(name)).unwrap();
+            std::fs::write(dir.join("P001").join(name).join("ANLZ0000.DAT"), bytes).unwrap();
+        }
+        let backup = root.join("backup");
+        assert_eq!(repair_analysis(&dir, &backup).unwrap(), 1);
+        assert_eq!(std::fs::read(dir.join("P001/bad/ANLZ0000.DAT")).unwrap(), healthy);
+        assert_eq!(std::fs::read(backup.join("P001/bad/ANLZ0000.DAT")).unwrap(), broken);
+        assert!(!backup.join("P001/good").exists());
+        assert_eq!(repair_analysis(&dir, &backup).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A rekordbox library in a new folder: `master.db` (track `t1` with an
     /// analysis file holding a 174 BPM grid), `masterPlaylists6.xml`, and a
@@ -1425,6 +1715,160 @@ mod tests {
         c.nodes.iter().find(|n| n.name == name).unwrap().id
     }
 
+    /// Two seconds of a 440 Hz tone at `path` (16-bit mono WAV).
+    fn tone(path: &Path) {
+        let rate = 44_100u32;
+        let samples: Vec<i16> = (0..rate * 2)
+            .map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 12_000.0) as i16)
+            .collect();
+        let data_len = samples.len() as u32 * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+        std::fs::write(path, wav).unwrap();
+    }
+
+    /// Repairing writes a track's analysis again when it lacks one of
+    /// rekordbox's waveforms (an older RofLoxBox left out the small
+    /// overview rekordbox shows in the track list), keeping the old files;
+    /// a plain save leaves it.
+    #[test]
+    fn repair_writes_missing_waveforms_again() {
+        let root = folder("refresh");
+        let backups = root.join("backups");
+        let mut c = collection(&root);
+        let path = root.join("Tone.wav");
+        tone(&path);
+        c.merge(vec![ScannedFile {
+            path: path.clone(),
+            title: "Tone".into(),
+            duration: 2.0,
+            bpm: Some(120.0),
+            sample_rate: Some(44_100),
+            ..ScannedFile::default()
+        }]);
+        let id = c.tracks.iter().find(|t| t.path == path).unwrap().id;
+        let list = c.create("With tone", NodeKind::Playlist, Some(node(&c, "Sets")));
+        c.add_to_playlist(list, &[id]);
+        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
+        let analysis: String = plain(&root)
+            .query_row("SELECT AnalysisDataPath FROM djmdContent WHERE FolderPath = ?1", [path.to_string_lossy()], |r| r.get(0))
+            .unwrap();
+        let ext = root.join("share").join(analysis.trim_start_matches('/')).with_extension("EXT");
+        // As an older RofLoxBox wrote it: without the colour overview.
+        let mut file = AnlzFile::open(&ext).unwrap();
+        file.sections.retain(|s| s.tag() != *b"PWV4");
+        let old = file.to_bytes();
+        std::fs::write(&ext, &old).unwrap();
+        let c = collection(&root);
+
+        let plain_save = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
+        assert_eq!(plain_save.repaired, 0);
+        assert_eq!(std::fs::read(&ext).unwrap(), old);
+
+        let repaired = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, true).unwrap();
+        assert_eq!(repaired.repaired, 1, "{repaired:?}");
+        assert!(AnlzFile::open(&ext).unwrap().sections.iter().any(|s| s.tag() == *b"PWV4"));
+        let kept: Vec<_> = walk(&backups).into_iter().filter(|p| p.ends_with("ANLZ0000.EXT")).collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), old);
+        // Nothing more to repair.
+        let again = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, true).unwrap();
+        assert_eq!(again.repaired, 0);
+    }
+
+    /// An overview of nothing but zeros counts as missing, except for a
+    /// short track (one that may be silent); a missing one always does.
+    #[test]
+    fn empty_overviews_count_as_missing_for_long_tracks() {
+        use rofloxbox_formats::anlz::{Waveform, WaveformKind};
+        let dir = std::env::temp_dir().join(format!("rofloxbox-overview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wave = |kind, entry_len, byte| Section::Waveform(Waveform { kind, entry_len, data: vec![byte; 60] });
+        let write = |ext: &str, sections| {
+            std::fs::write(dir.join(format!("ANLZ0000.{ext}")), AnlzFile { sections }.to_bytes()).unwrap();
+        };
+        let dat = dir.join("ANLZ0000.DAT");
+        write("DAT", vec![wave(WaveformKind::Preview, 1, 5), wave(WaveformKind::TinyPreview, 1, 5)]);
+        write("2EX", vec![wave(WaveformKind::ThreeBandDetail, 3, 5), wave(WaveformKind::ThreeBandPreview, 3, 5)]);
+        let ext = |overview| {
+            vec![
+                wave(WaveformKind::Detail, 1, 5),
+                wave(WaveformKind::ColorDetail, 2, 5),
+                wave(WaveformKind::ColorPreview, 6, overview),
+            ]
+        };
+        write("EXT", ext(5));
+        assert!(!lacks_waveforms(&dat, true));
+        write("EXT", ext(0));
+        assert!(lacks_waveforms(&dat, true));
+        assert!(!lacks_waveforms(&dat, false));
+        write("EXT", ext(5)[..2].to_vec());
+        assert!(lacks_waveforms(&dat, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows paths are the same file whichever way their slashes lean and
+    /// in any case; rekordbox gets them with `/`. Other paths are as they are.
+    #[test]
+    fn windows_paths_match_and_are_written_as_rekordbox_writes_them() {
+        assert_eq!(path_key("C:\\Music\\Night Raver.wav"), path_key("c:/music/night raver.WAV"));
+        assert_eq!(rekordbox_path_text("C:\\Music\\A, B - Night Raver.wav"), "C:/Music/A, B - Night Raver.wav");
+        assert_eq!(rekordbox_path_text("/Users/me/a\\b.wav"), "/Users/me/a\\b.wav");
+        assert_ne!(path_key("/Users/Me/a.wav"), path_key("/Users/me/a.wav"));
+        assert!(backslashed_windows_path("D:\\x.wav") && !backslashed_windows_path("D:/x.wav"));
+    }
+
+    /// Repairing rewrites a track's path an older RofLoxBox gave rekordbox
+    /// with backslashes (rekordbox plays it but can't analyse it); a plain
+    /// save leaves it.
+    #[test]
+    fn repair_writes_backslashed_paths_with_slashes() {
+        let root = folder("slashes");
+        let backups = root.join("backups");
+        let db = crate::rekordbox_db::connect(&root.join("master.db"), "secret", true).unwrap();
+        db.execute("UPDATE djmdContent SET FolderPath = 'C:\\Music\\One.wav' WHERE ID = 't1'", []).unwrap();
+        drop(db);
+        let c = collection(&root);
+        let path_of = || -> String {
+            plain(&root).query_row("SELECT FolderPath FROM djmdContent WHERE ID = 't1'", [], |r| r.get(0)).unwrap()
+        };
+        let saved = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
+        assert_eq!((saved.paths_fixed, path_of()), (0, "C:\\Music\\One.wav".to_owned()));
+        let c = collection(&root);
+        let saved = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, true).unwrap();
+        assert_eq!((saved.paths_fixed, path_of()), (1, "C:/Music/One.wav".to_owned()));
+        let c = collection(&root);
+        let again = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, true).unwrap();
+        assert_eq!(again.paths_fixed, 0);
+    }
+
+    /// Every file below `dir`.
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
     /// A track new to rekordbox goes in with RofLoxBox's analysis where
     /// rekordbox keeps its own (named by the track's UUID), so rekordbox
     /// shows its waveform without analysing it again.
@@ -1434,35 +1878,9 @@ mod tests {
         let root = folder("analysis");
         let backups = root.join("backups");
         let mut c = collection(&root);
-        // Two seconds of a 440 Hz tone, 16-bit mono.
         let rate = 44_100u32;
-        let samples: Vec<i16> = (0..rate * 2)
-            .map(|i| {
-                let phase = i as f32 * 440.0 * std::f32::consts::TAU / rate as f32;
-                (phase.sin() * 12_000.0) as i16
-            })
-            .collect();
-        let mut wav = Vec::new();
-        let data_len = samples.len() as u32 * 2;
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        for v in [16u32] {
-            wav.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in [1u16, 1] {
-            wav.extend_from_slice(&v.to_le_bytes());
-        }
-        wav.extend_from_slice(&rate.to_le_bytes());
-        wav.extend_from_slice(&(rate * 2).to_le_bytes());
-        for v in [2u16, 16] {
-            wav.extend_from_slice(&v.to_le_bytes());
-        }
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_len.to_le_bytes());
-        wav.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
         let path = root.join("Tone.wav");
-        std::fs::write(&path, wav).unwrap();
+        tone(&path);
         c.merge(vec![ScannedFile {
             path: path.clone(),
             title: "Tone".into(),
@@ -1476,7 +1894,7 @@ mod tests {
         c.add_to_playlist(list, &[tone]);
 
         let saved =
-            save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+            save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
         assert_eq!((saved.added, saved.unanalysed), (1, 0), "{saved:?}");
         let (uuid, analysis, analysed): (String, String, i64) = plain(&root)
             .query_row(
@@ -1536,7 +1954,7 @@ mod tests {
         let list = c.create("Moved", NodeKind::Playlist, Some(node(&c, "Sets")));
         c.add_to_playlist(list, &[one]);
         let saved =
-            save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+            save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
         assert_eq!((saved.moved.clone(), saved.added), (vec![one], 0), "{saved:?}");
         let (path, file_type, bitrate): (String, i64, i64) = plain(&root)
             .query_row(
@@ -1566,15 +1984,27 @@ mod tests {
             color: None,
             name: String::new(),
             active,
+            loop_beats: Some((8, 1)),
         };
-        c.update_track(one, |t| t.cues.extend([memory_loop(20.0, true), memory_loop(40.0, false)]));
-        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        // The library's own active loop (kind 4, at 0.1 s) is read as one.
+        assert!(c.track(one).unwrap().cues.iter().any(|q| q.active && (q.start - 0.1).abs() < 1e-6));
+        c.update_track(one, |t| {
+            for cue in &mut t.cues {
+                cue.active = false;
+            }
+            t.cues.extend([memory_loop(20.0, true), memory_loop(40.0, false)]);
+        });
+        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
+        // rekordbox marks the active loop by its kind (4); its ActiveLoop
+        // column stays 0.
         let flags = |root: &Path| -> Vec<(i64, i64)> {
             let db = plain(root);
             let mut statement = db
                 .prepare(
-                    "SELECT InMsec, coalesce(ActiveLoop, 0) FROM djmdCue
-                     WHERE ContentID = 't1' AND Kind = 0 AND OutMsec > 0 ORDER BY InMsec",
+                    "SELECT InMsec, Kind FROM djmdCue
+                     WHERE ContentID = 't1' AND Kind IN (0, 4) AND OutMsec > 0
+                        AND coalesce(ActiveLoop, 0) = 0
+                     ORDER BY InMsec",
                 )
                 .unwrap();
             statement
@@ -1584,7 +2014,20 @@ mod tests {
                 .unwrap()
         };
         let saved = flags(&root);
-        assert!(saved.contains(&(20_000, 1)) && saved.contains(&(40_000, 0)), "{saved:?}");
+        assert!(
+            saved.contains(&(100, 0)) && saved.contains(&(20_000, 4)) && saved.contains(&(40_000, 0)),
+            "{saved:?}"
+        );
+        // Their length in beats, as rekordbox keeps it (8 beats: 0x0008_0001);
+        // the library's own loop keeps its 2.
+        let sizes: Vec<(i64, i64)> = {
+            let db = plain(&root);
+            let mut statement = db
+                .prepare("SELECT InMsec, coalesce(BeatLoopSize, 0) FROM djmdCue WHERE ContentID = 't1' AND OutMsec > 0 ORDER BY InMsec")
+                .unwrap();
+            statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert!(sizes.contains(&(100, 0x0002_0001)) && sizes.contains(&(20_000, 0x0008_0001)), "{sizes:?}");
         let mut c = collection(&root);
         let read = |c: &Collection| -> Vec<f64> {
             let track = c.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap();
@@ -1597,9 +2040,9 @@ mod tests {
                 cue.active = cue.end.is_some() && (cue.start - 40.0).abs() < 0.01;
             }
         });
-        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
         let saved = flags(&root);
-        assert!(saved.contains(&(20_000, 0)) && saved.contains(&(40_000, 1)), "{saved:?}");
+        assert!(saved.contains(&(20_000, 0)) && saved.contains(&(40_000, 4)), "{saved:?}");
         assert_eq!(read(&collection(&root)), [40.0]);
     }
 
@@ -1621,8 +2064,12 @@ mod tests {
             t.color = Some(6);
             // The same key in the other notation: no change.
             t.key = Some("Am".into());
-            t.cues[0].start = 1.5;
-            t.cues[1].name = "build".into();
+            let hot = |t: &rofloxbox_library::Track, n| {
+                t.cues.iter().position(|c| c.kind == CueKind::Hot(n)).unwrap()
+            };
+            let (a, d) = (hot(t, 0), hot(t, 3));
+            t.cues[a].start = 1.5;
+            t.cues[d].name = "build".into();
             t.cues.push(Cue {
                 kind: CueKind::Memory,
                 start: 10.0,
@@ -1630,6 +2077,7 @@ mod tests {
                 color: None,
                 name: String::new(),
                 active: false,
+                loop_beats: None,
             });
             t.tempo[0].start = 0.12;
         });
@@ -1660,7 +2108,7 @@ mod tests {
         let made = c.create("Made", NodeKind::Playlist, Some(node(&c, "Sets")));
         c.add_to_playlist(made, &[new, one]);
 
-        let saved = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        let saved = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
         assert_eq!((saved.tracks, saved.cues, saved.grids, saved.added), (1, 1, 1, 1), "{saved:?}");
         assert_eq!(saved.ids.len(), 1);
         assert_eq!(saved.ids[0].0, made);
@@ -1790,14 +2238,16 @@ mod tests {
 
         // Saved again: nothing left to change, nothing written.
         c.saved_to_rekordbox(&saved.ids, saved.count);
-        let again = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false).unwrap();
+        let again = save(&root.join("master.db"), "secret", &snapshot(&c), &backups, false, false).unwrap();
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
 
         // Read back, the library is what RofLoxBox had.
         let reread = collection(&root);
         let one = reread.tracks.iter().find(|t| t.path == Path::new("/music/One.wav")).unwrap();
-        assert_eq!(one.cues.len(), 4);
+        // Hot cues A and D, the memory cue, and both memory loops (the
+        // kind 4 one kept as it was).
+        assert_eq!(one.cues.len(), 5);
         assert!((one.tempo[0].start - 0.12).abs() < 0.001);
         let _ = std::fs::remove_dir_all(&root);
         let _ = two;
@@ -1812,7 +2262,7 @@ mod tests {
         c.update_track(first, |t| t.rating = 1);
         let before = std::fs::read(root.join("master.db")).unwrap();
         let err =
-            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b"), false).unwrap_err();
+            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b"), false, false).unwrap_err();
         assert!(err.to_string().contains("changed its library"), "{err}");
         // Never read from rekordbox: there's nothing to save with.
         c.rekordbox_count = None;
@@ -1822,7 +2272,7 @@ mod tests {
         let mut c = collection(&root);
         c.delete(node(&c, "rekordbox"));
         let saved =
-            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b"), false).unwrap();
+            save(&root.join("master.db"), "secret", &snapshot(&c), &root.join("b"), false, false).unwrap();
         assert!(saved.is_empty(), "{saved:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1851,7 +2301,7 @@ mod tests {
             c.tracks.iter().map(|t| (t.path.clone(), rows(&t.path))).collect();
         c.import_rekordbox(opened.library);
         c.rekordbox_count = Some(opened.count);
-        let saved = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
+        let saved = save(&path, &key, &snapshot(&c), &backups, false, false).unwrap();
         println!("unchanged: {saved:?}");
         // Only tags edited in RofLoxBox go over.
         let edited = c.tracks.iter().filter(|t| !t.edited.is_empty()).count();
@@ -1874,6 +2324,7 @@ mod tests {
                 color: Some([230, 40, 40]),
                 name: "RofLoxBox".into(),
                 active: false,
+                loop_beats: None,
             })
         });
         c.rename(list, &format!("{name} (RofLoxBox)"));
@@ -1901,14 +2352,14 @@ mod tests {
         c.update_track(gridded, |t| t.tempo[0].start += 0.01);
         // The new track's cues go along.
         let new_cues = usize::from(new.is_some_and(|n| !c.track(n).unwrap().cues.is_empty()));
-        let saved = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
+        let saved = save(&path, &key, &snapshot(&c), &backups, false, false).unwrap();
         println!("edited: {saved:?}");
         assert_eq!(
             (saved.cues, saved.ids.len(), saved.tracks, saved.grids, saved.added),
             (1 + new_cues, 1, 0, 1, usize::from(new.is_some()))
         );
         c.saved_to_rekordbox(&saved.ids, saved.count);
-        let again = save(&path, &key, &snapshot(&c), &backups, false).unwrap();
+        let again = save(&path, &key, &snapshot(&c), &backups, false, false).unwrap();
         assert!(again.is_empty(), "{again:?}");
 
         let reread = crate::rekordbox_db::open_any(&path, &key).unwrap();

@@ -459,25 +459,29 @@ fn rekordbox_analysis(
             }
         }
     };
-    // The basic memory lists: the collection's, with its active loop.
-    let basic = |file: &mut AnlzFile| {
+    // The basic lists: the collection's memory cues (with its active
+    // loop), and its hot cues A–C in the .DAT, D and on in the .EXT.
+    let basic = |file: &mut AnlzFile, in_dat: bool| {
         for section in &mut file.sections {
             if let Section::Cues(list) = section
                 && !list.extended
-                && list.kind == CueListKind::Memory
             {
-                list.cues = basic_memory(&track.cues, &list.cues);
+                match list.kind {
+                    CueListKind::Memory => list.cues = basic_memory(&track.cues, &list.cues),
+                    CueListKind::Hot => list.cues = basic_hot(&track.cues, &list.cues, in_dat),
+                    CueListKind::Unknown(_) => {}
+                }
             }
         }
     };
     set_path(&mut dat);
-    basic(&mut dat);
+    basic(&mut dat, true);
     if grid_changed {
         replace_grid(&mut dat, grid);
     }
     let ext = ext.map(|mut ext| {
         set_path(&mut ext);
-        basic(&mut ext);
+        basic(&mut ext, false);
         if grid_changed {
             // Its summary of the old grid would no longer match.
             ext.sections.retain(|s| !matches!(s, Section::ExtendedBeatGrid(_)));
@@ -589,12 +593,61 @@ fn collection_cues(track: &CollectionTrack, original: &[AnlzCue]) -> (CueList, C
             order: None,
             trailer: Vec::new(),
         });
+        let mut entry = entry;
+        // A beat loop's length in beats, as rekordbox keeps it (the
+        // analysis's own stays where the collection doesn't know it).
+        entry.loop_beats = loop_end_ms.and(cue.loop_beats.or(entry.loop_beats));
         if hot_cue.is_some() { hot.push(entry) } else { memory.push(entry) }
     }
     hot.sort_by_key(|c| c.hot_cue);
     memory.sort_by_key(|c| c.time_ms);
     let list = |kind, cues| CueList { kind, extended: true, memory_count: 0, cues };
     (list(CueListKind::Hot, hot), list(CueListKind::Memory, memory))
+}
+
+/// Players read hot cues A–C from the `.DAT`'s basic list and D on from
+/// the `.EXT`'s (the extended list has them all, with colors and names).
+const DAT_HOT_CUES: u32 = 3;
+
+/// The collection's hot cues for a basic list: A–C for the `.DAT`
+/// (`in_dat`), D on for the `.EXT`, written as rekordbox writes them;
+/// entries already in the list keep their details.
+fn basic_hot(cues: &[rofloxbox_library::Cue], original: &[AnlzCue], in_dat: bool) -> Vec<AnlzCue> {
+    let mut hot: Vec<AnlzCue> = cues
+        .iter()
+        .filter_map(|cue| match cue.kind {
+            CueKind::Hot(n) => Some((u32::from(n) + 1, cue)),
+            CueKind::Memory => None,
+        })
+        .filter(|&(number, _)| (number <= DAT_HOT_CUES) == in_dat)
+        .map(|(number, cue)| {
+            let time_ms = (cue.start * 1000.0).round().max(0.0) as u32;
+            let loop_end_ms = cue.end.map(|end| (end * 1000.0).round().max(0.0) as u32);
+            let known = original.iter().find(|o| o.hot_cue == Some(number) && o.time_ms.abs_diff(time_ms) <= 1);
+            let mut entry = known.cloned().unwrap_or_else(|| AnlzCue {
+                hot_cue: Some(number),
+                kind: if loop_end_ms.is_some() { AnlzCueKind::Loop } else { AnlzCueKind::Cue },
+                time_ms,
+                loop_end_ms,
+                status: None,
+                color_id: None,
+                loop_beats: None,
+                comment: None,
+                hot_cue_color: None,
+                order: None,
+                trailer: Vec::new(),
+            });
+            entry.time_ms = time_ms;
+            entry.loop_end_ms = loop_end_ms;
+            entry.kind = if loop_end_ms.is_some() { AnlzCueKind::Loop } else { AnlzCueKind::Cue };
+            // rekordbox's hot cue entries: status 0 and not linked.
+            entry.status = Some(CueStatus::Disabled);
+            entry.order = Some((0xffff, 0xffff));
+            entry
+        })
+        .collect();
+    hot.sort_by_key(|c| c.hot_cue);
+    hot
 }
 
 /// The collection's memory cues and loops as a basic list's entries, the
@@ -627,7 +680,8 @@ fn basic_memory(cues: &[rofloxbox_library::Cue], original: &[AnlzCue]) -> Vec<An
             });
             entry.loop_end_ms = loop_end_ms;
             let active = cue.active && loop_end_ms.is_some();
-            entry.status = Some(if active { CueStatus::ActiveLoop } else { CueStatus::Enabled });
+            // As rekordbox writes them: 4 for the active loop, 0 otherwise.
+            entry.status = Some(if active { CueStatus::ActiveLoop } else { CueStatus::Disabled });
             // Linked again in their new order.
             entry.order = None;
             entry
@@ -777,6 +831,14 @@ fn own_analysis(
     let empty = |kind| {
         Section::Cues(CueList { kind, extended: false, memory_count: u32::MAX, cues: Vec::new() })
     };
+    let basic_hot_list = |in_dat| {
+        Section::Cues(CueList {
+            kind: CueListKind::Hot,
+            extended: false,
+            memory_count: u32::MAX,
+            cues: basic_hot(&track.cues, &[], in_dat),
+        })
+    };
 
     // rekordbox's own files have the VBR index next, all zeros but for some
     // MP3s (401 entries).
@@ -788,7 +850,7 @@ fn own_analysis(
     dat.extend([
         waveform(WaveformKind::Preview, 1, preview),
         waveform(WaveformKind::TinyPreview, 1, tiny),
-        empty(CueListKind::Hot),
+        basic_hot_list(true),
         Section::Cues(CueList {
             kind: CueListKind::Memory,
             extended: false,
@@ -799,7 +861,7 @@ fn own_analysis(
     let mut ext = vec![
         Section::Path(file_path.to_owned()),
         waveform(WaveformKind::Detail, 1, detail),
-        empty(CueListKind::Hot),
+        basic_hot_list(false),
         empty(CueListKind::Memory),
         Section::Cues(hot),
         Section::Cues(memory),
@@ -819,6 +881,70 @@ fn own_analysis(
 mod tests {
     use super::*;
 
+    /// A beat loop's length in beats goes into its extended entry, as
+    /// rekordbox writes it; a loop set by hand has none.
+    #[test]
+    fn loops_keep_their_length_in_beats() {
+        let mut collection = rofloxbox_library::Collection::default();
+        collection.merge(vec![rofloxbox_library::ScannedFile {
+            path: "/music/Loop.wav".into(),
+            ..rofloxbox_library::ScannedFile::default()
+        }]);
+        let id = collection.tracks[0].id;
+        let cues = vec![
+                rofloxbox_library::Cue {
+                    kind: CueKind::Memory,
+                    start: 10.0,
+                    end: Some(21.0),
+                    color: None,
+                    name: String::new(),
+                    active: false,
+                    loop_beats: Some((32, 1)),
+                },
+                rofloxbox_library::Cue {
+                    kind: CueKind::Memory,
+                    start: 30.0,
+                    end: Some(31.3),
+                    color: None,
+                    name: String::new(),
+                    active: false,
+                    loop_beats: None,
+                },
+            ];
+        collection.update_track(id, |t| t.cues = cues);
+        let track = collection.track(id).unwrap().clone();
+        let (_, memory) = collection_cues(&track, &[]);
+        let beats: Vec<_> = memory.cues.iter().map(|c| c.loop_beats).collect();
+        assert_eq!(beats, [Some((32, 1)), None]);
+        let bytes = AnlzFile { sections: vec![Section::Cues(memory)] }.to_bytes();
+        let entry = bytes.windows(4).position(|w| w == b"PCP2").unwrap();
+        assert_eq!(&bytes[entry + 0x24..entry + 0x28], &[0, 32, 0, 1]);
+    }
+
+    /// Hot cues A–C go in the .DAT's basic list and D on in the .EXT's
+    /// (players read them from there), written as rekordbox writes them.
+    #[test]
+    fn hot_cues_split_between_dat_and_ext() {
+        let cues: Vec<rofloxbox_library::Cue> = (0..5u8)
+            .map(|n| rofloxbox_library::Cue {
+                kind: CueKind::Hot(n),
+                start: f64::from(n) + 1.0,
+                end: None,
+                color: None,
+                name: String::new(),
+                active: false,
+                loop_beats: None,
+            })
+            .collect();
+        let numbers = |list: &[AnlzCue]| list.iter().map(|c| c.hot_cue.unwrap_or(0)).collect::<Vec<_>>();
+        let dat = basic_hot(&cues, &[], true);
+        let ext = basic_hot(&cues, &[], false);
+        assert_eq!(numbers(&dat), [1, 2, 3]);
+        assert_eq!(numbers(&ext), [4, 5]);
+        assert_eq!(dat[0].time_ms, 1000);
+        assert!(dat.iter().all(|c| c.status == Some(CueStatus::Disabled) && c.order == Some((0xffff, 0xffff))));
+    }
+
     /// The basic memory list holds the collection's memory cues and loops
     /// in order, the active loop flagged, entries rekordbox wrote kept.
     #[test]
@@ -830,6 +956,7 @@ mod tests {
             color: None,
             name: String::new(),
             active,
+            loop_beats: None,
         };
         let cues = [cue(30.0, Some(34.0), true), cue(10.0, None, false), cue(50.0, Some(52.0), false)];
         let original = AnlzCue {
@@ -851,9 +978,9 @@ mod tests {
         assert_eq!(
             got,
             [
-                (10_000, None, Some(CueStatus::Enabled)),
+                (10_000, None, Some(CueStatus::Disabled)),
                 (30_000, Some(34_000), Some(CueStatus::ActiveLoop)),
-                (50_000, Some(52_000), Some(CueStatus::Enabled)),
+                (50_000, Some(52_000), Some(CueStatus::Disabled)),
             ]
         );
         assert_eq!((list[1].color_id, list[1].trailer.as_slice(), list[1].order), (Some(3), &[1u8, 2][..], None));
@@ -986,6 +1113,7 @@ mod export_tests {
             color: Some([10, 20, 30]),
             name: "Added".into(),
             active: false,
+            loop_beats: None,
         });
         tracks[1].analysis = None;
         let stick = temp.join("stick");

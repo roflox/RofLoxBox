@@ -418,6 +418,7 @@ fn parse_markers(data: &[u8]) -> Vec<Cue> {
                         color: Some([entry[7], entry[8], entry[9]]),
                         name: name_at(entry, 12),
                         active: false,
+                        loop_beats: None,
                     });
                 }
             }
@@ -431,6 +432,7 @@ fn parse_markers(data: &[u8]) -> Vec<Cue> {
                         color: None,
                         name: name_at(entry, 20),
                         active: false,
+                        loop_beats: None,
                     });
                 }
             }
@@ -587,6 +589,7 @@ mod tests {
                     color: Some([0xcc, 0x88, 0x00]),
                     name: "Drop".into(),
                     active: false,
+                    loop_beats: None,
                 },
                 Cue {
                     kind: CueKind::Memory,
@@ -595,6 +598,7 @@ mod tests {
                     color: None,
                     name: "Roll".into(),
                     active: false,
+                    loop_beats: None,
                 },
             ]
         );

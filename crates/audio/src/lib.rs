@@ -21,7 +21,7 @@ pub use engine::{
     AudioOptions, Command, CrossfaderCurve, CrossfaderSide, DECKS, Engine, FaderCurve, JogSender,
     OutputInfo, Quality, SAMPLER_SLOTS, channel_gain,
 };
-pub use encode::{Encoding, write_track};
+pub use encode::{Encoding, time_offset, write_track};
 pub use eq::{EQ_MAX_DB, EQ_MIN_DB, EqSettings, Equalizer, Filter};
 pub use fx::{BeatFx, BeatFxKind, BeatFxParams, ColorFx, ColorFxKind, FxTarget};
 pub use preview::SessionPlayer;

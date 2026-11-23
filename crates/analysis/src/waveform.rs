@@ -138,31 +138,87 @@ pub fn zoom_colour(low: f32, mid: f32, high: f32) -> [u8; 3] {
     [red as u8, green as u8, blue as u8]
 }
 
-/// The colour detail waveform (`PWV5`): per column 3 bits each of red,
-/// green and blue and 5 bits of height, as stored in the file
-/// (`rrrgggbbbhhhhh00`, big-endian).
-pub fn color_detail(samples: &[f32], rate: u32) -> Vec<u16> {
-    let records = color_records(samples, rate);
+/// Every millisecond goes into the column it falls in (the counts are
+/// rounded up, which sets how they line up): lows windowed over ±`low_ms`
+/// and mids over ±`mid_ms` so they do not flicker, then the maxima of the
+/// band levels and the signal's extremes per column:
+/// `[low, mid, high, max, min]`.
+fn merge_records(
+    records: &[ColorColumn],
+    columns: usize,
+    (low_ms, mid_ms): (usize, usize),
+) -> Vec<[f32; 5]> {
     let window = |i: usize, radius: usize, of: fn(&ColorColumn) -> f64| {
         records[i.saturating_sub(radius)..(i + radius + 1).min(records.len())]
             .iter()
             .map(|r| to_i16(of(r)))
             .fold(0.0, f32::max)
     };
-    // Every millisecond goes into the column it falls in (the counts are
-    // rounded up, which sets how they line up): lows windowed over ±12 ms
-    // and mids over ±1 ms so they do not flicker, then the maxima of the
-    // band levels and the signal's extremes per column.
-    let columns = (samples.len() / 2 * COLUMNS_PER_SECOND as usize).div_ceil(rate as usize);
     let mut merged = vec![[0.0f32, 0.0, 0.0, f32::MIN, f32::MAX]; columns];
     for (i, record) in records.iter().enumerate() {
         let Some(m) = merged.get_mut(i * columns / records.len()) else { break };
-        m[0] = m[0].max(window(i, 12, |r| r.low));
-        m[1] = m[1].max(window(i, 1, |r| r.mid));
+        m[0] = m[0].max(window(i, low_ms, |r| r.low));
+        m[1] = m[1].max(window(i, mid_ms, |r| r.mid));
         m[2] = m[2].max(to_i16(record.high));
         m[3] = m[3].max(to_i16(record.max));
         m[4] = m[4].min(to_i16(record.min));
     }
+    merged
+}
+
+/// Band smoothing (± ms for lows, mids) of the colour detail waveform in
+/// the analysis files.
+const FILE_WINDOWS: (usize, usize) = (12, 1);
+/// One column of the RGB scrolling waveform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RgbColumn {
+    /// From the colour detail waveform's bands and formula (`zoom_colour`).
+    pub classic: [u8; 3],
+    /// How far the signal goes above and below zero, full scale 1.0.
+    pub top: f32,
+    pub bottom: f32,
+}
+
+/// The RGB waveform at `per_second` columns a second: each column's signal
+/// extremes (the two halves differ) and its colours at full 8-bit precision
+/// (the files keep 3 bits a channel).
+pub fn rgb_columns_at(samples: &[f32], rate: u32, per_second: u32) -> Vec<RgbColumn> {
+    let records = color_records(samples, rate);
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let columns = (samples.len() / 2 * per_second as usize).div_ceil(rate as usize);
+    let file = merge_records(&records, columns, FILE_WINDOWS);
+    // The bands are measured over as long as one colour detail column
+    // (1/150 s) around each finer one; over less the highs, which are not
+    // windowed, come out weaker and the colours greener.
+    let span = (per_second as usize).div_ceil(COLUMNS_PER_SECOND as usize).max(1);
+    let (before, after) = ((span - 1) / 2, span / 2);
+    let peaks = |merged: &[[f32; 5]], i: usize| {
+        let around = &merged[i.saturating_sub(before)..(i + after + 1).min(merged.len())];
+        let peak = |k: usize| around.iter().map(|m| m[k]).fold(0.0, f32::max);
+        [peak(0), peak(1), peak(2)]
+    };
+    (0..file.len())
+        .map(|i| {
+            let [low, mid, high] = peaks(&file, i);
+            let [.., max, min] = file[i];
+            RgbColumn {
+                classic: zoom_colour(low, mid, high),
+                top: (max / 32767.0).max(0.0),
+                bottom: (-min / 32768.0).max(0.0),
+            }
+        })
+        .collect()
+}
+
+/// The colour detail waveform (`PWV5`): per column 3 bits each of red,
+/// green and blue and 5 bits of height, as stored in the file
+/// (`rrrgggbbbhhhhh00`, big-endian).
+pub fn color_detail(samples: &[f32], rate: u32) -> Vec<u16> {
+    let records = color_records(samples, rate);
+    let columns = (samples.len() / 2 * COLUMNS_PER_SECOND as usize).div_ceil(rate as usize);
+    let merged = merge_records(&records, columns, FILE_WINDOWS);
     let mut heights = Vec::with_capacity(columns);
     let mut colours = Vec::with_capacity(columns);
     for [low, mid, high, max, min] in merged {
@@ -359,6 +415,7 @@ pub fn mono_detail(samples: &[f32], rate: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn silence_is_white_and_flat() {

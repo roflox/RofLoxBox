@@ -24,6 +24,8 @@ pub struct Hotplug {
     /// A port the user disconnected by hand: not reconnected until it is
     /// unplugged and plugged in again.
     declined: Option<String>,
+    /// The controller connected at the last frame (`None` before the first).
+    seen: Option<Option<String>>,
 }
 
 impl RofLoxBoxApp {
@@ -92,6 +94,44 @@ impl RofLoxBoxApp {
         {
             self.connect_controller(&port, ctx);
         }
+    }
+
+    /// A controller connecting switches to the view preset linked to it; it
+    /// disconnecting brings the view before back.
+    pub(super) fn follow_controller_views(&mut self) {
+        let port = self.controller.port().map(str::to_owned);
+        if self.hotplug.seen.as_ref() == Some(&port) {
+            return;
+        }
+        self.hotplug.seen = Some(port.clone());
+        let four = self.config.four_decks;
+        match port {
+            Some(port) => {
+                let Some(preset) =
+                    crate::layout::preset_for_controller(&self.config.layout_presets, &port).cloned()
+                else {
+                    return;
+                };
+                if self.config.view_before_controller.is_none() {
+                    self.config.view_before_controller = Some(crate::layout::SavedView {
+                        four,
+                        layout: self.config.deck_layout(four).clone(),
+                        view: self.config.view(),
+                    });
+                }
+                *self.config.deck_layout_mut(four) = preset.layout;
+                if let Some(view) = preset.view {
+                    self.config.set_view(view);
+                }
+                self.status = Some(format!("{port}: view “{}”", preset.name));
+            }
+            None => {
+                let Some(saved) = self.config.view_before_controller.take() else { return };
+                *self.config.deck_layout_mut(saved.four) = saved.layout;
+                self.config.set_view(saved.view);
+            }
+        }
+        self.config.save();
     }
 
     /// Remembers the ports present at start-up, so only later ones count as

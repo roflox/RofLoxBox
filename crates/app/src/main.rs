@@ -28,9 +28,11 @@ mod rekordbox_save;
 mod screen_layout;
 mod stems;
 mod tour;
+mod update;
 mod usb_export;
 mod usb_import;
 mod waveform;
+mod waveform_look;
 mod widgets;
 
 /// The app icon for the window, taskbar and Dock (packaging/icon.svg).

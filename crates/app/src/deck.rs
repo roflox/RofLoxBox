@@ -198,11 +198,26 @@ pub struct LoadedTrack {
     pub memory_cues: Vec<f64>,
     /// Stored loops (start, end) from the memory cue list.
     pub memory_loops: Vec<(f64, f64)>,
+    /// Memory loops made as beat loops: their length in beats (numerator,
+    /// denominator), by their (start, end).
+    pub loop_beats: Vec<((f64, f64), (u16, u16))>,
+    /// rekordbox's analysis of the track (`.DAT`), to work its waveform out
+    /// again.
+    pub analysis_path: Option<PathBuf>,
     /// Track gain in dB (Auto Gain), from the collection or the loudness.
     pub gain_db: f32,
 }
 
 impl LoadedTrack {
+    /// The length in beats of the memory loop at `range`, if it was made as
+    /// a beat loop.
+    pub fn loop_beats_of(&self, range: (f64, f64)) -> Option<(u16, u16)> {
+        self.loop_beats
+            .iter()
+            .find(|(r, _)| (r.0 - range.0).abs() < 0.001 && (r.1 - range.1).abs() < 0.001)
+            .map(|(_, beats)| *beats)
+    }
+
     /// Whether `range` is the track's active loop.
     pub fn is_active_loop(&self, range: (f64, f64)) -> bool {
         self.active_loop
@@ -365,11 +380,17 @@ pub enum LoopEdge {
 }
 
 pub struct Deck {
+    /// The last beat loop made: its (start, end) and length in beats, so a
+    /// memory loop stored from it keeps that length.
+    beat_loop: Option<((f64, f64), (u16, u16))>,
     pub index: usize,
     pub track: Option<LoadedTrack>,
     /// The decoded audio, kept to reload it when the audio output restarts.
     audio: Option<Arc<TrackAudio>>,
     loading: Option<(String, Receiver<LoadResult>)>,
+    /// The loaded track's waveform being worked out again (its detail
+    /// changed), with the track it is for.
+    rewaving: Option<(PathBuf, Receiver<WaveformData>)>,
     /// Beat grid and key being detected for the loaded track.
     analysing: Option<Receiver<Detected>>,
     /// Detection filled in the grid or key; the collection should keep it.
@@ -496,6 +517,7 @@ impl Deck {
             track: None,
             audio: None,
             loading: None,
+            rewaving: None,
             analysing: None,
             analysed: false,
             error: None,
@@ -511,6 +533,7 @@ impl Deck {
             vinyl: true,
             key_lock: false,
             loop_in: None,
+            beat_loop: None,
             loop_region: None,
             loop_active: false,
             loop_adjust: None,
@@ -697,7 +720,43 @@ impl Deck {
 
     /// Hands a finished load to the engine and runs time-based behavior.
     /// Call every frame.
+    /// Works the loaded track's waveform out again when the detail its
+    /// drawing wants is not the one it has (the drawing changed), so the
+    /// change shows at once; playback goes on.
+    fn follow_waveform_detail(&mut self) {
+        if let Some((path, rx)) = &self.rewaving {
+            match rx.try_recv() {
+                Ok(waveform) => {
+                    if let Some(track) = self.track.as_mut().filter(|t| t.path == *path) {
+                        track.waveform = waveform;
+                    }
+                    self.rewaving = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.rewaving = None,
+            }
+        }
+        let wanted = self.prefs.waveform_detail;
+        let (Some(track), Some(audio)) = (self.track.as_ref(), self.audio.clone()) else { return };
+        if detail_of(&track.waveform) == wanted || self.loading.is_some() {
+            return;
+        }
+        let (path, analysis_path, analysis) =
+            (track.path.clone(), track.analysis_path.clone(), self.prefs.analysis);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("waveform".into()).spawn(move || {
+            let open = |extension: &str| {
+                analysis_path.as_ref().and_then(|p| AnlzFile::open(p.with_extension(extension)).ok())
+            };
+            let _ = tx.send(build_waveform(&audio, open("EXT").as_ref(), open("2EX").as_ref(), analysis, wanted));
+        });
+        if spawned.is_ok() {
+            self.rewaving = Some((path, rx));
+        }
+    }
+
     pub fn poll(&mut self, engine: &mut Engine) {
+        self.follow_waveform_detail();
         if let Some((_, rx)) = &self.loading
             && let Ok(result) = rx.try_recv()
         {
@@ -945,6 +1004,7 @@ impl Deck {
         let playing = engine.is_playing(self.index);
         let position = self.quantized(engine.position_secs(self.index));
         let (region, active, cue_point) = (self.loop_region, self.loop_active, self.cue_point);
+        let beats = region.and_then(|r| self.beats_of_loop(r));
         let limit = self.prefs.memory_points_limit as usize;
         let Some(track) = self.track.as_mut() else { return };
         if limit > 0 && track.memory_cues.len() + track.memory_loops.len() >= limit {
@@ -959,6 +1019,9 @@ impl Deck {
             Some(range) => {
                 if !track.memory_loops.iter().any(|l| (l.0 - range.0).abs() < AT_CUE) {
                     track.memory_loops.push(range);
+                    if let Some(beats) = beats {
+                        track.loop_beats.push((range, beats));
+                    }
                     self.edited = true;
                 }
             }
@@ -1320,6 +1383,17 @@ impl Deck {
         let end = track.time_of_beat(track.beat_at(start) + beats);
         self.loop_in = Some(start);
         self.set_loop(start, end, engine);
+        self.beat_loop = rofloxbox_library::Cue::beats_fraction(beats).map(|b| ((start, end), b));
+    }
+
+    /// The length in beats of the loop at `range`, when it is a beat loop:
+    /// the one made last, or a memory loop stored as one.
+    fn beats_of_loop(&self, range: (f64, f64)) -> Option<(u16, u16)> {
+        let same = |r: (f64, f64)| (r.0 - range.0).abs() < 0.001 && (r.1 - range.1).abs() < 0.001;
+        self.beat_loop
+            .filter(|(r, _)| same(*r))
+            .map(|(_, beats)| beats)
+            .or_else(|| self.track.as_ref()?.loop_beats_of(range))
     }
 
     /// Moves the loop back (`-1`) or forward (`1`) by its own length.
@@ -1359,7 +1433,12 @@ impl Deck {
         if let Some((start, end)) = self.loop_region {
             let new_end = start + (end - start) * factor;
             if new_end - start > 0.01 {
+                // A beat loop halved or doubled stays one.
+                let beats = self.beats_of_loop((start, end)).and_then(|(n, d)| {
+                    rofloxbox_library::Cue::beats_fraction(f64::from(n) / f64::from(d) * factor)
+                });
                 self.set_loop(start, new_end, engine);
+                self.beat_loop = beats.map(|b| ((start, new_end), b));
             }
         }
     }
@@ -2114,6 +2193,7 @@ struct Known {
     hot_cues: [Option<HotCue>; HOT_CUES],
     memory_cues: Vec<f64>,
     memory_loops: Vec<(f64, f64)>,
+    loop_beats: Vec<((f64, f64), (u16, u16))>,
     active_loop: Option<(f64, f64)>,
 }
 
@@ -2125,6 +2205,7 @@ impl Known {
             hot_cues: [None; HOT_CUES],
             memory_cues: Vec::new(),
             memory_loops: Vec::new(),
+            loop_beats: Vec::new(),
             active_loop: None,
         };
         for cue in &track.cues {
@@ -2136,6 +2217,9 @@ impl Known {
                 }
                 (rofloxbox_library::CueKind::Memory, Some(end)) => {
                     known.memory_loops.push((cue.start, end));
+                    if let Some(beats) = cue.loop_beats {
+                        known.loop_beats.push(((cue.start, end), beats));
+                    }
                     if cue.active {
                         known.active_loop = Some((cue.start, end));
                     }
@@ -2165,6 +2249,55 @@ struct LoadRequest {
     analysis: AnalysisMethod,
 }
 
+/// A track's waveform at `detail`: rekordbox's analysis (`ext`, `two_ex`)
+/// for Standard, worked out from the audio for High.
+fn build_waveform(
+    audio: &TrackAudio,
+    ext: Option<&AnlzFile>,
+    two_ex: Option<&AnlzFile>,
+    analysis: AnalysisMethod,
+    detail: crate::waveform::WaveformDetail,
+) -> WaveformData {
+    if detail == crate::waveform::WaveformDetail::High {
+        let per_second = crate::waveform::HIGH_COLUMNS_PER_SECOND;
+        return WaveformData::high_detail(
+            &rofloxbox_audio::peak_waveform_at(audio, per_second),
+            rofloxbox_audio::band_waveform_at(audio, per_second),
+            &rofloxbox_analysis::waveform::rgb_columns_at(&audio.to_f32(), audio.sample_rate, per_second),
+            per_second,
+        );
+    }
+    // Without rekordbox's analysis: worked out to match its files, or
+    // RofLoxBox's quicker way.
+    let worked_out = || match analysis {
+        AnalysisMethod::Rekordbox => {
+            let columns = rofloxbox_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
+            let data = columns.iter().flat_map(|c| c.to_be_bytes()).collect();
+            let waveform = Waveform { kind: WaveformKind::ColorDetail, entry_len: 2, data };
+            let ext = AnlzFile { sections: vec![Section::Waveform(waveform)] };
+            WaveformData::from_analysis(Some(&ext), None)
+        }
+        AnalysisMethod::RofLoxBox => None,
+    };
+    let mut waveform = WaveformData::from_analysis(ext, two_ex)
+        .or_else(worked_out)
+        .unwrap_or_else(|| WaveformData::from_peaks(&peak_waveform(audio), Vec::new()));
+    if !waveform.has_bands() {
+        waveform.bands = band_waveform(audio);
+    }
+    waveform.shape_from_bands();
+    waveform
+}
+
+/// The detail a waveform was worked out at.
+fn detail_of(waveform: &WaveformData) -> crate::waveform::WaveformDetail {
+    if waveform.columns_per_second() > crate::waveform::COLUMNS_PER_SECOND {
+        crate::waveform::WaveformDetail::High
+    } else {
+        crate::waveform::WaveformDetail::Standard
+    }
+}
+
 impl LoadRequest {
     fn load(self) -> LoadResult {
         if !self.audio_path.is_file() {
@@ -2182,36 +2315,8 @@ impl LoadRequest {
 
         let two_ex =
             self.analysis_path.as_ref().and_then(|p| AnlzFile::open(p.with_extension("2EX")).ok());
-        // Without rekordbox's analysis: worked out to match its files,
-        // or RofLoxBox's quicker way.
-        let worked_out = || match self.analysis {
-            AnalysisMethod::Rekordbox => {
-                let columns =
-                    rofloxbox_analysis::waveform::color_detail(&audio.to_f32(), audio.sample_rate);
-                let data = columns.iter().flat_map(|c| c.to_be_bytes()).collect();
-                let waveform = Waveform { kind: WaveformKind::ColorDetail, entry_len: 2, data };
-                let ext = AnlzFile { sections: vec![Section::Waveform(waveform)] };
-                WaveformData::from_analysis(Some(&ext), None)
-            }
-            AnalysisMethod::RofLoxBox => None,
-        };
-        let waveform = if self.waveform_detail == crate::waveform::WaveformDetail::High {
-            let per_second = crate::waveform::HIGH_COLUMNS_PER_SECOND;
-            WaveformData::high_detail(
-                &rofloxbox_audio::peak_waveform_at(&audio, per_second),
-                rofloxbox_audio::band_waveform_at(&audio, per_second),
-                per_second,
-            )
-        } else {
-            let mut waveform = WaveformData::from_analysis(ext.as_ref(), two_ex.as_ref())
-                .or_else(worked_out)
-                .unwrap_or_else(|| WaveformData::from_peaks(&peak_waveform(&audio), Vec::new()));
-            if !waveform.has_bands() {
-                waveform.bands = band_waveform(&audio);
-            }
-            waveform.shape_from_bands();
-            waveform
-        };
+        let waveform =
+            build_waveform(&audio, ext.as_ref(), two_ex.as_ref(), self.analysis, self.waveform_detail);
         let mut beats: Vec<(f64, u16)> = dat
             .as_ref()
             .and_then(AnlzFile::beat_grid)
@@ -2232,6 +2337,7 @@ impl LoadRequest {
         let mut hot_cues = [None; HOT_CUES];
         let mut memory_cues = Vec::new();
         let mut memory_loops = Vec::new();
+        let mut loop_beats = Vec::new();
         let lists: Vec<_> = ext
             .iter()
             .flat_map(|f| f.cue_lists())
@@ -2251,7 +2357,11 @@ impl LoadRequest {
                     }
                     (CueListKind::Memory, _) => match (cue.kind, cue.loop_end_ms) {
                         (CueKind::Loop, Some(end)) => {
-                            memory_loops.push((seconds, f64::from(end) / 1000.0))
+                            let range = (seconds, f64::from(end) / 1000.0);
+                            memory_loops.push(range);
+                            if let Some(beats) = cue.loop_beats {
+                                loop_beats.push((range, beats));
+                            }
                         }
                         _ => memory_cues.push(seconds),
                     },
@@ -2287,8 +2397,13 @@ impl LoadRequest {
                 beats = known.beats;
             }
             if no_cues || (self.from_collection && known_cues) {
-                (hot_cues, memory_cues, memory_loops, active_loop) =
-                    (known.hot_cues, known.memory_cues, known.memory_loops, known.active_loop);
+                (hot_cues, memory_cues, memory_loops, loop_beats, active_loop) = (
+                    known.hot_cues,
+                    known.memory_cues,
+                    known.memory_loops,
+                    known.loop_beats,
+                    known.active_loop,
+                );
             }
         }
 
@@ -2309,6 +2424,8 @@ impl LoadRequest {
             hot_cues,
             memory_cues,
             memory_loops,
+            loop_beats,
+            analysis_path: self.analysis_path.clone(),
             gain_db: stored_gain.unwrap_or_else(|| auto_gain_db(&audio)),
         };
         let audio = Arc::new(audio);
@@ -2418,7 +2535,29 @@ mod tests {
             hot_cues: [None; HOT_CUES],
             memory_cues: Vec::new(),
             memory_loops: Vec::new(),
+            loop_beats: Vec::new(),
+            analysis_path: None,
             gain_db: 0.0,
+        }
+    }
+
+    /// A waveform worked out again at another detail comes back at that
+    /// detail (what a drawing change does to a loaded track).
+    #[test]
+    fn waveforms_are_worked_out_at_either_detail() {
+        use crate::waveform::WaveformDetail;
+        let rate = 44_100u32;
+        let samples: Vec<f32> = (0..rate * 2)
+            .flat_map(|i| {
+                let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        let audio = TrackAudio::new(rate, samples);
+        for detail in [WaveformDetail::Standard, WaveformDetail::High] {
+            let waveform = build_waveform(&audio, None, None, AnalysisMethod::RofLoxBox, detail);
+            assert_eq!(detail_of(&waveform), detail);
+            assert!(!waveform.detail.is_empty());
         }
     }
 
@@ -2521,6 +2660,7 @@ mod tests {
             color: None,
             name: String::new(),
             active: true,
+            loop_beats: None,
         }];
         assert_eq!(Known::from_track(&stored).active_loop, Some((30.0, 32.0)));
     }

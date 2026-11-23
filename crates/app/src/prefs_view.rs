@@ -18,14 +18,16 @@ pub enum PrefsTab {
     Keyboard,
     Stems,
     Library,
-    /// Theme, sizes, waveforms, key display and the View menu.
+    /// Theme, sizes, key display and the View menu.
     #[serde(alias = "appearance")]
     View,
+    /// How the waveforms are drawn and look.
+    Waveforms,
     Audio,
 }
 
 impl PrefsTab {
-    pub const ALL: [PrefsTab; 9] = [
+    pub const ALL: [PrefsTab; 10] = [
         PrefsTab::Deck,
         PrefsTab::Mixer,
         PrefsTab::Analysis,
@@ -34,6 +36,7 @@ impl PrefsTab {
         PrefsTab::Stems,
         PrefsTab::Library,
         PrefsTab::View,
+        PrefsTab::Waveforms,
         PrefsTab::Audio,
     ];
 
@@ -47,6 +50,7 @@ impl PrefsTab {
             PrefsTab::Stems => "Stems",
             PrefsTab::Library => "Library",
             PrefsTab::View => "View",
+            PrefsTab::Waveforms => "Waveforms",
             PrefsTab::Audio => "Audio",
         }
     }
@@ -74,8 +78,7 @@ fn lock(ui: &mut Ui, locked: &mut bool) -> bool {
     *locked != before
 }
 
-/// How things look: theme, sizes, waveforms, keys; returns whether
-/// anything changed.
+/// How things look: theme, sizes, keys; returns whether anything changed.
 pub fn view_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
     let before = p.clone();
     section(ui, "Theme", "Waveforms stay dark.", |ui| {
@@ -108,20 +111,6 @@ pub fn view_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
             }
         });
     });
-    section(ui, "Waveforms", "", |ui| {
-        use crate::waveform::WaveformDetail;
-        ui.label("Detail");
-        ui.indent("waveform detail", |ui| {
-            ui.radio_value(&mut p.waveform_detail, WaveformDetail::Standard, "Standard (rekordbox's)");
-            ui.radio_value(&mut p.waveform_detail, WaveformDetail::High, "High (4× finer)")
-                .on_hover_text("Sharper when zoomed in. For tracks loaded from now on.");
-        });
-        ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
-            .on_hover_text("Cut bands shrink in the waveforms");
-        ui.checkbox(&mut p.scroll_zoom, "Scroll over a waveform to zoom").on_hover_text(
-            "Wheel, scroll or pinch",
-        );
-    });
     section(ui, "Key display format", "On decks and in lists.", |ui| {
         use crate::deck::KeyNotation;
         ui.radio_value(&mut p.key_notation, KeyNotation::Alphanumeric, "Alphanumeric (4A, 8B)");
@@ -132,6 +121,40 @@ pub fn view_prefs(ui: &mut Ui, p: &mut Preferences) -> bool {
         });
     });
     *p != before
+}
+
+/// How the waveforms are drawn and look; returns whether anything changed.
+pub fn waveform_prefs(ui: &mut Ui, p: &mut Preferences, drawing: &mut crate::waveform::WaveformDrawing) -> bool {
+    use crate::waveform::WaveformDrawing;
+    let (before, drawing_before) = (p.clone(), *drawing);
+    section(
+        ui,
+        "Drawing",
+        "How the RGB waveforms are drawn; also picked above the waveforms, next to RGB and \
+         3-Band. Simplest uses rekordbox's own detail, the others work tracks out four times \
+         finer from the audio; loaded tracks follow a change at once.",
+        |ui| {
+            for choice in WaveformDrawing::ALL {
+                let label = if choice == WaveformDrawing::default() {
+                    format!("{} (default)", choice.label())
+                } else {
+                    choice.label().to_owned()
+                };
+                ui.radio_value(drawing, choice, label).on_hover_text(choice.description());
+            }
+        },
+    );
+    section(ui, "Waveforms", "", |ui| {
+        ui.checkbox(&mut p.eq_waveforms, "Waveforms follow the EQ")
+            .on_hover_text("Cut bands shrink in the waveforms");
+        ui.checkbox(&mut p.scroll_zoom, "Scroll over a waveform to zoom").on_hover_text(
+            "Wheel, scroll or pinch",
+        );
+    });
+    section(ui, "Look", "Gradients of each drawing and colours.", |ui| {
+        crate::waveform_look::look_prefs(ui, &mut p.waveform_look);
+    });
+    *p != before || *drawing != drawing_before
 }
 
 /// How tracks are analysed; returns whether anything changed.

@@ -315,6 +315,32 @@ fn keep_newest(dir: &Path, keep: usize) {
 }
 
 /// Hot cue slots A–H by rekordbox's cue kind (4 is not a hot cue).
+/// A beat loop's length from rekordbox's `BeatLoopSize`: the numerator in
+/// the high 16 bits, the denominator in the low (32 beats: `0x0020_0001`);
+/// 0 for a loop set by hand.
+pub(crate) fn loop_beats(size: i64) -> Option<(u16, u16)> {
+    let (numerator, denominator) = ((size >> 16) as u16, size as u16);
+    (size > 0 && numerator > 0 && denominator > 0).then_some((numerator, denominator))
+}
+
+/// [`loop_beats`] the other way: rekordbox's `BeatLoopSize`.
+pub(crate) fn beat_loop_size(beats: Option<(u16, u16)>) -> i64 {
+    beats.map_or(0, |(numerator, denominator)| (i64::from(numerator) << 16) | i64::from(denominator))
+}
+
+/// A cue's `Kind` in rekordbox's library for the track's active memory
+/// loop (rekordbox's export marks exactly those active; its `ActiveLoop`
+/// column stays 0). At most one per track.
+pub(crate) const ACTIVE_LOOP_KIND: i64 = 4;
+
+/// Whether a cue's `Kind` in rekordbox's library is a memory cue: 0, or
+/// [`ACTIVE_LOOP_KIND`] for the active memory loop.
+pub(crate) fn is_memory_kind(kind: i64) -> bool {
+    kind == 0 || kind == ACTIVE_LOOP_KIND
+}
+
+/// The hot cue (0 = A) a cue's `Kind` in rekordbox's library is: 1–3 for
+/// A–C, 5–9 for D–H (4 is the active memory loop).
 pub(crate) fn hot_cue_slot(kind: i64) -> Option<u8> {
     match kind {
         1..=3 => Some(kind as u8 - 1),
@@ -348,13 +374,15 @@ fn hot_cue_color(index: i64) -> Option<[u8; 3]> {
 fn read(db: &rusqlite::Connection, share: &Path) -> Result<XmlLibrary> {
     let mut cues: HashMap<String, Vec<Cue>> = HashMap::new();
     let mut statement = db.prepare(
-        "SELECT ContentID, InMsec, OutMsec, Kind, ColorTableIndex, Comment, ActiveLoop
+        "SELECT ContentID, InMsec, OutMsec, Kind, ColorTableIndex, Comment, ActiveLoop,
+            BeatLoopSize
          FROM djmdCue WHERE rb_local_deleted = 0 ORDER BY ContentID, InMsec",
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let kind = match integer(row, 3)? {
-            0 => CueKind::Memory,
+        let raw_kind = integer(row, 3)?;
+        let kind = match raw_kind {
+            kind if is_memory_kind(kind) => CueKind::Memory,
             other => match hot_cue_slot(other) {
                 Some(slot) => CueKind::Hot(slot),
                 None => continue,
@@ -373,7 +401,10 @@ fn read(db: &rusqlite::Connection, share: &Path) -> Result<XmlLibrary> {
             end,
             color,
             name: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-            active: kind == CueKind::Memory && end.is_some() && integer(row, 6)? != 0,
+            active: kind == CueKind::Memory
+                && end.is_some()
+                && (raw_kind == ACTIVE_LOOP_KIND || integer(row, 6)? != 0),
+            loop_beats: end.and(loop_beats(integer(row, 7)?)),
         });
     }
 
@@ -528,6 +559,24 @@ fn added_seconds(date: &str) -> Option<u64> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// rekordbox's BeatLoopSize: numerator high, denominator low.
+    #[test]
+    fn beat_loop_sizes() {
+        assert_eq!(loop_beats(0x0020_0001), Some((32, 1)));
+        assert_eq!(loop_beats(0x0001_0002), Some((1, 2)));
+        assert_eq!(loop_beats(0), None);
+        for beats in [(32, 1), (1, 2), (64, 1)] {
+            assert_eq!(loop_beats(beat_loop_size(Some(beats))), Some(beats));
+        }
+        assert_eq!(beat_loop_size(None), 0);
+        use rofloxbox_library::Cue;
+        assert_eq!(Cue::beats_fraction(32.0), Some((32, 1)));
+        assert_eq!(Cue::beats_fraction(0.5), Some((1, 2)));
+        assert_eq!(Cue::beats_fraction(0.125), Some((1, 8)));
+        assert_eq!(Cue::beats_fraction(1.397), None);
+    }
+
     use super::*;
 
     /// A small library like rekordbox's at `path`: encrypted with
@@ -590,7 +639,7 @@ pub(crate) mod tests {
              INSERT INTO djmdCue (ID, ContentID, InMsec, OutMsec, Kind, ColorTableIndex,
                 Comment) VALUES ('c3', 't1', 3000, 5000, 0, 0, '');
              INSERT INTO djmdCue (ID, ContentID, InMsec, OutMsec, Kind, ColorTableIndex,
-                Comment) VALUES ('c4', 't1', 100, 900, 4, 0, '');
+                Comment, BeatLoopSize) VALUES ('c4', 't1', 100, 900, 4, 0, '', 131073);
              INSERT INTO djmdPlaylist (ID, Seq, Name, Attribute, ParentID)
                 VALUES ('f1', 1, 'Sets', 1, 'root');
              INSERT INTO djmdPlaylist (ID, Seq, Name, Attribute, ParentID)
@@ -642,12 +691,17 @@ pub(crate) mod tests {
         assert_eq!(
             cues,
             [
+                // Kind 4: a memory loop.
+                (CueKind::Memory, 0.1, Some(0.9), None),
                 (CueKind::Hot(0), 1.0, None, Some([40, 226, 20])),
                 (CueKind::Hot(3), 2.0, None, Some([230, 40, 40])),
                 (CueKind::Memory, 3.0, Some(5.0), None),
             ]
         );
-        assert_eq!(one.cues[1].name, "drop");
+        assert_eq!(one.cues[2].name, "drop");
+        // The active loop is a 2-beat beat loop (BeatLoopSize 0x0002_0001).
+        assert_eq!((one.cues[0].active, one.cues[0].loop_beats), (true, Some((2, 1))));
+        assert_eq!(one.cues[3].loop_beats, None);
         assert_eq!(library.tracks[1].color, None);
         assert_eq!(
             library.playlists,

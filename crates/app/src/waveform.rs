@@ -11,7 +11,8 @@ pub const COLUMNS_PER_SECOND: f64 = 150.0;
 pub const HIGH_COLUMNS_PER_SECOND: u32 = 600;
 const OVERVIEW_COLUMNS: usize = 800;
 
-/// How finely the decks' waveforms are drawn (Preferences).
+/// How finely the decks' waveforms are worked out when a track loads
+/// (follows the drawing: [`WaveformDrawing::detail`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WaveformDetail {
     /// rekordbox's resolution: 150 columns a second, its own colours when
@@ -24,10 +25,6 @@ pub enum WaveformDetail {
 }
 
 const BLUE: Color32 = Color32::from_rgb(40, 120, 230);
-const LOW: Color32 = Color32::from_rgb(32, 83, 217);
-const MID: Color32 = Color32::from_rgb(242, 170, 60);
-const LOW_MID: Color32 = Color32::from_rgb(169, 107, 39);
-const HIGH: Color32 = Color32::from_rgb(255, 255, 255);
 const MEMORY_CUE: Color32 = Color32::from_rgb(230, 50, 50);
 const CUE_POINT: Color32 = Color32::from_rgb(255, 170, 0);
 
@@ -39,6 +36,74 @@ pub enum WaveformStyle {
     Rgb,
     /// Low, mid and high bands drawn over each other (CDJ-3000 style).
     ThreeBand,
+}
+
+/// How the RGB waveform is drawn (needs High detail; otherwise Simple).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum WaveformDrawing {
+    /// The signal's top and bottom, with a lighter core, colour held most of
+    /// the way out and soft tips; own colour mix, smoothed outline.
+    #[default]
+    Soft,
+    /// The signal's top and bottom, plain colours, fading to half at the
+    /// tips.
+    Classic,
+    /// One solid bar a column, the same above and below.
+    Simple,
+    /// Simple bars at rekordbox's own detail (150 columns a second, its
+    /// colours): the lightest to load and to draw.
+    Simplest,
+}
+
+impl WaveformDrawing {
+    pub const ALL: [Self; 4] = [Self::Soft, Self::Classic, Self::Simple, Self::Simplest];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Soft => "Soft",
+            Self::Classic => "Classic",
+            Self::Simple => "Simple",
+            Self::Simplest => "Simplest",
+        }
+    }
+
+    /// What it is, for Preferences.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Soft => "The waveform's top and bottom, a lighter core, soft tips",
+            Self::Classic => "The waveform's top and bottom in plain colours",
+            Self::Simple => "One solid bar a column",
+            Self::Simplest => "Simple bars at rekordbox's own detail: the lightest to load and draw",
+        }
+    }
+
+    /// How finely tracks are worked out for it when they load: rekordbox's
+    /// resolution for Simplest, four times finer for the rest.
+    pub fn detail(self) -> WaveformDetail {
+        match self {
+            Self::Simplest => WaveformDetail::Standard,
+            _ => WaveformDetail::High,
+        }
+    }
+
+    /// The drawing it is done with (Simplest draws as Simple does).
+    pub fn shape(self) -> Self {
+        match self {
+            Self::Simplest => Self::Simple,
+            other => other,
+        }
+    }
+}
+
+/// One column of the RGB waveform's shape and colours (High detail).
+#[derive(Debug, Clone, Copy)]
+pub struct RgbShape {
+    /// How far the signal goes above and below the middle, 1.0 = the
+    /// loudest point of the track (linear).
+    pub top: f32,
+    pub bottom: f32,
+    /// The pastel colours (from the colour detail waveform's formula).
+    pub pastel: Color32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +125,9 @@ pub struct WaveformData {
     pub overview: Vec<Column>,
     /// Columns a second in `detail` and `bands` (0 means 150).
     pub per_second: f64,
+    /// The RGB waveform's shape and colours, one per detail column (High
+    /// detail; empty otherwise).
+    pub rgb: Vec<RgbShape>,
 }
 
 impl WaveformData {
@@ -68,15 +136,32 @@ impl WaveformData {
         if self.per_second > 0.0 { self.per_second } else { COLUMNS_PER_SECOND }
     }
 
-    /// High detail: from peaks and bands at `per_second` columns a second,
-    /// coloured by the bands, with an overview as fine.
-    pub fn high_detail(peaks: &[f32], bands: Vec<[f32; 3]>, per_second: u32) -> Self {
-        let mut data = Self::from_peaks(peaks, bands);
-        data.shape_from_bands();
+    /// High detail: the RGB waveform (see
+    /// `rofloxbox_analysis::waveform::rgb_columns_at`) at `per_second`
+    /// columns a second, with bands for the 3-band view and an overview as
+    /// fine. Without `columns`, shaped and coloured from the peaks and bands.
+    pub fn high_detail(
+        peaks: &[f32],
+        bands: Vec<[f32; 3]>,
+        columns: &[rofloxbox_analysis::waveform::RgbColumn],
+        per_second: u32,
+    ) -> Self {
         let factor = f64::from(per_second) / COLUMNS_PER_SECOND;
-        let columns = (OVERVIEW_COLUMNS as f64 * factor.min(3.0)) as usize;
-        data.overview = overview(&data.detail, columns);
+        let overview_columns = (OVERVIEW_COLUMNS as f64 * factor.min(3.0)) as usize;
+        let mut data = Self::from_peaks(peaks, bands);
+        // Bars and the overview: shaped by the bands, in our own colours
+        // (from the bands).
+        data.shape_from_bands();
+        data.overview = overview(&data.detail, overview_columns);
         data.per_second = f64::from(per_second);
+        let loudest = columns.iter().map(|c| c.top.max(c.bottom)).fold(1e-6f32, f32::max);
+        data.rgb = columns
+            .iter()
+            .map(|c| {
+                let rgb = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+                RgbShape { top: c.top / loudest, bottom: c.bottom / loudest, pastel: rgb(c.classic) }
+            })
+            .collect();
         data
     }
 
@@ -134,7 +219,14 @@ impl WaveformData {
 
     fn with_detail(detail: Vec<Column>, bands: Vec<[f32; 3]>) -> Self {
         let overview = overview(&detail, OVERVIEW_COLUMNS);
-        Self { detail, colored: false, bands, overview, per_second: COLUMNS_PER_SECOND }
+        Self {
+            detail,
+            colored: false,
+            bands,
+            overview,
+            per_second: COLUMNS_PER_SECOND,
+            rgb: Vec::new(),
+        }
     }
 
     pub fn has_bands(&self) -> bool {
@@ -250,6 +342,8 @@ pub struct Markers<'a> {
     pub active_loop: Option<((f64, f64), bool)>,
     /// Beat grid brightness, 0.0 (off) … 1.5.
     pub grid_strength: f32,
+    /// Cue marker size on the scrolling waveform (1.0 = normal).
+    pub cue_size: f32,
     /// Slip: where the track would be, running on while the record is
     /// scratched, held or looping.
     pub slip: Option<f64>,
@@ -395,10 +489,12 @@ pub fn draw_detail(
     position: f64,
     seconds_visible: f64,
     style: WaveformStyle,
+    drawing: WaveformDrawing,
+    look: &crate::waveform_look::WaveformLook,
     gains: [f32; 3],
     markers: &Markers<'_>,
 ) {
-    painter.rect_filled(rect, 0.0, Color32::from_gray(12));
+    painter.rect_filled(rect, 0.0, look.background());
     let axes = Axes { rect, vertical };
     let (length, breadth) = (axes.length(), axes.breadth());
     let center = length / 2.0;
@@ -432,6 +528,14 @@ pub fn draw_detail(
     }
 
     let use_bands = style == WaveformStyle::ThreeBand && data.has_bands();
+    let mut mesh = eframe::egui::Mesh::default();
+    // RGB pixel columns: where along, extent up and down, colour.
+    let mut rgb: Vec<(f32, f32, f32, Color32)> = Vec::with_capacity(length as usize);
+    let drawing = drawing.shape();
+    let shaped = !use_bands && drawing != WaveformDrawing::Simple && !data.rgb.is_empty();
+    // Without the shape (Standard detail) every drawing is Simple bars.
+    let drawing = if use_bands || shaped { drawing } else { WaveformDrawing::Simple };
+    let stops = look.stops(drawing);
     let columns = if use_bands { data.bands.len() } else { data.detail.len() };
     let per_second = data.columns_per_second();
     for step in 0..length as usize {
@@ -447,10 +551,14 @@ pub fn draw_detail(
         }
         let end = (((t + 1.0 / px_per_sec) * per_second) as usize).clamp(first + 1, columns);
         let a = step as f32;
-        let bar = |height: f32, color: Color32| {
+        let mut bar = |height: f32, color: Color32, shaded: bool| {
             let h = height.min(1.0) * half;
             if h > 0.3 {
-                axes.line(painter, a, mid - h, mid + h, Stroke::new(1.0_f32, color));
+                if shaded {
+                    gradient_column(&mut mesh, axes, a, mid, h, h, color, stops);
+                } else {
+                    column_strip(&mut mesh, axes, a, &[(mid - h, color), (mid + h, color)]);
+                }
             }
         };
         if use_bands {
@@ -460,21 +568,78 @@ pub fn draw_detail(
             let (low, mid_band, high) = (low * gains[0], mid_band * gains[1], high * gains[2]);
             // Larger of low/mid first, their overlap in brown, highs on top.
             if low >= mid_band {
-                bar(low, LOW);
+                bar(low, look.three_band(0), false);
             } else {
-                bar(mid_band, MID);
+                bar(mid_band, look.three_band(1), false);
             }
-            bar(low.min(mid_band), LOW_MID);
-            bar(high * 0.6, HIGH);
-        } else {
-            let column = *data.detail[first..end]
-                .iter()
-                .max_by(|a, b| a.height.total_cmp(&b.height))
+            bar(low.min(mid_band), look.three_band(2), false);
+            bar(high * 0.6, look.three_band(3), false);
+        } else if !shaped {
+            let index = (first..end)
+                .max_by(|&a, &b| data.detail[a].height.total_cmp(&data.detail[b].height))
                 .expect("non-empty range");
+            let mut column = data.detail[index];
+            if look.pastel(drawing)
+                && let Some(shape) = data.rgb.get(index)
+            {
+                column.color = shape.pastel;
+            }
             let column = eq_rgb(column, gains);
-            bar(column.height, column.color);
+            bar(column.height, look.band_colours(drawing, column.color), true);
+        } else {
+            // The signal's top and bottom (the loudest of the pixel's
+            // columns each way), in the colour of its biggest column.
+            let from = first.min(data.rgb.len() - 1);
+            let shapes = &data.rgb[from..end.min(data.rgb.len())];
+            let Some((offset, biggest)) = shapes
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| (a.top + a.bottom).total_cmp(&(b.top + b.bottom)))
+            else {
+                continue;
+            };
+            let top = shapes.iter().map(|c| c.top).fold(0.0, f32::max);
+            let bottom = shapes.iter().map(|c| c.bottom).fold(0.0, f32::max);
+            let soft = drawing == WaveformDrawing::Soft;
+            let color = if look.pastel(drawing) {
+                biggest.pastel
+            } else {
+                data.detail.get(from + offset).map_or(biggest.pastel, |c| c.color)
+            };
+            let color = look.band_colours(drawing, color);
+            let color = if soft { look.shade(color) } else { color };
+            let height = biggest.top.max(1e-6);
+            let eq = eq_rgb(Column { height, color }, gains);
+            let scale = eq.height / height;
+            let size = |v: f32| {
+                let v = (v * scale).min(1.0);
+                if soft { v.powf(look.height_curve) } else { v }
+            };
+            let (up, down) = (size(top) * half, size(bottom) * half);
+            if soft {
+                rgb.push((a, up, down, eq.color));
+            } else if up + down > 0.3 {
+                gradient_column(&mut mesh, axes, a, mid, up, down, eq.color, stops);
+            }
         }
     }
+    // Soft: each pixel column blended a little with its neighbours (never
+    // made smaller), for a smoother outline.
+    let blend = |i: usize, of: fn(&(f32, f32, f32, Color32)) -> f32| {
+        if !look.smooth_outline {
+            return of(&rgb[i]);
+        }
+        let at = |j: usize| rgb.get(j).map_or(of(&rgb[i]), of);
+        let around = 0.5 * of(&rgb[i]) + 0.25 * (at(i.wrapping_sub(1)) + at(i + 1));
+        of(&rgb[i]).max(around)
+    };
+    for (i, &(a, _, _, full)) in rgb.iter().enumerate() {
+        let (up, down) = (blend(i, |c| c.1), blend(i, |c| c.2));
+        if up + down > 0.3 {
+            gradient_column(&mut mesh, axes, a, mid, up, down, full, stops);
+        }
+    }
+    painter.add(Shape::mesh(mesh));
 
     draw_beat_grid(painter, axes, markers.beats, along_of, markers.grid_strength);
     if let Some(((start, end), active)) = loop_edges {
@@ -498,27 +663,38 @@ pub fn draw_detail(
         }
     }
 
-    let visible = |a: f32| (-20.0..=length).contains(&a);
+    // Cue markers stand out over a bright waveform: lines with a dark
+    // edge, and big tabs and triangles at the edges.
+    let size = (breadth * 0.22).clamp(12.0, 22.0) * markers.cue_size.clamp(0.5, 3.0);
+    // Never taller than about half the waveform.
+    let size = size.min(breadth * 0.5).max(8.0);
+    let line = markers.cue_size.clamp(1.0, 2.0);
+    let visible = |a: f32| (-size * 1.5..=length + size).contains(&a);
     let inward = axes.inward();
+    let marker_line = |a: f32, width: f32, color: Color32| {
+        axes.line(painter, a, 0.0, breadth, Stroke::new(width + 2.0, Color32::from_black_alpha(170)));
+        axes.line(painter, a, 0.0, breadth, Stroke::new(width, color));
+    };
     for &t in markers.memory_cues {
         let a = along_of(t);
         if visible(a) {
-            axes.line(painter, a, 0.0, breadth, Stroke::new(1.0_f32, MEMORY_CUE));
-            pointer(painter, axes.at(a, 0.0), 7.0, inward, MEMORY_CUE);
+            marker_line(a, 1.5 * line, MEMORY_CUE);
+            pointer(painter, axes.at(a, 0.0), size * 0.7, inward, MEMORY_CUE);
         }
     }
     let a = along_of(markers.cue_point);
     if visible(a) {
-        pointer(painter, axes.at(a, breadth), 7.0, -inward, CUE_POINT);
+        marker_line(a, 1.5 * line, CUE_POINT);
+        pointer(painter, axes.at(a, breadth), size * 0.7, -inward, CUE_POINT);
     }
     for &(t, color, letter) in markers.hot_cues {
         let a = along_of(t);
         if visible(a) {
-            axes.line(painter, a, 0.0, breadth, Stroke::new(1.5_f32, color));
+            marker_line(a, 2.0 * line, color);
             let corner = axes.at(a, 0.0);
             // The flag sits on the later side of the cue line.
-            let corner = if vertical { corner - vec2(0.0, 14.0) } else { corner };
-            flag(painter, corner, letter, color, 13.0);
+            let corner = if vertical { corner - vec2(0.0, size + 1.0) } else { corner };
+            flag(painter, corner, letter, color, size);
         }
     }
     if let Some(t) = markers.slip {
@@ -579,17 +755,17 @@ pub fn draw_overview(
             Stroke::new(1.0_f32, color),
         );
     }
+    let size = (rect.height() * 0.3).clamp(10.0, 14.0);
     for &t in markers.memory_cues {
-        triangle(painter, pos2(x_of(t), rect.bottom()), 5.0, false, MEMORY_CUE);
+        triangle(painter, pos2(x_of(t), rect.bottom()), size * 0.55, false, MEMORY_CUE);
     }
-    triangle(painter, pos2(x_of(markers.cue_point), rect.bottom()), 5.0, false, CUE_POINT);
+    triangle(painter, pos2(x_of(markers.cue_point), rect.bottom()), size * 0.55, false, CUE_POINT);
     for &(t, color, letter) in markers.hot_cues {
         let x = x_of(t);
-        painter.line_segment(
-            [pos2(x, rect.top()), pos2(x, rect.bottom())],
-            Stroke::new(1.0_f32, color.gamma_multiply(0.7)),
-        );
-        flag(painter, pos2(x, rect.top()), letter, color, 10.0);
+        let line = [pos2(x, rect.top()), pos2(x, rect.bottom())];
+        painter.line_segment(line, Stroke::new(3.0_f32, Color32::from_black_alpha(150)));
+        painter.line_segment(line, Stroke::new(1.0_f32, color));
+        flag(painter, pos2(x, rect.top()), letter, color, size);
     }
     if let Some(t) = markers.slip {
         let x = x_of(t);
@@ -605,6 +781,51 @@ pub fn draw_overview(
     );
 }
 
+/// A column `up` above and `down` below `mid`, shaded by `stops` from the
+/// middle out to both tips.
+#[allow(clippy::too_many_arguments)]
+fn gradient_column(
+    mesh: &mut eframe::egui::Mesh,
+    axes: Axes,
+    along: f32,
+    mid: f32,
+    up: f32,
+    down: f32,
+    color: Color32,
+    stops: &[crate::waveform_look::GradientStop],
+) {
+    let mut points = [(0.0f32, Color32::TRANSPARENT); 2 * MAX_STOPS - 1];
+    let stops = &stops[..stops.len().min(MAX_STOPS)];
+    let n = stops.len();
+    if n == 0 {
+        return;
+    }
+    for (k, stop) in stops.iter().enumerate() {
+        let c = stop.color(color);
+        points[n - 1 - k] = (mid - up * stop.at, c);
+        points[n - 1 + k] = (mid + down * stop.at, c);
+    }
+    column_strip(mesh, axes, along, &points[..2 * n - 1]);
+}
+
+/// Most gradient stops drawn.
+const MAX_STOPS: usize = 8;
+
+/// A one-point-wide strip at `along` through `stops` (across, colour),
+/// shaded between them; neighbouring pieces share their vertices.
+fn column_strip(mesh: &mut eframe::egui::Mesh, axes: Axes, along: f32, stops: &[(f32, Color32)]) {
+    let first = mesh.vertices.len() as u32;
+    for &(across, color) in stops {
+        mesh.colored_vertex(axes.at(along, across), color);
+        mesh.colored_vertex(axes.at(along + 1.0, across), color);
+    }
+    for k in 0..stops.len().saturating_sub(1) as u32 {
+        let i = first + 2 * k;
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i + 1, i + 2, i + 3);
+    }
+}
+
 /// A triangle at `tip`, pointing down (at the top edge) or up (at the bottom edge).
 fn triangle(painter: &Painter, tip: Pos2, size: f32, pointing_down: bool, color: Color32) {
     pointer(painter, tip, size, vec2(0.0, if pointing_down { 1.0 } else { -1.0 }), color);
@@ -614,12 +835,14 @@ fn triangle(painter: &Painter, tip: Pos2, size: f32, pointing_down: bool, color:
 fn pointer(painter: &Painter, base: Pos2, size: f32, direction: Vec2, color: Color32) {
     let across = vec2(-direction.y, direction.x) * size * 0.7;
     let points = vec![base - across, base + across, base + direction * size];
-    painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
+    let edge = Stroke::new(1.0_f32, Color32::from_black_alpha(170));
+    painter.add(Shape::convex_polygon(points, color, edge));
 }
 
 /// A hot cue flag: a colored tab with the cue letter, hanging right of the line.
 fn flag(painter: &Painter, top_left: Pos2, letter: char, color: Color32, size: f32) {
     let rect = Rect::from_min_size(top_left, vec2(size, size + 1.0));
+    painter.rect_filled(rect.expand(1.0), 3.0, Color32::from_black_alpha(170));
     painter.rect_filled(rect, 2.0, color);
     let text = if color.r() as u16 + color.g() as u16 + color.b() as u16 > 380 {
         Color32::BLACK
@@ -630,7 +853,7 @@ fn flag(painter: &Painter, top_left: Pos2, letter: char, color: Color32, size: f
         rect.center(),
         Align2::CENTER_CENTER,
         letter,
-        FontId::proportional(size - 2.0),
+        FontId::proportional(size * 0.8),
         text,
     );
 }
@@ -655,6 +878,11 @@ mod tests {
         let data = WaveformData::high_detail(
             &rofloxbox_audio::peak_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
             rofloxbox_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND),
+            &rofloxbox_analysis::waveform::rgb_columns_at(
+                &audio.to_f32(),
+                audio.sample_rate,
+                HIGH_COLUMNS_PER_SECOND,
+            ),
             HIGH_COLUMNS_PER_SECOND,
         );
         let raw = rofloxbox_audio::band_waveform_at(&audio, HIGH_COLUMNS_PER_SECOND);

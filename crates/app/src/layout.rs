@@ -329,6 +329,47 @@ pub struct LayoutPreset {
     pub layout: DeckLayout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewSettings>,
+    /// Switched to when a controller connects (the view before comes back
+    /// when it disconnects).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<ControllerLink>,
+}
+
+/// The view before a controller's preset took over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedView {
+    pub four: bool,
+    pub layout: DeckLayout,
+    pub view: ViewSettings,
+}
+
+/// Which controllers switch to a view preset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControllerLink {
+    Any,
+    /// This MIDI port only.
+    Port(String),
+}
+
+impl ControllerLink {
+    /// How well it fits `port`: 2 its own port, 1 any controller.
+    pub fn fits(&self, port: &str) -> Option<u8> {
+        match self {
+            Self::Port(p) if p == port => Some(2),
+            Self::Port(_) => None,
+            Self::Any => Some(1),
+        }
+    }
+}
+
+/// The preset for a controller that just connected on `port`: one linked
+/// to that port before one linked to any controller.
+pub fn preset_for_controller<'a>(presets: &'a [LayoutPreset], port: &str) -> Option<&'a LayoutPreset> {
+    presets
+        .iter()
+        .filter_map(|p| Some((p.controller.as_ref()?.fits(port)?, p)))
+        .max_by_key(|(fit, _)| *fit)
+        .map(|(_, p)| p)
 }
 
 /// Everything in the View menu besides the deck elements.
@@ -391,6 +432,7 @@ impl LayoutPreset {
             name: name.to_owned(),
             layout,
             view: Some(view),
+            controller: None,
         };
         vec![
             preset("Default", default.clone(), ViewSettings::default()),
@@ -592,6 +634,24 @@ impl DeckLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_presets_prefer_their_own_port() {
+        let preset = |name: &str, controller| LayoutPreset {
+            name: name.into(),
+            layout: DeckLayout::default(),
+            view: None,
+            controller,
+        };
+        let presets = vec![
+            preset("plain", None),
+            preset("any", Some(ControllerLink::Any)),
+            preset("grv6", Some(ControllerLink::Port("DDJ-GRV6".into()))),
+        ];
+        assert_eq!(preset_for_controller(&presets, "DDJ-GRV6").unwrap().name, "grv6");
+        assert_eq!(preset_for_controller(&presets, "Other").unwrap().name, "any");
+        assert!(preset_for_controller(&presets[..1], "DDJ-GRV6").is_none());
+    }
 
     /// The View menu's groups are the decks' sections.
     #[test]

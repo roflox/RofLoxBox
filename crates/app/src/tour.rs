@@ -61,6 +61,7 @@ pub enum Target {
     PrefsAnalysis,
     PrefsEdit,
     PrefsAudio,
+    PrefsWaveforms,
     StemModels,
     StemPresets,
     LiveStems,
@@ -93,6 +94,7 @@ impl Target {
             PrefsTab::Analysis => Self::PrefsAnalysis,
             PrefsTab::Edit => Self::PrefsEdit,
             PrefsTab::Audio => Self::PrefsAudio,
+            PrefsTab::Waveforms => Self::PrefsWaveforms,
         }
     }
 }
